@@ -75,3 +75,15 @@ with TemporaryDirectory() as temp:
         assert output.getvalue().splitlines()[-1] == "Fixture worker 5-hour 96%"
 
 print("pick: all checks pass")
+
+# Coordinator: keep the selected Codex account while under its handoff point, else switch.
+row = {"id": "a", "label": "a", "agent": "codex", "plan": "plus"}
+other = {"id": "b", "label": "b", "agent": "codex", "plan": "plus"}
+cfg = {"account": [row]}
+with patch.object(pick, "windows", return_value=(40, 10)), patch.object(pick, "pick", return_value=(other, [])):
+    assert pick.coordinator(cfg, "local", 0, "a") is None
+with patch.object(pick, "windows", return_value=(100, 10)), patch.object(pick, "pick", return_value=(other, [])):
+    assert pick.coordinator(cfg, "local", 0, "a") is other
+with patch.object(pick, "windows", return_value=(100, 10)), patch.object(pick, "pick", return_value=(None, [])):
+    assert pick.coordinator(cfg, "local", 0, "a") is None
+assert pick.past_handoff(row, 10, 100).startswith("limit reached")

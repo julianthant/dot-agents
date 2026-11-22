@@ -138,6 +138,29 @@ def pick(cfg, agent, model, effort, host, now):
     return None, why
 
 
+def past_handoff(row, five, week):
+    """Why this account must stop taking work now, or None."""
+    plan = LIM.get(row["agent"], {}).get(row.get("plan")) or {}
+    if max(five or 0, week or 0) >= 100:
+        return f"limit reached (5-hour {five or 0:.0f}%, weekly {week or 0:.0f}%)"
+    if "handoff_5h" in plan and (five or 0) >= plan["handoff_5h"]:
+        return f"5-hour {five:.0f}%"
+    if "weekly_handoff" in plan and (week or 0) >= plan["weekly_handoff"]:
+        return f"weekly {week:.0f}%"
+    return None
+
+
+def coordinator(cfg, host, now, active):
+    """The selected Codex account also runs the coordinator bot; past its handoff point, choose another."""
+    row = next((r for r in cfg["account"] if r["id"] == active), None)
+    if row is not None:
+        five, week = windows(cfg, row, now)
+        if five is not None and past_handoff(row, five, week) is None:
+            return None
+    new, _ = pick(cfg, "codex", "gpt-6.2-sol", "medium", host, now)
+    return new if new is not None and new["id"] != active else None
+
+
 def due(cfg, host, now):
     """Live holds whose account is past its handoff point, as (label, terminal, why)."""
     holds = json.loads(HOLDS.read_text()) if HOLDS.exists() else {}
@@ -148,12 +171,9 @@ def due(cfg, host, now):
         row = rows.get(rec["account"])
         if rec["host"] != host or handle not in alive or row is None:
             continue
-        plan = LIM.get(row["agent"], {}).get(row.get("plan")) or {}
-        five, week = windows(cfg, row, now)
-        if "handoff_5h" in plan and (five or 0) >= plan["handoff_5h"]:
-            found.append((row["label"], handle, f"5-hour {five:.0f}%"))
-        elif "weekly_handoff" in plan and (week or 0) >= plan["weekly_handoff"]:
-            found.append((row["label"], handle, f"weekly {week:.0f}%"))
+        why = past_handoff(row, *windows(cfg, row, now))
+        if why:
+            found.append((row["label"], handle, why))
     return found
 
 
@@ -173,7 +193,7 @@ LIM = tomllib.loads(LIMITS.read_text())
 
 def main(argv=None):
     p = argparse.ArgumentParser()
-    p.add_argument("command", choices=["pick", "hold", "due"])
+    p.add_argument("command", choices=["pick", "hold", "due", "coordinator"])
     p.add_argument("--agent", choices=["claude", "codex"])
     p.add_argument("--model")
     p.add_argument("--effort", default="medium")
@@ -187,6 +207,14 @@ def main(argv=None):
         for label, handle, why in found:
             print(f"{label} {handle} {why}")
         return 0 if found else 1
+    if args.command == "coordinator":
+        out = subprocess.run(["orca", "account", "list", "--json"], capture_output=True, text=True, check=True).stdout
+        active = json.loads(out)["result"]["codex"]["activeAccountId"]
+        new = coordinator(cfg, args.host, time.time(), active)
+        if new is not None:
+            subprocess.run(["orca", "account", "select", "--agent", "codex", "--account", new["id"]], capture_output=True, check=True)
+            print(f"coordinator account switched to {new['label']}")
+        return 0
     if not (args.agent and args.model):
         raise SystemExit(f"{args.command} needs --agent and --model")
     if args.command == "hold":

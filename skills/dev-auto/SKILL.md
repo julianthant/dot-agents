@@ -50,11 +50,19 @@ response, rerun fill from the same coordinating Run. It looks up the existing
 Dispatch and verifies its Run, Task and worktree before recording the hold and
 Project fields. If Orca still cannot establish the outcome, inspect the
 reported Task with `orca orchestration dispatch-show --task <task> --full`.
-A missing Dispatch alone cannot establish that the start failed. Preparation
-errors and an explicit no-effects refusal leave no issue reservation. Inspect
+A missing Dispatch keeps that issue pending while disjoint issues can fill
+other available seats. After inspecting the Task and confirming a replacement
+would be safe, run `scripts/tick.py fill --release <issue>` to clear just its
+pending reservation. Release exits without launching anything. Preparation errors and an explicit no-effects refusal leave no issue reservation. Inspect
 any prepared worktree before reusing or removing it.
 
-When Codex is waiting, fill sends the observed prompt to the owning Run's
-mailbox, keeps the reservation and hold, and defers the Coding update. The
-operator handles hook review and model choices in the worker's own pane. The
-next real tick checks that same Dispatch again.
+For Codex workers, fill sets `notice.hide_rate_limit_model_nudge = true` in
+the new worktree's project config. Codex applies project settings in trusted
+workspaces. The installed 0.171.0 TUI reads this preference before showing its
+model-switch menu. Startup hook consent depends on the hooks' trust state.
+An operator reviews new or changed hooks. [Model nudge](https://github.com/openai/codex/blob/rust-v0.171.0/codex-rs/tui/src/chatwidget/rate_limits.rs#L475-L480) · [Hook review](https://github.com/openai/codex/blob/rust-v0.171.0/codex-rs/tui/src/startup_hooks_review.rs#L283-L293)
+
+If a startup prompt appears, fill forwards the observed prompt to the owning
+Run, sets the Project's Agent state to **Needs you**, and retains the hold
+and reservation. After the operator answers in the worker pane, the next real
+tick checks that same Dispatch before recording Coding.

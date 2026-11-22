@@ -125,8 +125,9 @@ def codex_reason(plan_name, plan, route, held, five, week):
     return None
 
 
-def pick(cfg, agent, model, effort, host, now):
-    holds = live_holds(host)
+def pick(cfg, agent, model, effort, host, now, holds=None):
+    if holds is None:
+        holds = live_holds(host)
     route = f"{model}:{effort}"
     why = []
     for row in cfg["account"]:

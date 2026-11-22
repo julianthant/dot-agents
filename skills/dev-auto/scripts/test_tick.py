@@ -269,6 +269,7 @@ with TemporaryDirectory() as tmp, sqlite3.connect(":memory:") as db:
     def local(*args):
         verb = args[:2]
         if verb == ("orchestration", "task-create"):
+            check.assertTrue(args[args.index("--spec") + 1].startswith("/goal Implement julianthant/hr-relay#51"))
             return {"task": {"id": "fixture-task"}}
         if verb == ("orchestration", "dispatch-show"):
             return {"dispatch": {"id": "fixture-dispatch"}}
@@ -290,7 +291,7 @@ with TemporaryDirectory() as tmp, sqlite3.connect(":memory:") as db:
         return {"dispatch": {"id": "fixture-dispatch", "assigneeHandle": "fixture-terminal", "runId": "fixture",
                              "taskId": "fixture-task"}, "worker": {"state": "ready", "worktreeId": "wt"}}
 
-    with patch.object(tick, "project_fields", return_value=("project", [("s","progress"),("c","coding"),("a",None)])), \
+    with patch.object(tick, "project_fields", return_value=("project", [("s","progress"),("c","coding"),("a",None)], ("c","needs-you"))), \
          patch.object(tick, "runtime", local), patch.object(tick, "command", cli), \
          patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE":"fixture"}), redirect_stdout(io.StringIO()):
         tick.launch(db, root, ticket, account, args, root / "holds.json")
@@ -319,6 +320,9 @@ with TemporaryDirectory() as tmp:
         if verb == ("account", "list"):
             return {"codex": {"activeAccountId": "other" if preparation_failed else "seat"}}
         if verb == ("orchestration", "worker-start"):
+            import tomllib
+            with (root / ".codex/config.toml").open("rb") as cfg:
+                check.assertEqual(tomllib.load(cfg), {"notice": {"hide_rate_limit_model_nudge": True}})
             if refused:
                 reply = {"ok": False, "error": {"message": "refused", "data": {"effectsApplied": False}}}
                 with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(argv, 1, json.dumps(reply), "")):
@@ -349,7 +353,7 @@ with TemporaryDirectory() as tmp:
         return cli(*argv)
 
     import pick
-    with (patch.object(tick, "project_fields", return_value=("project", [("field", "coding")])),
+    with (patch.object(tick, "project_fields", return_value=("project", [("field", "coding")], ("field","needs-you"))),
           patch.object(tick, "runtime", recovery_runtime), patch.object(tick, "command", recovery_command),
           patch.object(tick, "tickets", return_value=[]), patch.object(tick, "inventory", return_value=set()),
           patch.object(pick.account_usage, "load_config", return_value={}),
@@ -367,8 +371,8 @@ with TemporaryDirectory() as tmp:
             with check.assertRaisesRegex(tick.OrcaError, "fixture-task"):
                 tick.launch(db, root, codex_ticket, account, args, holds)
         with sqlite3.connect(ledger) as db:
-            with check.assertRaisesRegex(tick.OrcaError, "no Dispatch"):
-                tick.fill_tick(args, db)
+            tick.fill_tick(args, db)
+            check.assertIn("no Dispatch", output.getvalue())
             visible = True
             tick.fill_tick(args, db)
             check.assertIn("waiting for operator input", output.getvalue())
@@ -379,11 +383,11 @@ with TemporaryDirectory() as tmp:
             screen[:] = ["Hooks need review before continuing"]
             tick.fill_tick(args, db)
             check.assertIn('"prompt": "Hooks need review before continuing"', output.getvalue())
-            check.assertEqual(recovery_edits, [])
+            check.assertEqual([edit[-1] for edit in recovery_edits], ["needs-you", "needs-you"])
             screen.clear()
             tick.fill_tick(args, db)
             check.assertEqual(db.execute("SELECT receipt FROM starts").fetchone(), ("done",))
-            check.assertEqual(len(recovery_edits), 1)
+            check.assertEqual([edit[-1] for edit in recovery_edits], ["needs-you", "needs-you", "coding"])
     check.assertEqual(operations.count(("orchestration", "worker-start")), 1)
     check.assertNotIn(("terminal", "send"), operations)
     check.assertNotIn(("orchestration", "approve"), operations)
@@ -394,7 +398,7 @@ check.assertEqual(tick.codex_prompt(["unrelated transcript", *menu, "unrelated f
 check.assertIsNone(tick.codex_prompt(['I did not see the "Hooks need review" screen.']))
 
 # An in-pane worker cannot select somebody else's anchor even with a valid-looking Run.
-with sqlite3.connect(":memory:") as db, patch.object(tick, "project_fields", return_value=(None, [])), \
+with sqlite3.connect(":memory:") as db, patch.object(tick, "project_fields", return_value=(None, [], ("c","needs-you"))), \
      patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE":"fixture"}), patch.object(tick, "runtime") as call:
     with check.assertRaisesRegex(tick.OrcaError, "pane-less"):
         tick.launch(db, None, ticket, account, SimpleNamespace(anchor="external", run="run"), None)
@@ -460,5 +464,71 @@ with TemporaryDirectory() as temp, ExitStack() as stack:
     with check.assertRaisesRegex(tick.OrcaError, "base changed or task branch"):
         tick.fill_tick(args, None)
     start.assert_called_once()
+
+
+# An unresolved attempt still owns its paths and seat; an unrelated ticket can start.
+with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory:") as db:
+    root = Path(tmp)
+    stuck = dict(ticket, number=40, branch="task/a/stuck", paths=["src/occupied"])
+    overlap_ticket = dict(ticket, number=41, branch="task/a/overlap", paths=["src/occupied/file"])
+    tick.reserve(db, 40, dict(task="stuck", run="different", route=base["route"], account="held"))
+    args = SimpleNamespace(repo_path=root, dry_run=False, issue=None, holds=root / "holds.json")
+    stack.enter_context(patch.object(tick, "command", git))
+    raced = False
+    stack.enter_context(patch.object(tick, "tickets", side_effect=lambda: [dict(t) for t in (stuck, overlap_ticket, ticket)]))
+    stack.enter_context(patch.object(tick, "supervisor", return_value=([], "own")))
+    stack.enter_context(patch.object(tick, "inventory", return_value=set()))
+    stack.enter_context(patch.object(pick.account_usage, "load_config", return_value={}))
+    picker = stack.enter_context(patch.object(pick, "pick", return_value=(account, [])))
+    start = stack.enter_context(patch.object(tick, "launch"))
+    output = stack.enter_context(redirect_stdout(io.StringIO()))
+    tick.fill_tick(args, db)
+    check.assertIn("reconcile from its owning Run", output.getvalue())
+    check.assertIn("overlaps #40", output.getvalue())
+    check.assertEqual(start.call_args.args[2]["number"], ticket["number"])
+    start.assert_called_once()
+    check.assertEqual(picker.call_args.kwargs["holds"][0]["account"], "held")
+    check.assertEqual(db.execute("SELECT issue FROM starts").fetchall(), [(40,)])
+
+# Release is its own operation and only clears the inspected pending issue.
+with TemporaryDirectory() as tmp, patch.object(Path, "home", return_value=Path(tmp)), patch.object(tick, "fill_tick") as fill:
+    state = Path(tmp) / ".local/state/dev-auto"
+    state.mkdir(parents=True)
+    with sqlite3.connect(state / "starts.sqlite") as db:
+        tick.reserve(db, 40, {"task": "inspected"})
+        tick.reserve(db, 41, {"task": "other"})
+        db.execute("INSERT INTO starts VALUES(42,'done')")
+    with redirect_stdout(io.StringIO()):
+        tick.main(["fill", "--release", "40"])
+        tick.main(["fill", "--release", "42"])
+    fill.assert_not_called()
+    with sqlite3.connect(state / "starts.sqlite") as db:
+        check.assertEqual(db.execute("SELECT issue FROM starts ORDER BY issue").fetchall(), [(41,), (42,)])
+
+check.assertEqual(tick.owned_paths("Owned paths: Edit `scripts/dev.py` and `docs/how.md`, plus config/app.json."),
+                  ["scripts/dev.py", "docs/how.md", "config/app.json"])
+check.assertEqual(tick.owned_paths("Owned paths: src, docs, scripts/setup.py."), ["src", "docs", "scripts/setup.py"])
+check.assertIn(".github/workflows", tick.owned_paths("Owned paths: Development/checks workflows, CI plan and focused tests."))
+
+with TemporaryDirectory() as tmp:
+    import tomllib
+    cfg = Path(tmp) / ".codex/config.toml"
+    cfg.parent.mkdir()
+    cfg.write_text('[profile]\nname="unchanged"\n[notice] # existing notices\nhide_rate_limit_model_nudge = false\n')
+    tick.configure_codex_notice(Path(tmp))
+    check.assertEqual(tomllib.loads(cfg.read_text()), {"profile": {"name": "unchanged"},
+                                                       "notice": {"hide_rate_limit_model_nudge": True}})
+
+    cfg.write_text('notice = { hide_other_banner = true }\n')
+    tick.configure_codex_notice(Path(tmp))
+    check.assertEqual(tomllib.loads(cfg.read_text())["notice"], {"hide_other_banner": True,
+                                                                 "hide_rate_limit_model_nudge": True})
+
+with patch.object(tick, "command", side_effect=[json.dumps({"id": "project"}), json.dumps({"fields": [
+        {"name": "Status", "id": "status", "options": [{"name": "In Progress", "id": "progress"}]},
+        {"name": "Agent state", "id": "stage", "options": [{"name": "Coding", "id": "coding"},
+                                                           {"name": "Needs you", "id": "waiting"}]},
+        {"name": "Agent", "id": "agent"}]})]):
+    check.assertEqual(tick.project_fields()[2], ("stage", "waiting"))
 
 print("ok")

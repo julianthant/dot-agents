@@ -26,7 +26,7 @@ ask it, not the operator.
 - Push your task branch; never force-push published history, and never push `main`, `staging`
   or `development`.
 - Wait on the run in one blocking command:
-  `gh run watch "$(gh run list --branch <branch> --limit 1 --json databaseId -q '.[0].databaseId')" --exit-status`
+  `gh run watch "$(gh run list --branch <branch> --limit 1 --json databaseId -q '.[0].databaseId')" --interval 30 --exit-status`
 - Fix failures you caused and push again until green. When a failure is also red on the base
   branch, report it with that proof instead of changing unrelated tests.
 

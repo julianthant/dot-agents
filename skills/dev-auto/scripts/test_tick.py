@@ -1004,4 +1004,240 @@ for scenario in ({}, {"merged": False}, {"dirty": True}, {"refused": True},
     with TemporaryDirectory() as tmp:
         close_fixture(tmp, **scenario)
 
+
+# Screens recorded from live workers. Codex 2026-11-22 at and near its limit; Claude from the retired dev_auto.py tests.
+CODEX_AT_LIMIT = [
+    "■ You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit",
+    "  https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 6:49 PM.",
+    "",
+    "  Approaching rate limits",
+    "› 1. Switch to gpt-6-luna   Uses fewer credits for upcoming turns",
+    "  2. Keep current model",
+    "  3. Keep current model (never show again)   Hide future rate limit reminders about switching models",
+]
+CODEX_NEAR_LIMIT = [
+    "• Ran python3 test_tick.py",
+    "⚠ Heads up, you have less than 5% of your 5h limit left.",
+    "› Ask Codex to do anything",
+    "  gpt-6.2-astra medium · ~/orca/workspaces/.agents/dev-auto.watch-workers",
+    "  ⚠ 5h limit: only 4% left · resets at 5:57 PM",
+]
+CODEX_SWITCHED = ["• Working (12s • esc to interrupt)", "› Ask Codex to do anything",
+                  "  GPT-6-Luna medium · ~/orca/workspaces/.agents/dev-auto.watch-workers"]
+CLAUDE_AT_LIMIT = ["⏺ Running the tests.", "  ⎿  You've hit your 5-hour limit · resets 5am (America/Los_Angeles)",
+                   "Usage limit reached · continuing automatically at 5am · esc to cancel"]
+CLAUDE_WORKING = ["⏺ Reading tick.py", "✶ Prestidigitating… (5m 45s · ↓ 2.8k tokens)", "❯",
+                  "  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt"]
+assert tick.screen_limit(CODEX_AT_LIMIT, {"agent": "codex", "model": "gpt-6.2-astra"}).startswith("■ You've hit")
+assert tick.screen_limit(CODEX_AT_LIMIT[3:], {"agent": "codex", "model": "gpt-6.2-astra"}) == "Approaching rate limits"
+assert tick.screen_limit(CODEX_SWITCHED, {"agent": "codex", "model": "gpt-6.2-astra"}) == "model switched to GPT-6-Luna medium"
+assert tick.screen_limit(CODEX_NEAR_LIMIT, {"agent": "codex", "model": "gpt-6.2-astra"}) is None
+assert tick.screen_limit(CLAUDE_AT_LIMIT, {"agent": "claude", "model": "claude-opus-5-5"}).startswith("Usage limit reached")
+assert tick.screen_limit(CLAUDE_AT_LIMIT[:2], {"agent": "claude", "model": "claude-opus-5-5"}).startswith("⎿  You've hit")
+assert tick.screen_limit(CLAUDE_WORKING, {"agent": "claude", "model": "claude-opus-5-5"}) is None
+assert [l for l in CODEX_NEAR_LIMIT if tick.NEAR_LIMIT.match(l)] == CODEX_NEAR_LIMIT[1:2] + CODEX_NEAR_LIMIT[-1:]
+assert tick.card_agent("coder gpt-6.2-astra medium @jzaw", False, "x2") == "coder gpt-6.2-astra medium @x2"
+assert tick.card_agent("coder m e @a · reviewer m e @b", True, "c") == "coder m e @a · reviewer m e @c"
+
+
+class Fleet:
+    """One coder in the coordinating Run, shaped like the recorded #553 worker-list and worker-show receipts."""
+
+    def __init__(self, tmp, agent="codex", model="gpt-6.2-astra", screen=CODEX_NEAR_LIMIT):
+        self.tmp = Path(tmp)
+        self.holds = self.tmp / "holds.json"
+        self.holds.write_text(json.dumps({"term_coder": {"account": "jzaw", "label": "jzaw", "host": "local"}}))
+        self.agent, self.model, self.screen = agent, model, screen
+        self.dispatch, self.terminal, self.status, self.state = "ctx_coder", "term_coder", "dispatched", "ready"
+        self.liveness, self.failure, self.wait = "live", None, None
+        self.seats = ["jzaw", "x2"]  # the limited account is first in accounts.toml order
+        self.superseded = False
+        self.start_error = None
+        self.events, self.cards, self.now = [], [], 1_795_389_500
+        self.ticket = dict(number=553, item="card", agent=f"coder {model} medium @jzaw", stage="Coding")
+        self.db = sqlite3.connect(":memory:")
+
+    def orca(self, *args):
+        self.events.append(args)
+        verb = args[:2]
+        if verb == ("orchestration", "task-list"):
+            return {"tasks": [{"id": "task_coder", "run_id": "run", "task_title": "#553 coder",
+                               "spec": "/goal Implement julianthant/hr-relay#553 and report a green SHA."}]}
+        if verb == ("orchestration", "worker-list"):
+            row = dict(dispatchId=self.dispatch, taskId="task_coder", runId="run", workerState=self.state,
+                       dispatchStatus=self.status, agentTerminalHandle=self.terminal,
+                       resource={"ownerDispatchId": self.dispatch},
+                       projection={"host": {"kind": "local"}, "liveness": {"verdict": self.liveness}})
+            # An older attempt on the same pane is history.
+            old = dict(row, dispatchId="ctx_older", dispatchStatus="failed", resource={"ownerDispatchId": "ctx_older"})
+            # A follow-up's predecessor can be listed while the pane belongs to the newer Dispatch.
+            before = [dict(row, dispatchId="ctx_followed", resource={"ownerDispatchId": self.dispatch})] if self.superseded else []
+            return {"workers": [*before, row, old], "page": {"hasMore": False, "nextCursor": None}}
+        if verb == ("orchestration", "worker-show"):
+            assert args[3] == self.dispatch, args
+            return {"dispatch": {"id": self.dispatch, "runId": "run", "taskId": "task_coder", "status": self.status,
+                                 "assigneeHandle": self.terminal, "lastFailure": self.failure},
+                    "worker": {"state": self.state, "worktreeId": "repo::/wt",
+                               "startOptions": {"launch": {"effective": {"agent": self.agent, "model": self.model,
+                                                                         "effort": "medium"}}}},
+                    "projection": {"liveness": {"verdict": self.liveness}},
+                    "terminal": {"handle": self.terminal, "agentWait": self.wait}, "observation": {"agentWait": self.wait}}
+        if verb == ("terminal", "read"):
+            return {"terminal": {"handle": self.terminal, "tail": self.screen, "source": "screen"}}
+        if verb == ("orchestration", "worker-stop"):
+            self.state, self.status, self.failure = "stopped", "failed", "stopped"
+            return {"dispatchId": self.dispatch, "processAction": "closed_agent_terminal"}
+        if verb == ("account", "select"):
+            self.active = args[-1]
+            return {}
+        if verb == ("account", "list"):
+            return {self.agent: {"activeAccountId": self.active}}
+        if verb == ("orchestration", "worker-start"):
+            if self.start_error:
+                raise self.start_error
+            spec = args[args.index("--spec") + 1]
+            assert spec.startswith("/goal Implement julianthant/hr-relay#553") and "You replace Dispatch" in spec, spec
+            assert args[args.index("--worktree") + 1] == "id:repo::/wt"
+            self.dispatch, self.terminal = "ctx_restart", "term_restart"
+            self.status, self.state, self.liveness, self.failure = "dispatched", "ready", "live", None
+            self.screen = CLAUDE_WORKING
+            return full_start("ctx_restart", "term_restart")
+        if verb == ("orchestration", "send"):
+            return {"delivery": "queued"}
+        raise AssertionError(args)
+
+    def tick(self, minutes=0):
+        self.now += minutes * 60
+        self.events.clear()
+        seat = lambda cfg, *route, now=None: (
+            (next(({"id": s, "label": s} for s in self.seats if s in [r["id"] for r in cfg["account"]]), None), ["full"]))
+        cfg = {"account": [{"id": "jzaw"}, *({"id": s} for s in self.seats)]}
+        record = lambda ticket, stage, agent: (self.cards.append((stage, agent)), ticket.update(agent=agent))
+        out = io.StringIO()
+        with patch.object(tick, "supervisor", return_value=([], "run")), patch.object(tick, "runtime", self.orca), \
+                patch.object(tick, "tickets", return_value=[self.ticket]), patch.object(tick, "review_card", record), \
+                patch.object(pick, "main", return_value=0), patch.object(pick, "due", return_value=[]), \
+                patch.object(pick, "pick", seat), patch.object(pick.account_usage, "load_config", return_value=cfg), \
+                patch.object(tick.time, "time", return_value=self.now), redirect_stdout(out):
+            try:
+                tick.watch_tick(SimpleNamespace(holds=self.holds), self.db)
+            finally:
+                self.lines = out.getvalue().splitlines()
+        assert len(self.lines) == 1 and self.lines[0].startswith("watch"), self.lines
+        return [e[:2] for e in self.events]
+
+    def sent(self):
+        return [(e[e.index("--to") + 1], e[e.index("--subject") + 1]) for e in self.events if e[:2] == ("orchestration", "send")]
+
+
+# Near its limit: one handoff request, Handed off on the card, then a fresh worker on another seat from the handoff.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp)
+    tick.review_state(f.db, "run", 553)
+    tick.save_review(f.db, "run", 553, {"coder": "ctx_coder", "expected": "ctx_coder", "coder_terminal": "term_coder"})
+    f.tick()
+    assert f.sent() == [("dispatch:ctx_coder", "#553: hand off now")] and f.cards == [("Handed off", f.ticket["agent"])]
+    assert "handoff" in f.lines[0]
+    f.tick(1)
+    assert f.sent() == [] and len(f.cards) == 1  # asked once
+    f.status, f.state = "failed", "failed"
+    f.failure = json.dumps({"provenance": "worker_report", "outcome": "failed", "body": "Handoff at /wt/.handoff-553.md"})
+    calls = f.tick(1)
+    assert ("orchestration", "worker-start") in calls and ("orchestration", "worker-stop") not in calls
+    start = next(e for e in f.events if e[:2] == ("orchestration", "worker-start"))
+    assert "/wt/.handoff-553.md" in start[start.index("--spec") + 1]
+    assert f.active == "x2" and f.cards[-1] == ("Coding", "coder gpt-6.2-astra medium @x2")
+    holds = json.loads(f.holds.read_text())
+    assert "term_coder" not in holds and holds["term_restart"]["account"] == "x2"
+    review = tick.review_state(f.db, "run", 553)
+    assert (review["coder"], review["coder_terminal"]) == ("ctx_restart", "term_restart")
+
+# At the limit, on a model-switch menu, or after Codex switched models: stop it, then restart on another account.
+for agent, model, screen in (("codex", "gpt-6.2-astra", CODEX_AT_LIMIT), ("codex", "gpt-6.2-astra", CODEX_SWITCHED),
+                             ("claude", "claude-opus-5-5", CLAUDE_AT_LIMIT)):
+    with TemporaryDirectory() as tmp:
+        f = Fleet(tmp, agent, model, screen)
+        calls = f.tick()
+        assert calls.index(("orchestration", "worker-stop")) < calls.index(("orchestration", "worker-start")), calls
+        assert ("account", "select", "--agent", agent, "--account", "x2") in f.events
+        assert [c[0] for c in f.cards] == ["Handed off", "Coding"]
+        assert not any(e[:2] == ("terminal", "send") for e in f.events)  # never types into the pane
+
+# No seat: the card stays Handed off and each tick retries; no account means no worker-start.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    f.seats = []
+    assert ("orchestration", "worker-start") not in f.tick() and f.cards == [("Handed off", f.ticket["agent"])]
+    assert "waiting for seat" in f.lines[0]
+    f.seats = ["x2"]
+    calls = f.tick(5)
+    assert ("orchestration", "worker-stop") not in calls and ("orchestration", "worker-start") in calls
+    assert f.cards[-1][0] == "Coding"
+
+# A lost worker-start response is never replayed: the coordinator inspects it.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    f.superseded = True
+    f.start_error = tick.OrcaError("timed out")
+    try:
+        f.tick()
+        raise AssertionError("watch should report the failed start")
+    except tick.OrcaError:
+        pass
+    f.start_error = None
+    calls = f.tick(1)
+    assert ("orchestration", "worker-start") not in calls and f.sent() == [("run:run", "#553: restart unconfirmed")]
+
+# A crash relaunches once, on any seat; a second crash goes to the coordinator and the card to Needs you.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.seats = ["jzaw"]
+    f.liveness = "exited"
+    assert ("orchestration", "worker-start") in f.tick() and f.cards == [("Coding", "coder gpt-6.2-astra medium @jzaw")]
+    f.liveness = "exited"
+    calls = f.tick(1)
+    assert ("orchestration", "worker-start") not in calls and f.sent() == [("run:run", "#553: worker crashed again")]
+    assert f.cards[-1][0] == "Needs you"
+    f.tick(1)
+    assert f.sent() == []
+
+# An unchanged screen for 20 minutes: nudge once, then report; a changing screen is never silent.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.tick()
+    f.tick(19)
+    assert f.sent() == []
+    f.tick(1)
+    assert f.sent() == [("dispatch:ctx_coder", "#553: still working?")]
+    f.tick(19)
+    assert f.sent() == []
+    f.tick(1)
+    assert f.sent() == [("run:run", "#553: silent worker")] and f.cards == []
+    f.tick(30)
+    assert f.sent() == []
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    for minute in range(5):
+        f.screen = [*CLAUDE_WORKING[:1], f"✶ Prestidigitating… ({minute * 10}m · ↓ 2.8k tokens)"]
+        f.tick(10)
+    assert f.sent() == []
+
+# A permission prompt is forwarded to the Run once and the card goes to Needs you; nothing is typed or approved.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.wait = {"kind": "permission", "approvalId": "appr_1"}
+    f.tick()
+    assert f.sent() == [("run:run", "#553: permission prompt")] and f.cards[-1][0] == "Needs you"
+    assert not any(e[1] in ("approve", "deny") for e in f.events)
+    f.tick(1)
+    assert f.sent() == []
+
+# An operator stop, or a finished worker, ends the watch; neither is relaunched.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.tick()
+    f.status, f.state, f.failure, f.liveness = "failed", "stopped", "stopped", "exited"
+    assert ("orchestration", "worker-start") not in f.tick(1) and f.sent() == []
+    assert not f.db.execute("SELECT * FROM watch").fetchall()
+
 print("ok")

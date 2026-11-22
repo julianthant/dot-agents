@@ -2,6 +2,7 @@
 
   tick.py review [--issue N]                         advance reports from the owning Run mailbox
   tick.py close --repo-path <checkout> [--issue N]   release workers and clean up closed tickets
+  tick.py watch                                      hand off, relaunch, nudge or report live workers
   tick.py fill --repo-path <checkout> [--issue N] [--dry-run]
   tick.py start --repo id:<repo-id> --state <file>   process 1: scratch worker started, its ask answered
   tick.py resume --state <file>                      process 2: rebinds the stored Run, finishes, cleans up
@@ -1656,6 +1657,261 @@ def close(args):
         close_tick(args, db)
 
 
+# Codex near its limit, seen 2026-11-22: "⚠ Heads up, you have less than 5% of your 5h limit left."
+# and its status line "⚠ 5h limit: only 4% left · resets at 5:57 PM".
+NEAR_LIMIT = re.compile(r"^\s*⚠\s*(?:heads up, you have less than \d+% of your \S+ limit left"
+                        r"|\S+ limit: only \d+% left\b)", re.I)
+# Codex's status line under its input box: "GPT-6.1-Sol xhigh · ~/repo".
+CODEX_STATUS = re.compile(r"\s*([\w.-]+)(?: (\w+))? · (?=[~/])")
+QUIET_MINUTES = 20
+HANDOFF = ("Your account is at its usage handoff point ({why}). Finish the current step, run /handoff, then send "
+           "worker_done --outcome failed with the handoff path. A fresh worker on another account continues from it.")
+NUDGE = ("Your screen has not changed for {minutes} minutes. If you are blocked, report it with orca orchestration "
+         "ask or send; otherwise continue the task.")
+
+
+def screen_limit(tail, launch):
+    """Why this screen means the worker cannot hand off: a limit line, the model-switch menu, or a switched model."""
+    hit = limited(tail)
+    if hit:
+        return hit
+    menu = codex_prompt(tail)
+    if menu and not menu.lower().lstrip().startswith("hooks need review"):
+        return menu.splitlines()[0].strip()
+    if launch.get("agent") == "codex":
+        status = next((m for line in reversed(tail[-6:]) if (m := CODEX_STATUS.match(line))), None)
+        if status and status[1].lower() != (launch.get("model") or "").lower():
+            return f"model switched to {status[1]} {status[2] or ''}".strip()
+    return None
+
+
+def card_agent(text, reviewer, label):
+    parts = (text or "").split(" · ")
+    i = 1 if reviewer and len(parts) > 1 else 0
+    parts[i] = re.sub(r"\s*@\S+$", "", parts[i]) + " @" + label
+    return " · ".join(parts)
+
+
+def watch_tick(args, db):
+    import contextlib
+    import hashlib
+    import io
+    import pick
+    actor, run = supervisor(args)
+    now = time.time()
+    actions, errors = [], []
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            pick.main(["coordinator"])
+        if out.getvalue().strip():
+            actions.append({"coordinator": out.getvalue().strip()})
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError, SystemExit) as e:
+        errors.append({"coordinator": str(e)})
+    cfg = pick.account_usage.load_config()
+    holds_path = args.holds or pick.HOLDS
+    due = {handle: why for _, handle, why in pick.due(cfg, "local", now)}
+    tasks = {t["id"]: t for t in runtime("orchestration", "task-list", *(actor or ["--run", run]), "--full")["tasks"]}
+    cards = {t["number"]: t for t in tickets()}
+    db.execute("CREATE TABLE IF NOT EXISTS watch (run TEXT, terminal TEXT, state TEXT, PRIMARY KEY(run,terminal))")
+    saved = dict(db.execute("SELECT terminal,state FROM watch WHERE run=?", (run,)))
+
+    def save(terminal, state):
+        with db:
+            if state is None:
+                db.execute("DELETE FROM watch WHERE run=? AND terminal=?", (run, terminal))
+            else:
+                db.execute("INSERT OR REPLACE INTO watch VALUES (?,?,?)", (run, terminal, json.dumps(state)))
+
+    def escalate(number, subject, body):
+        runtime("orchestration", "send", *actor, "--to", "run:" + run, "--type", "escalation",
+                "--subject", f"#{number}: {subject}" if number else subject, "--body", body)
+
+    def stage(ticket, name, agent=None):
+        if ticket and ticket.get("item") and (ticket["stage"] != name or agent):
+            review_card(ticket, name, agent or ticket["agent"] or "")
+            ticket["stage"] = name
+
+    def issue_of(show):
+        task = tasks.get(show["dispatch"]["taskId"]) or {}
+        found = re.search(r"#(\d+)", task.get("task_title") or "") or re.search(r"hr-relay ?#(\d+)", task.get("spec") or "")
+        return task, int(found[1]) if found else None
+
+    def restart(w, show, state, why, exclude, crash=False):
+        dispatch, terminal = w["dispatchId"], w["agentTerminalHandle"]
+        task, number = issue_of(show)
+        title = task.get("task_title") or ""
+        ticket = cards.get(number)
+        if (state.get("pending") or {}).get("starting"):
+            # A lost worker-start response may have launched the replacement already.
+            if state.get("escalated") != "start":
+                escalate(number, "restart unconfirmed", f"Inspect the restart of Dispatch {dispatch} in Run {run} "
+                         "before clearing its watch row.")
+                state["escalated"] = "start"
+                save(terminal, state)
+            return
+        state.update(pending={"why": why, "exclude": exclude, "crash": crash})
+        save(terminal, state)
+        if not task.get("spec"):
+            raise OrcaError(f"no Task spec for {dispatch}")
+        if exclude:
+            state.setdefault("previous_stage", ticket and ticket["stage"])
+            stage(ticket, "Handed off")
+            save(terminal, state)
+        launch = show["worker"]["startOptions"]["launch"]["effective"]
+        route = (launch["agent"], launch["model"], launch["effort"])
+        seats = dict(cfg, account=[r for r in cfg["account"] if r["id"] != exclude])
+        account, reasons = pick.pick(seats, *route, "local", now)
+        if account is None:
+            actions.append({"issue": number, "dispatch": dispatch, "waiting for seat": reasons})
+            return
+        runtime("account", "select", "--agent", route[0], "--account", account["id"])
+        if runtime("account", "list")[route[0]]["activeAccountId"] != account["id"]:
+            raise OrcaError("selected account changed before restart")
+        report = show["dispatch"].get("lastFailure") or ""
+        try:
+            report = json.loads(report).get("body") or ""
+        except (ValueError, AttributeError):
+            report = ""
+        state["pending"]["starting"] = True
+        save(terminal, state)
+        spec = (task["spec"] + f"\n\nYou replace Dispatch {dispatch}, which stopped: {why}. Read its handoff first "
+                "if it wrote one" + (f"; its last report:\n{report[:1500]}\n" if report else "; ")
+                + "otherwise continue from the last commit on this branch.")
+        started = runtime("orchestration", "worker-start", *actor,
+                          "--worktree", "id:" + show["worker"]["worktreeId"], "--agent", route[0],
+                          "--model", route[1], "--effort", route[2], "--task-title", title or f"{dispatch} restart",
+                          "--spec", spec, "--full")
+        new, handle = start_identity(started)
+        with pick.edit_holds(Path(holds_path)) as holds:
+            holds.pop(terminal, None)
+            holds[handle] = dict(account=account["id"], label=account["label"], agent=route[0], model=route[1],
+                                 effort=route[2], host="local", at=int(now))
+        if number is not None:
+            review = review_state(db, run, number)
+            if review and review.get("coder") == dispatch:
+                review.update(coder=new, expected=new, coder_terminal=handle)
+                save_review(db, run, number, review)
+            elif review and (review.get("reviewer") or {}).get("dispatch") == dispatch:
+                review["reviewer"].update(dispatch=new, terminal=handle)
+                review["expected"] = new
+                save_review(db, run, number, review)
+        save(terminal, None)
+        save(handle, {"relaunched": bool(state.get("relaunched") or crash)})
+        if ticket:
+            previous = state.get("previous_stage")
+            agent = card_agent(ticket["agent"], "review" in title, account["label"])
+            stage(ticket, previous if previous and previous != "Handed off" else "Coding", agent)
+        actions.append({"issue": number, "restarted": dispatch, "as": new, "why": why, "account": account["label"]})
+
+    seen = set()
+    for w in close_workers(run):
+        terminal, dispatch = w["agentTerminalHandle"], w["dispatchId"]
+        owner = (w.get("resource") or {}).get("ownerDispatchId")
+        # worker-list is newest first: act only on a terminal's current attempt.
+        if not terminal or terminal in seen or (owner and owner != dispatch):
+            continue
+        seen.add(terminal)
+        state = json.loads(saved.get(terminal) or "null")
+        live = w["dispatchStatus"] == "dispatched"
+        if not live and state is None:
+            continue
+        state = state or {}
+        try:
+            show = runtime("orchestration", "worker-show", "--dispatch", dispatch, "--full")
+            if show["dispatch"]["id"] != dispatch or show["dispatch"]["runId"] != run:
+                raise OrcaError("Dispatch identity changed")
+            number = issue_of(show)[1]
+            ticket = cards.get(number)
+            account = (json.loads(Path(holds_path).read_text()) if Path(holds_path).exists() else {}).get(terminal, {})
+            failure = show["dispatch"].get("lastFailure") or ""
+            reported = failure.startswith("{") and json.loads(failure).get("provenance") == "worker_report"
+            stopped = (show.get("worker") or {}).get("state") == "stopped"
+            exited = show["projection"]["liveness"]["verdict"] == "exited" or (show.get("observation") or {}).get("status") == "exited"
+            if state.get("pending"):
+                pending = state["pending"]
+                restart(w, show, state, pending["why"], pending["exclude"], pending.get("crash", False))
+                continue
+            if not live:
+                if state.get("handoff") and reported:
+                    restart(w, show, state, "handed off at a usage limit", account.get("account"))
+                    continue
+                if w["dispatchStatus"] != "failed" or reported or stopped:
+                    save(terminal, None)  # finished, reported or stopped by the operator
+                    continue
+                exited = True
+            if exited:
+                if state.get("relaunched"):
+                    if not state.get("escalated"):
+                        escalate(number, "worker crashed again", f"Dispatch {dispatch} exited after its relaunch.")
+                        stage(ticket, "Needs you")
+                        state["escalated"] = "crash"
+                        save(terminal, state)
+                        actions.append({"issue": number, "dispatch": dispatch, "reported": "crashed again"})
+                else:
+                    restart(w, show, state, "its agent exited", None, crash=True)
+                continue
+            term = show.get("terminal") or {}
+            wait = (show.get("observation") or {}).get("agentWait") or term.get("agentWait")
+            launch = show["worker"]["startOptions"]["launch"]["effective"]
+            tail = runtime("terminal", "read", "--terminal", terminal, "--screen")["terminal"]["tail"]
+            hooks = codex_prompt(tail)
+            prompt = wait or (hooks if hooks and hooks.lower().lstrip().startswith("hooks need review") else None)
+            hit = screen_limit(tail, launch)
+            if hit:
+                stop = runtime("orchestration", "worker-stop", "--dispatch", dispatch, "--full")
+                actions.append({"issue": number, "stopped": dispatch, "limit": hit, "process": stop.get("processAction")})
+                restart(w, show, state, f"usage limit ({hit})", account.get("account"))
+            elif prompt:
+                key = json.dumps(prompt, ensure_ascii=False, sort_keys=True)
+                if state.get("prompt") != key:
+                    escalate(number, "permission prompt", f"Dispatch {dispatch} is waiting on: {key}")
+                    stage(ticket, "Needs you")
+                    state["prompt"] = key
+                    save(terminal, state)
+                    actions.append({"issue": number, "dispatch": dispatch, "forwarded": prompt})
+            elif (near := next((line.strip() for line in tail if NEAR_LIMIT.match(line)), None) or due.get(terminal)):
+                if not state.get("handoff"):
+                    runtime("orchestration", "send", *actor, "--to", "dispatch:" + dispatch,
+                            "--subject", f"#{number}: hand off now" if number else "hand off now",
+                            "--body", HANDOFF.format(why=near))
+                    state.update(handoff=int(now), previous_stage=ticket and ticket["stage"])
+                    stage(ticket, "Handed off")
+                    save(terminal, state)
+                    actions.append({"issue": number, "dispatch": dispatch, "handoff": near})
+            else:
+                digest = hashlib.sha256("\n".join(tail).encode()).hexdigest()
+                if state.get("screen") != digest:
+                    state.update(screen=digest, since=int(now))
+                    save(terminal, state)
+                elif now - state["since"] >= QUIET_MINUTES * 60 and state.get("escalated") != "silent":
+                    if not state.get("nudged"):
+                        runtime("orchestration", "send", *actor, "--to", "dispatch:" + dispatch,
+                                "--subject", f"#{number}: still working?" if number else "still working?",
+                                "--body", NUDGE.format(minutes=QUIET_MINUTES))
+                        state.update(nudged=True, since=int(now))
+                        actions.append({"issue": number, "dispatch": dispatch, "nudged": QUIET_MINUTES})
+                    else:
+                        escalate(number, "silent worker",
+                                 f"Dispatch {dispatch} showed the same screen for {QUIET_MINUTES} minutes after a nudge.")
+                        state["escalated"] = "silent"
+                        actions.append({"issue": number, "dispatch": dispatch, "reported": "silent after nudge"})
+                    save(terminal, state)
+        except (OrcaError, OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as e:
+            errors.append({"dispatch": dispatch, "error": str(e)})
+    log("watch", actions + errors or "no action")
+    if errors:
+        raise OrcaError(f"{len(errors)} watch error(s); see the watch line")
+
+
+def watch_workers(args):
+    import fcntl
+    state = Path.home() / ".local/state/dev-auto"
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (state / "fill.lock").open("a+") as lock, sqlite3.connect(state / "starts.sqlite") as db:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        watch_tick(args, db)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1684,7 +1940,17 @@ def main(argv=None):
     c.add_argument("--holds", type=Path, help="existing fleet picker's holds.json")
     c.add_argument("--anchor", help="pane-less supervisor anchor")
     c.add_argument("--run", help="Run already bound to the anchor")
+    w = sub.add_parser("watch", help="hand off, relaunch, nudge or report the coordinating Run's live workers",
+                       description="Check every live worker once and report what needs the coordinator that owns the Run.")
+    w.add_argument("--holds", type=Path, help="existing fleet picker's holds.json")
+    w.add_argument("--anchor", help="pane-less supervisor anchor")
+    w.add_argument("--run", help="Run already bound to the anchor")
     args = ap.parse_args(argv)
+    if args.cmd == "watch":
+        try:
+            return watch_workers(args)
+        except (OSError, OrcaError, ValueError, KeyError, sqlite3.Error, subprocess.TimeoutExpired) as e:
+            ap.exit(1, f"watch: {e}\n")
     if args.cmd == "close":
         if args.issue is not None and args.issue <= 0:
             c.error("--issue requires a positive issue number")

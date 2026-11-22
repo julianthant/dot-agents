@@ -66,3 +66,24 @@ If a startup prompt appears, fill forwards the observed prompt to the owning
 Run, sets the Project's Agent state to **Needs you**, and retains the hold
 and reservation. After the operator answers in the worker pane, the next real
 tick checks that same Dispatch before recording Coding.
+
+## Watch
+
+Run `scripts/tick.py watch` from the coordinating Run (or pass its launchd
+`--anchor` and `--run`). Each tick runs `pick.py coordinator`, then checks
+the current attempt of every live worker in the Run and logs one `watch` line:
+
+- A limit screen, the Codex model-switch menu or a switched Codex model:
+  `worker-stop`, then a fresh worker on another account `pick.py` gives,
+  started from the Task's spec plus the predecessor's last report.
+- A near-limit screen or an account `pick.py due` lists: one handoff request
+  to the Dispatch. Its failed `worker_done` starts the fresh worker.
+- The card shows **Handed off** until the replacement starts; with no seat it
+  stays there and each tick retries.
+- A crash relaunches once, then goes to the Run as an escalation (Needs you).
+- A screen unchanged for 20 minutes gets one nudge, then an escalation.
+- A permission prompt goes to the Run and the card goes to **Needs you**.
+
+The watch never types into a pane or answers a menu. A restart whose
+`worker-start` response was lost is escalated, not repeated: inspect the Run,
+then delete that terminal's row from the `watch` table in `starts.sqlite`.

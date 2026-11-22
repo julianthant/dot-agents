@@ -47,9 +47,14 @@ def live_holds(host):
 
 
 def windows(cfg, row, now):
-    """(five_hour %, weekly %); an unread window counts as 0 and is named in `why`."""
-    found = {w: p for p, _r, w in (da.usage_reading(cfg, row, now) or [])}
-    return found.get("five_hour"), found.get("weekly")
+    """(five_hour %, weekly %) from the newest reading of any age, Orca's or the CLI file's; a
+    window whose reset has passed reads 0. (None, None) when the account was never read."""
+    found = [r for r in (da.orca_usage(now).get(da.orca_key(row, now)), da.file_usage(row)) if r]
+    if not found:
+        return None, None
+    _at, read = max(found, key=lambda r: float(r[0]))
+    out = {w: (0.0 if r and float(r) <= now else float(p)) for p, r, w in read}
+    return out.get("five_hour", 0.0), out.get("weekly", 0.0)
 
 
 def claude_reason(plan, model, held, five, week):
@@ -115,9 +120,12 @@ def pick(cfg, agent, model, effort, host, now):
             why.append(f"{name}: Fable runs only on Max")
             continue
         five, week = windows(cfg, row, now)
-        if five is None or week is None:
-            why.append(f"{name}: usage unread, counted as 0%")
-        five, week = five or 0.0, week or 0.0
+        if five is None:
+            why.append(f"{name}: usage never read; run it once by hand to read it")
+            continue
+        if max(five, week) >= 100:
+            why.append(f"{name}: limit reached (5-hour {five:.0f}%, weekly {week:.0f}%)")
+            continue
         mine = [h for h in holds if h["account"] == row["id"]]
         if agent == "claude":
             reason = claude_reason(plan, model, [h["model"] for h in mine], five, week)

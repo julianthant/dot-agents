@@ -41,7 +41,8 @@ handoff_5h = 95
 weekly_handoff = 97     # at 97% weekly: every working session hands off to another account,
 weekly_single_sol = true  # then only one gpt-6.2-sol worker (any effort) runs here at a time
 
-# Weekly use never blocks an account; it narrows what runs there (Claude and Codex plus).
+# Weekly use narrows what runs on an account (Claude and Codex plus); only a window at 100%
+# blocks it, until that window resets. An account never read is skipped.
 [weekly]
 one_ticket = 90         # one ticket at a time: its coder and reviewer
 claude_sonnet_only = 97

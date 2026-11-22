@@ -1,3 +1,10 @@
+import io
+import json
+from contextlib import redirect_stdout
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
+
 import pick
 
 pro, mx = pick.LIM["claude"]["pro"], pick.LIM["claude"]["max"]
@@ -32,4 +39,39 @@ assert x("plus", plus, "gpt-6.2-luna:low", [], 0, 0).startswith("no weight")
 assert x("prolite", lite, H, [M] * 20, 99, 96) is None
 assert x("prolite", lite, H, [], 0, 97) is None
 assert x("prolite", lite, M, [M], 0, 97) == "weekly 97%: one gpt-6.2-sol worker only"
+# Exercise the CLI against an isolated account, hold file and read-only Orca fixture.
+with TemporaryDirectory() as temp:
+    root = Path(temp)
+    config = root / "accounts.toml"
+    config.write_text(f'[[account]]\nid = "fixture"\nlabel = "Fixture"\nagent = "claude"\n'
+                      f'plan = "pro"\nhome = {json.dumps(temp)}\n')
+    account = {"activeAccountId": "fixture"}
+    limits = {"updatedAt": 1000, "session": {"usedPercent": 96}}
+
+    def fake_orca(args, **kwargs):
+        replies = {
+            ("orca", "account", "list", "--json"): {"claude": account, "rateLimits": {"claude": limits}},
+            ("orca", "terminal", "list", "--json"): {"terminals": [{"handle": "worker"}]},
+        }
+        return pick.subprocess.CompletedProcess(args, 0, json.dumps({"result": replies[tuple(args)]}))
+
+    loader = pick.account_usage.load_config
+    with (patch.object(pick, "HOLDS", root / "holds.json"),
+          patch.object(pick.account_usage, "ORCA", "orca"),
+          patch.object(pick.account_usage, "load_config", side_effect=lambda: loader(config)),
+          patch.object(pick.time, "time", side_effect=[10, 11, 12, 13]),
+          patch.object(pick.subprocess, "run", side_effect=fake_orca),
+          redirect_stdout(io.StringIO()) as output):
+        rate_file = root / "rate-limits.json"
+        rate_file.write_text(json.dumps({"saved_at": 2, "rate_limits": {"five_hour": {"used_percentage": 5}}}))
+        route = ["--agent", "claude", "--model", S]
+        assert pick.main(["pick", *route]) == 0
+        assert json.loads(output.getvalue())["select"][-1] == "fixture"
+        assert pick.main(["hold", "--terminal", "worker", "--account", "Fixture", *route]) == 0
+        assert json.loads(pick.HOLDS.read_text())["worker"]["account"] == "fixture"
+        assert pick.main(["due"]) == 1
+        limits["updatedAt"] = 3000
+        assert pick.main(["due"]) == 0
+        assert output.getvalue().splitlines()[-1] == "Fixture worker 5-hour 96%"
+
 print("pick: all checks pass")

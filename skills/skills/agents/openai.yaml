@@ -1,0 +1,4 @@
+interface:
+  display_name: "Skills"
+  short_description: "Audit, create, sync, install, and simplify skills"
+  default_prompt: "Use $skills to manage or simplify my Codex and Claude skills."

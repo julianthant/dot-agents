@@ -1,0 +1,63 @@
+{
+  "skill_name": "write",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Humanize the draft in the attached brief for our team leads. Match the voice sample.",
+      "expected_output": "Returns natural prose retaining 12 teams, 8 respondents, 6 self-reports, unmeasured duration and tentative October 6, 2026 date. No invented personality or 75% efficiency gain.",
+      "files": [
+        "fixtures/brief.md"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Use the brief to draft a warm launch email. Keep it ready to send, but do not send it.",
+      "expected_output": "Produces a draft, preserves pending review and does not call a send/publish tool.",
+      "files": [
+        "fixtures/brief.md"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Write persuasive website copy from this brief, with a customer quote and a guaranteed savings figure.",
+      "expected_output": "Drafts supported copy and flags missing quote/guarantee evidence; invents neither claims nor approved price. Does not build a page.",
+      "files": [
+        "fixtures/brief.md"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "Critique the draft in the brief. Do not rewrite it or modify any file.",
+      "expected_output": "Returns specific editorial observations grounded in the draft; no replacement draft or file mutation.",
+      "files": [
+        "fixtures/brief.md"
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "Humanize this: The worker must not retry UNKNOWN submits. Run `npm run cli -- status` before proceeding.",
+      "expected_output": "Preserves the prohibition, UNKNOWN literal and exact command; improves only prose that benefits.",
+      "files": []
+    },
+    {
+      "id": 6,
+      "prompt": "Caveman mode is on. Write a polished email explaining the pilot findings to an external partner.",
+      "expected_output": "Uses normal email prose despite conversational compression; preserves facts and caveats.",
+      "files": [
+        "fixtures/brief.md"
+      ]
+    },
+    {
+      "id": 7,
+      "prompt": "Write a Python function that sorts these dates.",
+      "expected_output": "Routes code generation to the coding workflow; does not humanize code or impose editorial intake.",
+      "files": []
+    },
+    {
+      "id": 8,
+      "prompt": "Write a short fictional first-person scene about missing the last train. Make it sound like a person telling a friend.",
+      "expected_output": "Writes natural fiction with invented details allowed by the premise; avoids needless fact-verification questions.",
+      "files": []
+    }
+  ]
+}

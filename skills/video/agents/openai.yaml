@@ -1,0 +1,6 @@
+interface:
+  display_name: "Video"
+  short_description: "Inspect video frames and timestamped transcripts"
+  default_prompt: "Use $video to inspect this video and answer my question with timestamps."
+policy:
+  allow_implicit_invocation: false

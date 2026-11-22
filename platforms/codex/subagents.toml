@@ -1,0 +1,14 @@
+# Codex fields for agents/generate.py. No [access] tables: a custom agent file cannot override the
+# parent's sandbox or permissions, so tool limits stay in each role's instructions.
+
+[role.scout]
+model = "gpt-6-luna"
+model_reasoning_effort = "max"
+
+[role.mechanic]
+model = "gpt-6-luna"
+model_reasoning_effort = "max"
+
+[role.builder]
+model = "gpt-6.1-sol"
+model_reasoning_effort = "medium"

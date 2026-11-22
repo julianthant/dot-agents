@@ -1,0 +1,6 @@
+interface:
+  display_name: "Docs"
+  short_description: "Simplify Markdown and agent instructions"
+  default_prompt: "Use $docs to simplify these instruction files and reconcile duplicates."
+policy:
+  allow_implicit_invocation: false

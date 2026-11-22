@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""host-check-lock <command> [args...]: run a heavy check (a typecheck, lint or test run)
+holding this host's one check lock, so only one runs on the host at a time. Waits for the
+lock, then runs the command and exits with its code. The lock is a flock on a file in
+~/.cache/dev-auto (DEV_AUTO_CHECK_LOCK overrides the path); it is freed when the command
+ends, however it ends."""
+
+import fcntl
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+def main(argv):
+    if not argv:
+        sys.exit("usage: host-check-lock <command> [args...]")
+    path = Path(
+        os.environ.get("DEV_AUTO_CHECK_LOCK")
+        or Path.home() / ".cache" / "dev-auto" / "host-check.lock"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            began = time.monotonic()
+            print("host-check-lock: another check runs on this host; waiting", file=sys.stderr)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            waited = time.monotonic() - began
+            print(f"host-check-lock: waited {waited:.0f}s", file=sys.stderr)
+        try:
+            return subprocess.call(argv, pass_fds=(lock.fileno(),))
+        except OSError as error:
+            print(f"host-check-lock: {argv[0]}: {error}", file=sys.stderr)
+            return 127
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

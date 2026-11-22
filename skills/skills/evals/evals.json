@@ -1,0 +1,17 @@
+{
+  "skill_name": "skills",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Sync Codex to Claude. Claude has an intentional hidden browser helper absent from the Codex skill root.",
+      "expected_output": "Inspect its internal equivalent and callers, preserve native exposure and do not retire the helper solely because it is target-only.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Evaluate our skill improvement. We have smaller Markdown files and new expected-output fixtures but no recorded model runs.",
+      "expected_output": "Report structural checks and fixture preparation separately; behavioral runs and token savings remain unmeasured. Do not fabricate a pass or dispatch without authorization.",
+      "files": []
+    }
+  ]
+}

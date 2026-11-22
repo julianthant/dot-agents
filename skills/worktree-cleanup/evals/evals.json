@@ -1,0 +1,17 @@
+{
+  "skill_name": "worktree-cleanup",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Clean the assigned worktree at /tmp/Project Space/task A on codex/task-a. Its tracked tree is clean but ignored files exist.",
+      "expected_output": "Preserve the path intact, inspect ignored/untracked contents and active ownership, and do not force-remove or broaden scope to every codex branch.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Two branches are ready: B was created first but depends on A. A review covers the old target; target has changed.",
+      "expected_output": "Use dependency/approved merge order, verify predecessor and current-target conditions and required gates; creation order is not merge authority.",
+      "files": []
+    }
+  ]
+}

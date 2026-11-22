@@ -1,0 +1,84 @@
+[
+  {
+    "name": "frontend-design",
+    "repo": "anthropics/claude-plugins-official",
+    "path": "plugins/frontend-design/skills/frontend-design",
+    "local": "ui-direction",
+    "commit": "a7ba5b93db0c7c8d17f3f1d25853adca79598a1a",
+    "license": "Apache-2.0",
+    "license_path": "plugins/frontend-design/skills/frontend-design/LICENSE.txt"
+  },
+  {
+    "name": "impeccable",
+    "repo": "pbakaus/impeccable",
+    "path": ".agents/skills/impeccable",
+    "local": "ui-polish",
+    "commit": "e89e3ada3e875a89ac2c5d33d11e65ebef6fe285",
+    "license": "Apache-2.0",
+    "license_path": "LICENSE"
+  },
+  {
+    "name": "impeccable-rules",
+    "repo": "pbakaus/impeccable",
+    "path": "crates/live/assets/antipatterns.json",
+    "local": "ui-polish",
+    "commit": "e89e3ada3e875a89ac2c5d33d11e65ebef6fe285",
+    "license": "Apache-2.0",
+    "license_path": "LICENSE"
+  },
+  {
+    "name": "shadcn",
+    "repo": "shadcn-ui/ui",
+    "path": "skills/shadcn",
+    "local": "ui-component",
+    "commit": "4aaea19d9cff3e0908e12a8c1d504b8c5ec34610",
+    "license": "MIT",
+    "license_path": "LICENSE.md"
+  },
+  {
+    "name": "web-design-guidelines",
+    "repo": "vercel-labs/agent-skills",
+    "path": "skills/web-design-guidelines",
+    "local": "ui-review",
+    "commit": "1a2c79d4e6c4a2283dc2c614b6538cbe1ed5ca62",
+    "license": "Not specified upstream"
+  },
+  {
+    "name": "redesign-existing-projects",
+    "repo": "leonxlnx/taste-skill",
+    "path": "skills/redesign-skill",
+    "local": "ui-redesign",
+    "commit": "e04409a461022e1b9d0e898eac6b9224e2b9dc4e",
+    "license": "MIT",
+    "license_path": "LICENSE",
+    "ref": "e04409a461022e1b9d0e898eac6b9224e2b9dc4e"
+  },
+  {
+    "name": "impeccable-license",
+    "repo": "pbakaus/impeccable",
+    "path": "LICENSE",
+    "local": "ui-polish",
+    "commit": "e89e3ada3e875a89ac2c5d33d11e65ebef6fe285",
+    "license": "Apache-2.0",
+    "license_path": "LICENSE"
+  },
+  {
+    "name": "shadcn-license",
+    "repo": "shadcn-ui/ui",
+    "path": "LICENSE.md",
+    "local": "ui-component",
+    "commit": "4aaea19d9cff3e0908e12a8c1d504b8c5ec34610",
+    "license": "MIT",
+    "license_path": "LICENSE.md"
+  },
+  {
+    "name": "redesign-existing-projects-license",
+    "repo": "leonxlnx/taste-skill",
+    "path": "LICENSE",
+    "local": "ui-redesign",
+    "commit": "e04409a461022e1b9d0e898eac6b9224e2b9dc4e",
+    "license": "MIT",
+    "license_path": "LICENSE",
+    "ref": "e04409a461022e1b9d0e898eac6b9224e2b9dc4e"
+  }
+]

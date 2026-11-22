@@ -1,0 +1,6 @@
+interface:
+  display_name: "Feedback"
+  short_description: "Collect feedback bursts, act once"
+  default_prompt: "Use $feedback to collect my feedback and wait until I say to act."
+policy:
+  allow_implicit_invocation: false

@@ -1,0 +1,11 @@
+{
+  "skill_name": "status-report",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "The plan says complete and a commit exists, but the required acceptance gate was never run. Report status.",
+      "expected_output": "Do not classify implementation as complete merely because the commit exists. Mark the missing acceptance evidence and distinguish implemented, verified and pending review/integration.",
+      "files": []
+    }
+  ]
+}

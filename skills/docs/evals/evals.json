@@ -1,0 +1,17 @@
+{
+  "skill_name": "docs",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Record the lesson from this fix. The final code and test fully explain the behavior; there is no non-obvious rationale.",
+      "expected_output": "Explain why a separate lesson adds no durable value; do not create redundant documentation.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Move long agent instructions into references. One proposed pointer says \"read more if needed\".",
+      "expected_output": "Replace the vague pointer with a concrete task trigger and owner; verify real retrieval and preserved rules, not only link existence.",
+      "files": []
+    }
+  ]
+}

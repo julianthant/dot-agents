@@ -1,0 +1,49 @@
+{
+  "skill_name": "discuss",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "/discuss I am unsure whether this service should own retries or leave them to callers.",
+      "expected_output": "A collaborative exploration of ownership, failure semantics, callers, and tradeoffs that does not create a plan, edit files, or choose for the user.",
+      "files": [],
+      "expectations": [
+        "Reflects the tension and surfaces assumptions.",
+        "Uses focused conversational questions rather than an exhaustive questionnaire.",
+        "Does not persist or take action."
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "/discuss Check the repository if needed: I think there is no existing authority for queue retry behavior.",
+      "expected_output": "A read-only check of relevant repository authorities followed by a discussion that distinguishes verified facts from inference and makes no modifications.",
+      "files": [],
+      "expectations": [
+        "Allows bounded read-only fact finding.",
+        "Does not create a board, research record, or plan.",
+        "Keeps uncertainty visible."
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "/discuss We agree on the direction now.",
+      "expected_output": "A concise shared-understanding summary and optional next-mode choices without automatically recording, planning, coordinating, or implementing anything.",
+      "files": [],
+      "expectations": [
+        "Does not infer that agreement authorizes action.",
+        "Waits for an explicit mode switch or record request."
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "Use /discuss: I think adding a leaderboard will improve retention. We have no user research yet.",
+      "expected_output": "Separate the retention outcome, user problem, proposed leaderboard and assumptions; do not invent research, write a PRD or start implementation.",
+      "files": []
+    },
+    {
+      "id": 5,
+      "prompt": "Use /discuss. We have explored this thoroughly; the remaining question is whether users will return more often.",
+      "expected_output": "Identify the empirical evidence needed, preserve uncertainty and stop expanding the interview merely to fill a framework.",
+      "files": []
+    }
+  ]
+}

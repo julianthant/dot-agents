@@ -1,0 +1,20 @@
+# Claude Code fields for agents/generate.py: [role.<name>] per role, [access.<level>] per tool limit.
+
+[access.read-only]
+tools = "Bash, Read, Grep, Glob"
+
+[access.edit]
+tools = "*"
+disallowedTools = "Agent, AskUserQuestion, EnterPlanMode, ExitPlanMode, Artifact, PushNotification, SendMessage, ScheduleWakeup"
+
+[role.scout]
+model = "haiku"
+effort = "low"
+
+[role.mechanic]
+model = "sonnet"
+effort = "low"
+
+[role.builder]
+model = "sonnet"
+effort = "medium"

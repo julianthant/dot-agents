@@ -1,0 +1,6 @@
+interface:
+  display_name: "UI"
+  short_description: "Chain the ui skills for interface work"
+  default_prompt: "Use $ui for this interface change."
+policy:
+  allow_implicit_invocation: false

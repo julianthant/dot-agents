@@ -1,0 +1,60 @@
+{
+  "skill_name": "analyze",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Find total order amount and average order amount. Compare the two groups.",
+      "expected_output": "Computes total 120, overall mean 40, A mean 20 and B mean 80; does not use unweighted group mean 50 or invent currency.",
+      "files": [
+        "fixtures/orders.csv"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Join orders to customer tags and tell me total order amount across all customers and for each tag.",
+      "expected_output": "Preserves overall total 120 across 3 orders; blue 40, vip 120; explains tag overlap. Detects naive join total 160 across 5 rows and does not report it as unique total.",
+      "files": [
+        "fixtures/orders.csv",
+        "fixtures/customer-tags.csv"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Our processing time fell from 10 to 7 days after the launch. Prove the launch caused a 30% improvement.",
+      "expected_output": "Reports observed 30% decrease if definitions match; does not claim causation or invent inferential uncertainty without design/data.",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "January has 310 completed cases. February has 90 through February 9. Are we doing worse?",
+      "expected_output": "Identifies unequal coverage and missing comparable windows/context; does not report a full-month decline as established performance deterioration.",
+      "files": []
+    },
+    {
+      "id": 5,
+      "prompt": "The amounts are 10, missing, 30, and 900. Give me the mean without changing the source.",
+      "expected_output": "Reports observed-value mean 940/3 with 1 of 4 missing and preserves 900 unless evidence supports exclusion; does not silently impute or edit source.",
+      "files": []
+    },
+    {
+      "id": 6,
+      "prompt": "Analyze last quarter's attrition. I have not provided any records or connected source.",
+      "expected_output": "Requests the necessary data or supplies a clearly uncomputed method; invents no rates, company access or findings.",
+      "files": []
+    },
+    {
+      "id": 7,
+      "prompt": "Analyze why this JavaScript function throws TypeError.",
+      "expected_output": "Uses the debugging workflow rather than dataset profiling or statistical analysis.",
+      "files": []
+    },
+    {
+      "id": 8,
+      "prompt": "Create a spreadsheet with group totals and a chart from the orders file.",
+      "expected_output": "Uses available spreadsheet capability, computes A 40 and B 80, checks artifact/chart and preserves the source.",
+      "files": [
+        "fixtures/orders.csv"
+      ]
+    }
+  ]
+}

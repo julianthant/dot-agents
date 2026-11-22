@@ -1,0 +1,5 @@
+interface:
+  display_name: "Update"
+  short_description: "Check plugins and copied sources are current"
+policy:
+  allow_implicit_invocation: false

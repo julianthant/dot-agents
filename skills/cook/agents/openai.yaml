@@ -1,0 +1,6 @@
+interface:
+  display_name: "Cook"
+  short_description: "Take a bug, feature or refactor to a mergeable change"
+  default_prompt: "Use $cook to take this task to a verified, mergeable change."
+policy:
+  allow_implicit_invocation: false

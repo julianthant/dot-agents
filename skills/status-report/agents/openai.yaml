@@ -1,0 +1,6 @@
+interface:
+  display_name: "Status Report"
+  short_description: "Verified COMPLETE / DRIFT / NEXT / NEEDS YOU"
+  default_prompt: "Use $status-report to tell me where this project stands."
+policy:
+  allow_implicit_invocation: false

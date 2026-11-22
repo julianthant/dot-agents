@@ -1,0 +1,6 @@
+interface:
+  display_name: "Ship"
+  short_description: "Take a written change to a merged PR"
+  default_prompt: "Use $ship to take this change from cleanup to a merged PR."
+policy:
+  allow_implicit_invocation: false

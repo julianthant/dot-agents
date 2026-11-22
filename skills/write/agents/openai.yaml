@@ -1,0 +1,4 @@
+interface:
+  display_name: "Write"
+  short_description: "Draft and humanize prose in your voice"
+  default_prompt: "Use $write to make this draft natural while preserving its facts and my voice."

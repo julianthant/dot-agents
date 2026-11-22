@@ -1,0 +1,9 @@
+backups/
+__pycache__/
+*.pyc
+.DS_Store
+node_modules/
+.orca-skill-backups/
+.concord/
+skills/dev-auto/accounts.toml
+skills/dev-auto/accounts.toml.bak*

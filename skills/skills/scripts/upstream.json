@@ -1,0 +1,456 @@
+{
+  "repos": {
+    "pbakaus/impeccable": "b4bff1626c344067788c2679f048a20057c7cc5a",
+    "jakubkrehel/skills": "8b254eb75dadf3615a6abce87aed28e1b6e4d77c",
+    "emilkowalski/skills": "4061b67b8d976a186aca118594f54b638c5f718a",
+    "ibelick/ui-skills": "f511eae41c996e3953fbeabf95d38e4077d40711",
+    "Dammyjay93/interface-design": "2f9be3206855bcb2d1d0af262c8bae25cba6658d",
+    "anthropics/skills": "2c5958ecac7cee2b583967a2c4981d0f4a75c579",
+    "nextlevelbuilder/ui-ux-pro-max-skill": "6ae86f61f520d6ca229d2f40e070410638c908c5",
+    "shadcn-ui/ui": "dd41d19e2f80ff6891951f7ced74c2c9a650b065",
+    "magicuidesign/magicui": "1ac985adca3cdfab9b1739253fd14209687c4e9c",
+    "21st-dev/skill": "15c7436c41dc88c54094f1be93ce53bda456b114",
+    "CloudAI-X/threejs-skills": "0e181866f095b5f06d005133876e926515390d95"
+  },
+  "skills": {
+    "ui-dashboard": [
+      {
+        "repo": "Dammyjay93/interface-design",
+        "from": ".claude/skills/interface-design",
+        "to": "references/interface-design"
+      },
+      {
+        "repo": "Dammyjay93/interface-design",
+        "files": [
+          "LICENSE"
+        ],
+        "as": "LICENSE-interface-design"
+      }
+    ],
+    "ui-direction": [
+      {
+        "repo": "anthropics/skills",
+        "from": "skills/frontend-design",
+        "to": "references/frontend-design",
+        "files": [
+          "SKILL.md"
+        ]
+      },
+      {
+        "repo": "anthropics/skills",
+        "from": "skills/frontend-design",
+        "files": [
+          "LICENSE.txt"
+        ],
+        "as": "LICENSE-frontend-design.txt"
+      }
+    ],
+    "ui-style": [
+      {
+        "repo": "nextlevelbuilder/ui-ux-pro-max-skill",
+        "from": ".claude/skills/ui-ux-pro-max",
+        "to": "references/ui-ux-pro-max",
+        "exclude": [
+          "scripts/tests/*",
+          "scripts/validate_data.py",
+          "data/phosphor-icons-upstream.json",
+          "data/google-font-licenses.json",
+          "data/data-provenance.json",
+          "data/stacks/angular.csv",
+          "data/stacks/astro.csv",
+          "data/stacks/avalonia.csv",
+          "data/stacks/flutter.csv",
+          "data/stacks/javafx.csv",
+          "data/stacks/jetpack-compose.csv",
+          "data/stacks/laravel.csv",
+          "data/stacks/nextjs.csv",
+          "data/stacks/nuxt-ui.csv",
+          "data/stacks/nuxtjs.csv",
+          "data/stacks/react-native.csv",
+          "data/stacks/svelte.csv",
+          "data/stacks/swiftui.csv",
+          "data/stacks/threejs.csv",
+          "data/stacks/uno.csv",
+          "data/stacks/uwp.csv",
+          "data/stacks/vue.csv",
+          "data/stacks/winui.csv",
+          "data/stacks/wpf.csv"
+        ]
+      },
+      {
+        "repo": "nextlevelbuilder/ui-ux-pro-max-skill",
+        "files": [
+          "LICENSE"
+        ],
+        "as": "LICENSE-ui-ux-pro-max"
+      }
+    ],
+    "ui-polish": [
+      {
+        "repo": "pbakaus/impeccable",
+        "from": ".agents/skills/impeccable",
+        "to": "references/impeccable",
+        "files": [
+          "reference/polish.md",
+          "reference/craft-floor.md",
+          "reference/operate.md"
+        ]
+      },
+      {
+        "repo": "pbakaus/impeccable",
+        "files": [
+          "LICENSE"
+        ],
+        "as": "LICENSE-impeccable"
+      }
+    ],
+    "ui-redesign": [
+      {
+        "repo": "pbakaus/impeccable",
+        "from": ".agents/skills/impeccable",
+        "to": "references/impeccable",
+        "files": [
+          "reference/bolder.md",
+          "reference/quieter.md",
+          "reference/distill.md",
+          "reference/layout.md",
+          "reference/typeset.md",
+          "reference/craft-floor.md"
+        ]
+      },
+      {
+        "repo": "pbakaus/impeccable",
+        "files": [
+          "LICENSE"
+        ],
+        "as": "LICENSE-impeccable"
+      }
+    ],
+    "ui-critique": [
+      {
+        "repo": "jakubkrehel/skills",
+        "from": "skills/better-interface",
+        "to": "references/better-interface"
+      },
+      {
+        "repo": "jakubkrehel/skills",
+        "from": "skills/better-accessibility",
+        "to": "references/better-accessibility"
+      },
+      {
+        "repo": "jakubkrehel/skills",
+        "from": "skills/better-colors",
+        "to": "references/better-colors"
+      },
+      {
+        "repo": "jakubkrehel/skills",
+        "from": "skills/better-layout",
+        "to": "references/better-layout"
+      },
+      {
+        "repo": "jakubkrehel/skills",
+        "from": "skills/better-typography",
+        "to": "references/better-typography"
+      },
+      {
+        "repo": "jakubkrehel/skills",
+        "from": "skills/better-ui",
+        "to": "references/better-ui"
+      },
+      {
+        "repo": "jakubkrehel/skills",
+        "from": "skills/better-writing",
+        "to": "references/better-writing"
+      },
+      {
+        "repo": "jakubkrehel/skills",
+        "files": [
+          "LICENSE"
+        ],
+        "as": "LICENSE-jakubkrehel"
+      }
+    ],
+    "ui-review": [
+      {
+        "repo": "jakubkrehel/skills",
+        "from": "skills/interface-review",
+        "to": "references/interface-review"
+      },
+      {
+        "repo": "jakubkrehel/skills",
+        "from": "skills/better-interface",
+        "to": "references/better-interface"
+      },
+      {
+        "repo": "jakubkrehel/skills",
+        "from": "skills/better-accessibility",
+        "to": "references/better-accessibility"
+      },
+      {
+        "repo": "jakubkrehel/skills",
+        "from": "skills/better-colors",
+        "to": "references/better-colors"
+      },
+      {
+        "repo": "jakubkrehel/skills",
+        "from": "skills/better-layout",
+        "to": "references/better-layout"
+      },
+      {
+        "repo": "jakubkrehel/skills",
+        "from": "skills/better-typography",
+        "to": "references/better-typography"
+      },
+      {
+        "repo": "jakubkrehel/skills",
+        "from": "skills/better-ui",
+        "to": "references/better-ui"
+      },
+      {
+        "repo": "jakubkrehel/skills",
+        "from": "skills/better-writing",
+        "to": "references/better-writing"
+      },
+      {
+        "repo": "jakubkrehel/skills",
+        "files": [
+          "LICENSE"
+        ],
+        "as": "LICENSE-jakubkrehel"
+      }
+    ],
+    "ui-accessibility": [
+      {
+        "repo": "jakubkrehel/skills",
+        "from": "skills/better-accessibility",
+        "to": "references/better-accessibility"
+      },
+      {
+        "repo": "jakubkrehel/skills",
+        "files": [
+          "LICENSE"
+        ],
+        "as": "LICENSE-jakubkrehel"
+      }
+    ],
+    "ui-motion": [
+      {
+        "repo": "emilkowalski/skills",
+        "from": "skills/emil-design-eng",
+        "to": "references/emil-design-eng"
+      },
+      {
+        "repo": "emilkowalski/skills",
+        "from": "skills/review-animations",
+        "to": "references/review-animations"
+      },
+      {
+        "repo": "emilkowalski/skills",
+        "from": "skills/improve-animations",
+        "to": "references/improve-animations"
+      },
+      {
+        "repo": "emilkowalski/skills",
+        "files": [
+          "LICENSE"
+        ],
+        "as": "LICENSE-emilkowalski"
+      }
+    ],
+    "ui-stress": [
+      {
+        "repo": "emilkowalski/skills",
+        "from": "skills/break-ui",
+        "to": "references/break-ui"
+      },
+      {
+        "repo": "emilkowalski/skills",
+        "files": [
+          "LICENSE"
+        ],
+        "as": "LICENSE-emilkowalski"
+      }
+    ],
+    "ui-states": [
+      {
+        "repo": "jakubkrehel/skills",
+        "from": "skills/state-machine",
+        "to": "references/state-machine"
+      },
+      {
+        "repo": "jakubkrehel/skills",
+        "files": [
+          "LICENSE"
+        ],
+        "as": "LICENSE-jakubkrehel"
+      }
+    ],
+    "ui-library": [
+      {
+        "repo": "emilkowalski/skills",
+        "from": "skills/pick-ui-library",
+        "to": "references/pick-ui-library"
+      },
+      {
+        "repo": "emilkowalski/skills",
+        "files": [
+          "LICENSE"
+        ],
+        "as": "LICENSE-emilkowalski"
+      }
+    ],
+    "ui-components": [
+      {
+        "repo": "shadcn-ui/ui",
+        "from": "skills/shadcn",
+        "to": "references/shadcn",
+        "exclude": [
+          "evals/*",
+          "assets/*.png"
+        ]
+      },
+      {
+        "repo": "magicuidesign/magicui",
+        "from": "skills/magic-ui",
+        "to": "references/magic-ui"
+      },
+      {
+        "repo": "21st-dev/skill",
+        "from": "skills/21st-cli-use",
+        "to": "references/21st-cli-use"
+      },
+      {
+        "repo": "shadcn-ui/ui",
+        "files": [
+          "LICENSE.md"
+        ],
+        "as": "LICENSE-shadcn.md"
+      },
+      {
+        "repo": "magicuidesign/magicui",
+        "files": [
+          "LICENSE.md"
+        ],
+        "as": "LICENSE-magicui.md"
+      },
+      {
+        "repo": "21st-dev/skill",
+        "files": [
+          "LICENSE"
+        ],
+        "as": "LICENSE-21st"
+      }
+    ],
+    "ui-audit": [
+      {
+        "repo": "ibelick/ui-skills",
+        "from": "skills/improve-ui",
+        "to": "references/improve-ui"
+      },
+      {
+        "repo": "ibelick/ui-skills",
+        "files": [
+          "LICENSE"
+        ],
+        "as": "LICENSE-ui-skills"
+      }
+    ],
+    "ui-design-md": [
+      {
+        "repo": "ibelick/ui-skills",
+        "from": "skills/create-design-md",
+        "to": "references/create-design-md"
+      },
+      {
+        "repo": "ibelick/ui-skills",
+        "files": [
+          "LICENSE"
+        ],
+        "as": "LICENSE-ui-skills"
+      }
+    ],
+    "ui-3d": [
+      {
+        "repo": "CloudAI-X/threejs-skills",
+        "from": "skills/threejs-fundamentals",
+        "to": "references/threejs-fundamentals"
+      },
+      {
+        "repo": "CloudAI-X/threejs-skills",
+        "from": "skills/threejs-geometry",
+        "to": "references/threejs-geometry"
+      },
+      {
+        "repo": "CloudAI-X/threejs-skills",
+        "from": "skills/threejs-materials",
+        "to": "references/threejs-materials"
+      },
+      {
+        "repo": "CloudAI-X/threejs-skills",
+        "from": "skills/threejs-lighting",
+        "to": "references/threejs-lighting"
+      },
+      {
+        "repo": "CloudAI-X/threejs-skills",
+        "from": "skills/threejs-shaders",
+        "to": "references/threejs-shaders"
+      },
+      {
+        "repo": "CloudAI-X/threejs-skills",
+        "from": "skills/threejs-animation",
+        "to": "references/threejs-animation"
+      },
+      {
+        "repo": "CloudAI-X/threejs-skills",
+        "from": "skills/threejs-interaction",
+        "to": "references/threejs-interaction"
+      },
+      {
+        "repo": "CloudAI-X/threejs-skills",
+        "from": "skills/threejs-loaders",
+        "to": "references/threejs-loaders"
+      },
+      {
+        "repo": "CloudAI-X/threejs-skills",
+        "from": "skills/threejs-postprocessing",
+        "to": "references/threejs-postprocessing"
+      },
+      {
+        "repo": "CloudAI-X/threejs-skills",
+        "from": "skills/threejs-performance",
+        "to": "references/threejs-performance"
+      },
+      {
+        "repo": "CloudAI-X/threejs-skills",
+        "from": "skills/threejs-react-three-fiber",
+        "to": "references/threejs-react-three-fiber"
+      },
+      {
+        "repo": "CloudAI-X/threejs-skills",
+        "from": "skills/threejs-asset-pipeline",
+        "to": "references/threejs-asset-pipeline"
+      },
+      {
+        "repo": "CloudAI-X/threejs-skills",
+        "files": [
+          "LICENSE"
+        ],
+        "as": "LICENSE-threejs-skills"
+      }
+    ],
+    "ui-mock": [
+      {
+        "repo": "jakubkrehel/skills",
+        "from": "skills/variant",
+        "to": "references/variant"
+      },
+      {
+        "repo": "jakubkrehel/skills",
+        "files": [
+          "LICENSE"
+        ],
+        "as": "LICENSE-jakubkrehel"
+      }
+    ]
+  }
+}

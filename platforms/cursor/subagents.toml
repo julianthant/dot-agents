@@ -1,0 +1,13 @@
+# Cursor fields for agents/generate.py: [role.<name>] per role, [access.<level>] per tool limit.
+
+[access.read-only]
+readonly = true
+
+[role.scout]
+model = "inherit"
+
+[role.mechanic]
+model = "inherit"
+
+[role.builder]
+model = "inherit"

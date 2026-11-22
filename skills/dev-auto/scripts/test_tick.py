@@ -246,10 +246,10 @@ from pathlib import Path
 with TemporaryDirectory() as tmp:
     dbpath = Path(tmp) / "state"
     with sqlite3.connect(dbpath) as db:
-        tick.reserve(db, 17)
+        tick.reserve(db, 17, {"task": "fixture"})
     with sqlite3.connect(dbpath) as db:
         with check.assertRaisesRegex(tick.OrcaError, "17"):
-            tick.reserve(db, 17)
+            tick.reserve(db, 17, {"task": "fixture"})
 
 # Exercise launch through the real advisor file, journal, hold and Project-edit boundary.
 from types import SimpleNamespace
@@ -258,31 +258,37 @@ with TemporaryDirectory() as tmp, sqlite3.connect(":memory:") as db:
     root = Path(tmp)
     card = []
     starts = []
-    ticket = dict(base, number=51, base="origin/main", route=("claude", "claude-sonnet-5-5", "medium", "opus"))
+    ticket = dict(base, number=51, sha="sha", base="origin/main", route=("claude", "claude-sonnet-5-5", "medium", "opus"))
     args = SimpleNamespace(anchor=None, run=None)
     def cli(*args):
         if args[0] == "git":
-            return ticket["branch"]
+            return "sha" if "rev-parse" in args else ticket["branch"]
         check.assertEqual(args[:3], ("gh", "project", "item-edit"))
         card.append(args[-1])
         return ""
     def local(*args):
         verb = args[:2]
+        if verb == ("orchestration", "task-create"):
+            return {"task": {"id": "fixture-task"}}
+        if verb == ("orchestration", "dispatch-show"):
+            return {"dispatch": {"id": "fixture-dispatch"}}
         if verb == ("orchestration", "run-current"):
             return {"runId": "fixture"}
         if verb == ("worktree", "create"):
-            return {"worktree": {"path": str(root), "branch": ticket["branch"]}}
+            return {"worktree": {"path": str(root), "branch": ticket["branch"], "id": "wt"}}
         if verb == ("account", "select"):
             return {}
         if verb == ("account", "list"):
             return {"claude": {"activeAccountId": "seat"}}
         if verb == ("orchestration", "worker-start"):
             starts.append(args)
+            check.assertIn("--task", args)
             check.assertEqual(json.loads((root / ".claude/settings.local.json").read_text()), {"advisorModel": "opus"})
             check.assertNotIn("--from", args)
             return {"dispatchId": "fixture-dispatch", "state": "ready"}
         check.assertEqual(verb, ("orchestration", "worker-show"))
-        return {"dispatch": {"id": "fixture-dispatch", "assigneeHandle": "fixture-terminal"}}
+        return {"dispatch": {"id": "fixture-dispatch", "assigneeHandle": "fixture-terminal", "runId": "fixture",
+                             "taskId": "fixture-task"}, "worker": {"state": "ready", "worktreeId": "wt"}}
 
     with patch.object(tick, "project_fields", return_value=("project", [("s","progress"),("c","coding"),("a",None)])), \
          patch.object(tick, "runtime", local), patch.object(tick, "command", cli), \
@@ -293,6 +299,99 @@ with TemporaryDirectory() as tmp, sqlite3.connect(":memory:") as db:
     check.assertEqual(len(starts), 1)
     check.assertEqual(json.loads((root / "holds.json").read_text())["fixture-terminal"]["account"], "seat")
     check.assertEqual(card, ["progress", "coding", "coder claude-sonnet-5-5 medium+advisor @example"])
+
+# Preparation can fail without reserving an issue. A lost start response is recovered by
+# its durable Task, including after reopening SQLite with a parked Codex menu.
+with TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    ledger = root / "starts"
+    holds = root / "holds.json"
+    args = SimpleNamespace(anchor=None, run=None, dry_run=False, repo_path=root, holds=holds, issue=None)
+    codex_ticket = dict(ticket, route=base["route"])
+    screen = ["Switch model?"]
+    operations = []
+    preparation_failed = True
+    visible = False
+    refused = False
+    def recovery_runtime(*argv):
+        verb = argv[:2]
+        operations.append(verb)
+        if verb == ("account", "list"):
+            return {"codex": {"activeAccountId": "other" if preparation_failed else "seat"}}
+        if verb == ("orchestration", "worker-start"):
+            if refused:
+                reply = {"ok": False, "error": {"message": "refused", "data": {"effectsApplied": False}}}
+                with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(argv, 1, json.dumps(reply), "")):
+                    return real_command("orca", *argv)
+            raise subprocess.TimeoutExpired("worker-start", 1)
+        if verb == ("orchestration", "dispatch-show") and not visible:
+            return {"dispatch": None}
+        if verb == ("orchestration", "worker-show"):
+            return dict(local(*argv), observation=None, terminal={"handle": "fixture-terminal"})
+        if verb == ("orchestration", "send"):
+            check.assertEqual(argv[argv.index("--to")+1], "run:fixture")
+            check.assertIn(screen[0], argv[argv.index("--body")+1])
+            return {"messageId": "notice"}
+        if verb == ("terminal", "read"):
+            return {"terminal": {"tail": screen}}
+        return local(*argv)
+
+    recovery_edits = []
+    real_command = tick.command
+    def recovery_command(*argv):
+        if argv[:3] == ("gh", "project", "item-edit"):
+            recovery_edits.append(argv)
+            return ""
+        if "get-url" in argv:
+            return "git@github.com:julianthant/hr-relay.git"
+        if "for-each-ref" in argv or "ls-remote" in argv:
+            return ""
+        return cli(*argv)
+
+    import pick
+    with (patch.object(tick, "project_fields", return_value=("project", [("field", "coding")])),
+          patch.object(tick, "runtime", recovery_runtime), patch.object(tick, "command", recovery_command),
+          patch.object(tick, "tickets", return_value=[]), patch.object(tick, "inventory", return_value=set()),
+          patch.object(pick.account_usage, "load_config", return_value={}),
+          patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE": "fixture"}), redirect_stdout(io.StringIO()) as output):
+        with sqlite3.connect(ledger) as db:
+            with check.assertRaisesRegex(tick.OrcaError, "selected account changed"):
+                tick.launch(db, root, codex_ticket, account, args, holds)
+            preparation_failed = False
+            refused = True
+            with check.assertRaisesRegex(tick.OrcaError, "no start effects"):
+                tick.launch(db, root, codex_ticket, account, args, holds)
+            check.assertEqual(db.execute("SELECT count(*) FROM starts").fetchone(), (0,))
+            operations.clear()
+            refused = False
+            with check.assertRaisesRegex(tick.OrcaError, "fixture-task"):
+                tick.launch(db, root, codex_ticket, account, args, holds)
+        with sqlite3.connect(ledger) as db:
+            with check.assertRaisesRegex(tick.OrcaError, "no Dispatch"):
+                tick.fill_tick(args, db)
+            visible = True
+            tick.fill_tick(args, db)
+            check.assertIn("waiting for operator input", output.getvalue())
+            check.assertIn('"prompt": "Switch model?"', output.getvalue())
+            check.assertEqual(json.loads(holds.read_text())["fixture-terminal"]["account"], "seat")
+            tick.fill_tick(args, db)
+            check.assertEqual(operations.count(("orchestration", "send")), 1)
+            screen[:] = ["Hooks need review before continuing"]
+            tick.fill_tick(args, db)
+            check.assertIn('"prompt": "Hooks need review before continuing"', output.getvalue())
+            check.assertEqual(recovery_edits, [])
+            screen.clear()
+            tick.fill_tick(args, db)
+            check.assertEqual(db.execute("SELECT receipt FROM starts").fetchone(), ("done",))
+            check.assertEqual(len(recovery_edits), 1)
+    check.assertEqual(operations.count(("orchestration", "worker-start")), 1)
+    check.assertNotIn(("terminal", "send"), operations)
+    check.assertNotIn(("orchestration", "approve"), operations)
+
+# The fleet's actual model menu has no question mark. Quoted prose is not a prompt.
+menu = ["Approaching rate limits", "› 1. Switch to gpt-6-luna", "  2. Keep current model"]
+check.assertEqual(tick.codex_prompt(["unrelated transcript", *menu, "unrelated footer"]), "\n".join(menu))
+check.assertIsNone(tick.codex_prompt(['I did not see the "Hooks need review" screen.']))
 
 # An in-pane worker cannot select somebody else's anchor even with a valid-looking Run.
 with sqlite3.connect(":memory:") as db, patch.object(tick, "project_fields", return_value=(None, [])), \
@@ -318,10 +417,48 @@ with TemporaryDirectory() as tmp, ExitStack() as stack:
     stack.enter_context(patch.object(pick, "pick", return_value=(account, [])))
     launch = stack.enter_context(patch.object(tick, "launch"))
     with redirect_stdout(io.StringIO()) as output:
-        tick.fill_tick(args, None)
+        with patch.object(Path, "home", return_value=root):
+            tick.fill(args)
+    check.assertFalse((root / ".local").exists())
     check.assertIn('would start', output.getvalue())
     check.assertIn('"issue": 51', output.getvalue())
     check.assertEqual(holds.read_text(), '{"dead": {"host": "local"}}')
     launch.assert_not_called()
+
+
+# Only the chosen upstream base is fetched. A concurrent remote branch blocks the start.
+with TemporaryDirectory() as temp, ExitStack() as stack:
+    root = Path(temp)
+    args = SimpleNamespace(repo_path=root, dry_run=False, issue=51, holds=root / "holds.json")
+    calls = []
+    raced = False
+    def git(*argv):
+        calls.append(argv)
+        if "get-url" in argv:
+            return "git@github.com:julianthant/hr-relay.git"
+        if "for-each-ref" in argv:
+            return ""
+        if "ls-remote" in argv:
+            return "abc refs/heads/main" + ("\ndef refs/heads/task/a/lane" if raced and argv[-1] != "origin" else "")
+        if "fetch" in argv:
+            check.assertEqual(argv[3:], ("fetch", "--no-tags", "origin", "refs/heads/main:refs/remotes/origin/main"))
+            return ""
+        check.assertEqual(argv[3:], ("rev-parse", "--verify", "origin/main"))
+        return "abc"
+
+    stack.enter_context(patch.object(tick, "command", git))
+    stack.enter_context(patch.object(tick, "tickets", side_effect=lambda: [dict(ticket)]))
+    stack.enter_context(patch.object(tick, "inventory", return_value=set()))
+    stack.enter_context(patch.object(pick.account_usage, "load_config", return_value={}))
+    stack.enter_context(patch.object(pick, "pick", return_value=(account, [])))
+    start = stack.enter_context(patch.object(tick, "launch"))
+    stack.enter_context(redirect_stdout(io.StringIO()))
+    tick.fill_tick(args, None)
+    check.assertEqual(start.call_args.args[2]["sha"], "abc")
+    check.assertEqual([c[3] for c in calls][-3:], ["fetch", "ls-remote", "rev-parse"])
+    raced = True
+    with check.assertRaisesRegex(tick.OrcaError, "base changed or task branch"):
+        tick.fill_tick(args, None)
+    start.assert_called_once()
 
 print("ok")

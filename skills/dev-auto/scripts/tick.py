@@ -13,7 +13,6 @@ Coordinator verbs refuse a sender with no stable Orca pane, so the script opens 
 from pathlib import Path
 import argparse
 import sqlite3
-import tempfile
 from unittest.mock import patch
 import json
 import os
@@ -337,9 +336,26 @@ query($endCursor:String) {
 """
 
 
+class StartNotApplied(OrcaError):
+    pass
+
+
 def command(*args):
     result = subprocess.run(args, capture_output=True, text=True, timeout=900 if "worker-start" in args else 90)
     if result.returncode:
+        if args[1:3] == ("orchestration", "worker-start"):
+            try:
+                reply = json.loads(result.stdout)
+            except ValueError:
+                reply = {}
+            error = reply.get("error") if isinstance(reply, dict) and reply.get("ok") is False else None
+            data = error.get("data") if isinstance(error, dict) else None
+            if isinstance(data, dict):
+                recovery = data.get("recovery") or {}
+                if data.get("effectsApplied") is False or recovery.get("disposition") == "not_sent":
+                    raise StartNotApplied(str(error.get("message")))
+                if recovery.get("orchestrationRequestId"):
+                    raise OrcaError(f"inspect Orca request {recovery['orchestrationRequestId']}")
         raise OrcaError(f"{args[0]} {args[1]} failed: {(result.stderr or result.stdout).strip()[:500]}")
     return result.stdout
 
@@ -457,11 +473,11 @@ def runtime(*args):
     return response["result"]
 
 
-def reserve(db, number):
+def reserve(db, number, receipt):
     db.execute("CREATE TABLE IF NOT EXISTS starts (issue INTEGER PRIMARY KEY, receipt TEXT)")
     try:
         with db:
-            db.execute("INSERT INTO starts VALUES (?, NULL)", (number,))
+            db.execute("INSERT INTO starts VALUES (?, ?)", (number, json.dumps(receipt)))
     except sqlite3.IntegrityError as e:
         raise OrcaError(f"issue #{number} already reserved") from e
 
@@ -479,18 +495,17 @@ def project_fields():
     return project, edits
 
 
-def record_start(db, number, rec):
+def record_hold(rec):
     tier = rec["route"]
-    # Same hold file used by the existing fleet. Write the complete replacement atomically.
-    path = Path(rec["holds"])
-    holds = json.loads(path.read_text()) if path.exists() else {}
-    holds[rec["terminal"]] = dict(account=rec["account"], label=rec["label"], agent=tier[0],
-                                  model=tier[1], effort=tier[2], host="local", at=rec["time"])
-    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as f:
-        json.dump(holds, f, indent=1)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(f.name, path)
+    import pick
+    with pick.edit_holds(Path(rec["holds"])) as holds:
+        holds[rec["terminal"]] = dict(account=rec["account"], label=rec["label"], agent=tier[0],
+                                      model=tier[1], effort=tier[2], host="local", at=rec["time"])
+
+
+def record_start(db, number, rec):
+    record_hold(rec)
+    tier = rec["route"]
     agent = f"coder {tier[1]} {tier[2]}" + ("+advisor" if tier[3] else "") + " @" + rec["label"]
     for field, value in rec["fields"]:
         command("gh", "project", "item-edit", "--project-id", rec["project"], "--id", rec["item"],
@@ -535,7 +550,14 @@ def fill_tick(args, db):
             if receipt != "done":
                 if args.dry_run:
                     raise OrcaError(f"pending hold and card for #{n}")
-                record_start(db, n, json.loads(receipt))
+                rec = json.loads(receipt)
+                if "task" in rec:
+                    actor, run = supervisor(args)
+                    if rec["run"] != run:
+                        raise OrcaError(f"reconcile #{n} from its owning Run {rec['run']}")
+                    reconcile_start(db, n, rec, actor)
+                else:
+                    record_start(db, n, rec)
 
     issues = [t for t in tickets() if t["repo"] == repo]
     live = inventory(repo_path, issues, repo)
@@ -547,7 +569,7 @@ def fill_tick(args, db):
         if (t.get("occupied") or t["number"] in previous or t["branch"] in refs
                 or "origin/" + (t["branch"] or "") in refs or "refs/heads/" + (t["branch"] or "") in heads):
             t["blocked"] = True
-        if t["base"] not in refs or "refs/heads/" + t["base"].removeprefix("origin/") not in heads:
+        if not t["base"] or "refs/heads/" + t["base"].removeprefix("origin/") not in heads:
             t["blocked"] = True
     cfg = pick.account_usage.load_config()
     holds_path = (args.holds or pick.HOLDS).resolve()
@@ -574,20 +596,19 @@ def fill_tick(args, db):
                 raise OrcaError(f"#{n} readiness or seat changed")
             ref = "refs/heads/" + ticket["base"].removeprefix("origin/")
             wanted = "refs/heads/" + ticket["branch"]
+            command("git", "-C", str(repo_path), "fetch", "--no-tags", "origin",
+                    ref + ":refs/remotes/" + ticket["base"])
             latest_refs = command("git", "-C", str(repo_path), "ls-remote", "--heads", "origin", ref, wanted)
             sha = command("git", "-C", str(repo_path), "rev-parse", "--verify", ticket["base"]).strip()
             if latest_refs.split() != [sha, ref]:
                 raise OrcaError(f"#{n} base changed or task branch already exists on origin")
-            launch(db, repo_path, ticket, acct, args, holds_path)
+            launch(db, repo_path, dict(ticket, sha=sha), acct, args, holds_path)
         count += 1
     if not count:
         log("fill", "no eligible start")
 
 
-def launch(db, repo_path, t, acct, args, holds_path):
-    project, fields = project_fields()
-    number, route = t["number"], t["route"]
-    spec = (HERE.parent / "references/coder-spec.md").read_text().format(**t)
+def supervisor(args):
     actor = []
     if args.anchor or args.run:
         pane = any(k.startswith(("ORCA_AGENT_", "ORCA_TERMINAL_", "ORCA_PANE_", "ORCA_WORKTREE_",
@@ -599,15 +620,30 @@ def launch(db, repo_path, t, acct, args, holds_path):
             raise OrcaError("supervisor anchor is not bound to the configured Run")
         actor = ["--from", args.anchor, "--run", args.run]
     else:
-        if not os.environ.get("ORCA_TERMINAL_HANDLE") or not runtime("orchestration", "run-current").get("runId"):
+        if not os.environ.get("ORCA_TERMINAL_HANDLE"):
             raise OrcaError("launch from the coordinating Run, or configure its launchd anchor and Run")
-    reserve(db, number)
+        current = runtime("orchestration", "run-current")
+        if not current.get("runId"):
+            raise OrcaError("launch requires a coordinating Run")
+    return actor, current["runId"]
+
+
+def launch(db, repo_path, t, acct, args, holds_path):
+    project, fields = project_fields()
+    number, route = t["number"], t["route"]
+    spec = (HERE.parent / "references/coder-spec.md").read_text().format(**t)
+    actor, run = supervisor(args)
+    if db.execute("SELECT name FROM sqlite_master WHERE name='starts'").fetchone() and db.execute(
+            "SELECT 1 FROM starts WHERE issue=?", (number,)).fetchone():
+        raise OrcaError(f"issue #{number} already reserved")
     branch = t["branch"]
     wt = runtime("worktree", "create", "--repo", "path:" + str(repo_path), "--name", branch[5:].replace("/", "."),
                  "--branch", branch, "--base-branch", t["base"], "--no-parent", "--setup", "skip")["worktree"]
     path = Path(wt["path"])
     if wt["branch"] != branch or command("git", "-C", str(path), "branch", "--show-current").strip() != branch:
         raise OrcaError("created worktree does not own the requested branch")
+    if command("git", "-C", str(path), "rev-parse", "HEAD").strip() != t["sha"]:
+        raise OrcaError("created worktree has a different base commit")
     if route[3]:
         settings = path / ".claude/settings.local.json"
         if settings.parent.is_symlink() or settings.is_symlink():
@@ -617,45 +653,118 @@ def launch(db, repo_path, t, acct, args, holds_path):
         config["advisorModel"] = route[3]
         settings.write_text(json.dumps(config) + "\n")
     runtime("account", "select", "--agent", route[0], "--account", acct["id"])
+    task = runtime("orchestration", "task-create", *actor, "--task-title", f"#{number} coder",
+                   "--spec", spec, "--full")["task"]["id"]
     selected = runtime("account", "list")[route[0]]["activeAccountId"]
     if selected != acct["id"]:
-        raise OrcaError("selected account changed before worker start")
-    rec = runtime("orchestration", "worker-start", *actor, "--worktree", "path:" + str(path), "--agent", route[0],
-                  "--model", route[1], "--effort", route[2], "--task-title", f"#{number} coder",
-                  "--spec", spec, "--keep-open", "--full")
-    terminal = rec.get("terminal") or rec.get("agentTerminalHandle")
-    if isinstance(terminal, dict):
-        terminal = terminal["handle"]
-    if not rec.get("dispatchId") or rec.get("state") != "ready":
-        raise OrcaError("worker start receipt unresolved")
-    show = runtime("orchestration", "worker-show", "--dispatch", rec["dispatchId"], "--full")
-    dispatch = show["dispatch"]
-    if (dispatch["id"] != rec["dispatchId"] or (terminal and terminal != dispatch["assigneeHandle"])
-            or (args.run and dispatch["runId"] != args.run)):
-        raise OrcaError("unverified worker terminal")
-    terminal = dispatch["assigneeHandle"]
-    if not terminal:
-        raise OrcaError("missing worker terminal")
-    receipt = dict(terminal=terminal, dispatch=rec["dispatchId"], account=acct["id"], label=acct["label"],
-                   route=route, project=project, item=t["item"], fields=fields, time=int(time.time()),
-                   holds=str(holds_path))
-    with db:
-        db.execute("UPDATE starts SET receipt=? WHERE issue=?", (json.dumps(receipt), number))
-    record_start(db, number, receipt)
-    log("started", {"issue": number, "dispatch": rec["dispatchId"]})
-    if route[0] == "codex":
-        # Orca exposes no coordinator action for a provider menu. Preserve its actor boundary.
-        wait = show.get("observation", {}).get("agentWait")
-        tail = runtime("terminal", "read", "--terminal", terminal, "--screen")["terminal"]["tail"]
-        if wait or any(re.search(r"hooks need review|switch model\?", line, re.I) for line in tail):
-            log("needs operator", {"issue": number, "dispatch": rec["dispatchId"],
-                                   "action": "review owner hooks or keep the current model in the Codex pane"})
+        raise OrcaError(f"selected account changed before worker start; inspect prepared Task {task} and worktree {path}")
+    rec = dict(task=task, run=run, worktree=wt["id"], account=acct["id"], label=acct["label"],
+               route=route, project=project, item=t["item"], fields=fields, time=int(time.time()),
+               holds=str(holds_path))
+    # The fill lock covers preparation. A durable Task identity precedes the only start call.
+    reserve(db, number, rec)
+    try:
+        started = runtime("orchestration", "worker-start", *actor, "--task", task, "--worktree", "path:" + str(path),
+                          "--agent", route[0], "--model", route[1], "--effort", route[2], "--keep-open", "--full")
+        if started.get("dispatchId"):
+            rec["dispatch"] = started["dispatchId"]
+            terminal = started.get("terminal") or started.get("agentTerminalHandle")
+            rec["terminal"] = terminal.get("handle") if isinstance(terminal, dict) else terminal
+            with db:
+                db.execute("UPDATE starts SET receipt=? WHERE issue=?", (json.dumps(rec), number))
+    except StartNotApplied as e:
+        with db:
+            db.execute("DELETE FROM starts WHERE issue=?", (number,))
+        raise OrcaError(f"#{number}: Orca confirmed no start effects; inspect prepared worktree {path}: {e}") from e
+    except (OrcaError, OSError, ValueError, subprocess.TimeoutExpired) as e:
+        log("start receipt unavailable", {"issue": number, "task": task, "reason": str(e)})
+    reconcile_start(db, number, rec, actor)
 
+
+def codex_prompt(tail):
+    for index in reversed(range(len(tail))):
+        if re.match(r"^\s*(?:hooks need review\b|switch model\?|approaching rate limits\s*$)", tail[index], re.I):
+            choices = []
+            for line in tail[index + 1:]:
+                if re.match(r"^\s*[›❯>]?\s*\d+[.)] ", line):
+                    choices.append(line)
+                elif line.strip():
+                    break
+            if tail[index].strip().lower() != "approaching rate limits" or choices:
+                return "\n".join([tail[index], *choices])
+    return None
+
+
+def reconcile_start(db, number, rec, actor):
+    task = rec["task"]
+    try:
+        lookup = runtime("orchestration", "dispatch-show", "--task", task, "--full")
+        dispatch_id = (lookup.get("dispatch") or {}).get("id")
+        if not dispatch_id:
+            raise OrcaError("no Dispatch is visible")
+        show = runtime("orchestration", "worker-show", "--dispatch", dispatch_id, "--full")
+    except (OrcaError, OSError, ValueError, subprocess.TimeoutExpired) as e:
+        raise OrcaError(f"#{number} reserved: inspect Task {task} in Run {rec['run']}: {e}") from e
+    dispatch = show["dispatch"]
+    worker = show.get("worker") or {}
+    if (dispatch["id"] != dispatch_id or dispatch["taskId"] != task or dispatch["runId"] != rec["run"]
+            or worker.get("worktreeId") != rec["worktree"]):
+        raise OrcaError(f"#{number} reserved: unverified worker for Task {task}")
+    terminal = dispatch.get("assigneeHandle")
+    if dispatch.get("retryOfDispatchId") or (rec.get("dispatch") and rec["dispatch"] != dispatch_id):
+        raise OrcaError(f"#{number} reserved: Task {task} has a different attempt; inspect {dispatch_id}")
+    if rec.get("terminal") and rec["terminal"] != terminal:
+        raise OrcaError(f"#{number} reserved: assignee changed for Dispatch {dispatch_id}")
+    resource = (show.get("projection") or {}).get("resource") or {}
+    released_failure = worker["state"] == "failed" and resource.get("terminalState") == "released"
+    if released_failure or dispatch.get("status") == "completed":
+        if terminal and (show.get("terminal") or {}).get("handle") == terminal and not released_failure:
+            record_hold(dict(rec, terminal=terminal))
+        log("already settled", {"issue": number, "task": task, "dispatch": dispatch_id, "state": worker["state"]})
+        with db:
+            db.execute("UPDATE starts SET receipt='done' WHERE issue=?", (number,))
+        return
+    if not terminal:
+        raise OrcaError(f"#{number} reserved: inspect {dispatch_id}, worker state {worker['state']}")
+    rec = dict(rec, terminal=terminal, dispatch=dispatch_id)
+    if rec["route"][0] == "codex":
+        observed_terminal = show.get("terminal") or {}
+        observation = show.get("observation") or {}
+        wait = observation.get("agentWait") or observed_terminal.get("agentWait")
+        prompt = None
+        if observed_terminal:
+            if observed_terminal.get("handle") != terminal:
+                raise OrcaError(f"#{number} reserved: worker terminal identity changed")
+            tail = runtime("terminal", "read", "--terminal", terminal, "--screen")["terminal"]["tail"]
+            prompt = codex_prompt(tail)
+        if not observed_terminal and "agentWait" not in observation:
+            raise OrcaError(f"#{number} reserved: no Codex startup observation for {dispatch_id}")
+        if prompt or wait:
+            record_hold(rec)
+            notice = {"issue": number, "task": task, "dispatch": dispatch_id, "prompt": prompt or wait}
+            if rec.get("notice") != notice:
+                runtime("orchestration", "send", *actor, "--to", "run:" + rec["run"], "--type", "status",
+                        "--subject", f"#{number} waiting for operator input", "--body", json.dumps(notice, ensure_ascii=False))
+                with db:
+                    db.execute("UPDATE starts SET receipt=? WHERE issue=?",
+                               (json.dumps(dict(rec, notice=notice)), number))
+            log("waiting for operator input", notice)
+            return
+    if worker["state"] != "ready":
+        raise OrcaError(f"#{number} reserved: inspect {dispatch_id}, worker state {worker['state']}")
+    record_start(db, number, rec)
+    log("started", {"issue": number, "dispatch": dispatch_id})
 
 
 def fill(args):
     import fcntl
     state = Path.home() / ".local/state/dev-auto"
+    path = state / "starts.sqlite"
+    if args.dry_run:
+        if path.exists():
+            with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as db:
+                return fill_tick(args, db)
+        return fill_tick(args, None)
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (state / "fill.lock").open("a+") as lock:
         try:
@@ -663,12 +772,8 @@ def fill(args):
         except BlockingIOError:
             log("fill", "another tick is active")
             return
-        path = state / "starts.sqlite"
-        if args.dry_run and not path.exists():
-            fill_tick(args, None)
-        else:
-            with sqlite3.connect(path) as db:
-                fill_tick(args, db)
+        with sqlite3.connect(path) as db:
+            fill_tick(args, db)
 
 
 def main(argv=None):

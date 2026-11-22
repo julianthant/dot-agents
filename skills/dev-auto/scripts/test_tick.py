@@ -206,4 +206,122 @@ with TemporaryDirectory() as tmp:
         errs = tick.cleanup({**st, **real, "git": f"{tmp}/missing"})
     assert errs[0].startswith("absence not verified: git worktree list exit 128"), errs
 
+
+# The dry-run plan reserves both paths and account capacity in priority order.
+from unittest import TestCase
+check = TestCase()
+base = dict(status="Todo", kind="Task", later=False, assigned=False, blocked=False, busy=False,
+            repo="hr-relay", branch="task/a/lane", paths=["src/a"], route=("codex", "gpt-6.2-sol", "medium", None),
+            score=0, item="card", title="a / lane")
+tickets = [dict(base, number=1, score=3), dict(base, number=2, paths=["src/a/file.ts"]),
+           dict(base, number=3, paths=["src/b"]), dict(base, number=4, blocked=True, score=9),
+           dict(base, number=5, status="In Progress", paths=["src/c"]),
+           dict(base, number=6, paths=["src/c/sub"]), dict(base, number=7, later=True),
+           dict(base, number=8, assigned=True, paths=["src/d"]), dict(base, number=9, kind="Feature")]
+for t in tickets:
+    t["branch"] += str(t["number"])
+
+account = dict(id="seat", label="example")
+def seat(route, held):
+    return (account, []) if len(held) < 1 else (None, ["capacity"])
+with redirect_stdout(io.StringIO()) as output:
+    plan = list(tick.fill_plan(tickets, seat))
+check.assertEqual([t["number"] for t, a in plan], [1])
+check.assertIn("capacity", output.getvalue())
+body = """## Owned paths
+
+src/backend/logs/ (writers), tests/backend/logs*.ts
+
+## Route
+
+- Coder: claude (claude-sonnet-5-5, effort high) with Opus advisor · Reviewer: codex (gpt-6.2-sol, effort medium)
+"""
+check.assertEqual(tick.coder_route(body), ("claude", "claude-sonnet-5-5", "high", "opus"))
+check.assertEqual(tick.owned_paths(body), ["src/backend/logs/", "tests/backend/logs*.ts"])
+check.assertEqual(tick.owned_paths("Owned paths: selected service code and fixtures."), ["*"])
+
+# A response lost after dispatch prevents a second launch, even after reopening the state.
+import sqlite3
+from pathlib import Path
+with TemporaryDirectory() as tmp:
+    dbpath = Path(tmp) / "state"
+    with sqlite3.connect(dbpath) as db:
+        tick.reserve(db, 17)
+    with sqlite3.connect(dbpath) as db:
+        with check.assertRaisesRegex(tick.OrcaError, "17"):
+            tick.reserve(db, 17)
+
+# Exercise launch through the real advisor file, journal, hold and Project-edit boundary.
+from types import SimpleNamespace
+import json
+with TemporaryDirectory() as tmp, sqlite3.connect(":memory:") as db:
+    root = Path(tmp)
+    card = []
+    starts = []
+    ticket = dict(base, number=51, base="origin/main", route=("claude", "claude-sonnet-5-5", "medium", "opus"))
+    args = SimpleNamespace(anchor=None, run=None)
+    def cli(*args):
+        if args[0] == "git":
+            return ticket["branch"]
+        check.assertEqual(args[:3], ("gh", "project", "item-edit"))
+        card.append(args[-1])
+        return ""
+    def local(*args):
+        verb = args[:2]
+        if verb == ("orchestration", "run-current"):
+            return {"runId": "fixture"}
+        if verb == ("worktree", "create"):
+            return {"worktree": {"path": str(root), "branch": ticket["branch"]}}
+        if verb == ("account", "select"):
+            return {}
+        if verb == ("account", "list"):
+            return {"claude": {"activeAccountId": "seat"}}
+        if verb == ("orchestration", "worker-start"):
+            starts.append(args)
+            check.assertEqual(json.loads((root / ".claude/settings.local.json").read_text()), {"advisorModel": "opus"})
+            check.assertNotIn("--from", args)
+            return {"dispatchId": "fixture-dispatch", "state": "ready"}
+        check.assertEqual(verb, ("orchestration", "worker-show"))
+        return {"dispatch": {"id": "fixture-dispatch", "assigneeHandle": "fixture-terminal"}}
+
+    with patch.object(tick, "project_fields", return_value=("project", [("s","progress"),("c","coding"),("a",None)])), \
+         patch.object(tick, "runtime", local), patch.object(tick, "command", cli), \
+         patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE":"fixture"}), redirect_stdout(io.StringIO()):
+        tick.launch(db, root, ticket, account, args, root / "holds.json")
+        with check.assertRaisesRegex(tick.OrcaError, "51"):
+            tick.launch(db, root, ticket, account, args, root / "holds.json")
+    check.assertEqual(len(starts), 1)
+    check.assertEqual(json.loads((root / "holds.json").read_text())["fixture-terminal"]["account"], "seat")
+    check.assertEqual(card, ["progress", "coding", "coder claude-sonnet-5-5 medium+advisor @example"])
+
+# An in-pane worker cannot select somebody else's anchor even with a valid-looking Run.
+with sqlite3.connect(":memory:") as db, patch.object(tick, "project_fields", return_value=(None, [])), \
+     patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE":"fixture"}), patch.object(tick, "runtime") as call:
+    with check.assertRaisesRegex(tick.OrcaError, "pane-less"):
+        tick.launch(db, None, ticket, account, SimpleNamespace(anchor="external", run="run"), None)
+    call.assert_not_called()
+
+
+# Dry-run reads the existing account ledger without pruning it or starting work.
+import pick
+from contextlib import ExitStack
+with TemporaryDirectory() as tmp, ExitStack() as stack:
+    root = Path(tmp)
+    holds = root / "holds.json"
+    holds.write_text('{"dead": {"host": "local"}}')
+    args = SimpleNamespace(repo_path=root, dry_run=True, issue=None, holds=holds)
+    stack.enter_context(patch.object(tick, "tickets", return_value=[dict(ticket)]))
+    stack.enter_context(patch.object(tick, "inventory", return_value=set()))
+    stack.enter_context(patch.object(tick, "command", side_effect=["git@github.com:julianthant/hr-relay.git", "origin/main",
+                                                              "abcdef refs/heads/main"]))
+    stack.enter_context(patch.object(pick.account_usage, "load_config", return_value={}))
+    stack.enter_context(patch.object(pick, "pick", return_value=(account, [])))
+    launch = stack.enter_context(patch.object(tick, "launch"))
+    with redirect_stdout(io.StringIO()) as output:
+        tick.fill_tick(args, None)
+    check.assertIn('would start', output.getvalue())
+    check.assertIn('"issue": 51', output.getvalue())
+    check.assertEqual(holds.read_text(), '{"dead": {"host": "local"}}')
+    launch.assert_not_called()
+
 print("ok")

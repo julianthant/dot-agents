@@ -886,4 +886,122 @@ with patch.object(tick, "runtime", side_effect=ancestry), patch.object(tick, "gr
         tick.review_step(sqlite3.connect(":memory:"), "run", [], ticket, state, [new, old])
     assert sha in verify.call_args.args[1]
 
+def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncertain=False, remote_race=False):
+    root = Path(tmp)
+    path = str(root / "task-tree")
+    branch = "task/dev-auto/example"
+    ref = "refs/heads/" + branch
+    worktree = "repo::" + path
+    holds = root / "holds.json"
+    handles = {"term_coder", "term_reviewer"}
+    holds.write_text(json.dumps({handle: {"host": "local"} for handle in (*handles, "term_other")}))
+    args = SimpleNamespace(repo_path=root, issue=41, holds=holds)
+    card = dict(id="card", agent={"text": "coder"}, stage={"name": "Merging"},
+                project={"number": 5, "owner": {"login": "julianthant"}})
+    pr = dict(merged=True, headRefName=branch, headRefOid=sha, isCrossRepository=False,
+              repository={"nameWithOwner": "julianthant/dot-agents"})
+    issue = dict(number=41, title="dev-auto / example", body=f"Branch: dot-agents `{branch}`",
+                 projectItems={"totalCount": 1, "nodes": [card]},
+                 closedByPullRequestsReferences={"totalCount": int(merged), "nodes": [pr] if merged else []})
+    # Projected fields from the #551 worker-list and worker-show receipts.
+    workers = [dict(dispatchId=dispatch, runId="run", agentTerminalHandle=terminal if owns else None,
+                    dispatchStatus="completed", projection={"workspace": {"id": worktree}, "host": {"kind": "local"}})
+               for dispatch, terminal, owns in (("ctx_merge", "term_coder", True),
+                                                ("ctx_review", "term_reviewer", True),
+                                                ("ctx_initial", "term_coder", False))]
+    events = []
+    tree = dict(id=worktree, path=path, branch=ref, isMainWorktree=False)
+    present = True
+    local_ref = sha
+    remote_present = remote_race
+
+    def cli(*args):
+        nonlocal local_ref, remote_present
+        events.append(args)
+        if args[:2] == ("gh", "api"):
+            return json.dumps([{"data": {"repository": {"issues": {"nodes": [issue]}}}}])
+        if args[0] == "gh":
+            assert args[1:3] == ("project", "item-edit")
+            return ""
+        if args[3:5] == ("remote", "get-url"):
+            return "https://github.com/julianthant/dot-agents.git\n"
+        if args[3:5] == ("worktree", "list"):
+            return f"worktree {root}\0HEAD {sha}\0branch refs/heads/main\0\0" + (
+                f"worktree {path}\0HEAD {sha}\0branch {ref}\0\0" if present else "")
+        if args[3] == "status":
+            return "?? notes.txt\n" if dirty else ""
+        if args[3] == "ls-remote":
+            return f"{sha}\t{ref}\n" if remote_present else ""
+        if args[3] == "push":
+            assert remote_race and not present
+            assert args[4:] == (f"--force-with-lease={ref}:{sha}", "origin", ":" + ref)
+            remote_present = False  # GitHub deletes the branch between lookup and deletion.
+            raise tick.OrcaError("remote ref does not exist")
+        if args[3] == "for-each-ref":
+            return f"{local_ref} {ref}\n" if local_ref else ""
+        if args[3] == "update-ref":
+            assert args[4:] == ("-d", ref, sha)
+            local_ref = ""
+            return ""
+        raise AssertionError(args)
+
+    def orca(*args):
+        nonlocal present
+        events.append(args)
+        if args[:2] == ("worktree", "list"):
+            return {"truncated": False, "worktrees": [tree] if present else []}
+        if args[:2] == ("orchestration", "worker-list"):
+            if "--cursor" in args:
+                return {"workers": workers[2:], "page": {"hasMore": False, "nextCursor": None}}
+            return {"workers": workers[:2], "page": {"hasMore": True, "nextCursor": "recorded-cursor"}}
+        if args[:2] == ("orchestration", "worker-show"):
+            return {"dispatch": {"id": "ctx_initial", "runId": "run", "assigneeHandle": "term_coder"},
+                    "worker": {"dispatchId": "ctx_initial", "worktreeId": worktree, "effects": [
+                        {"kind": "terminal", "role": "agent", "action": "reused", "id": "term_coder"}]}}
+        if args[:2] == ("orchestration", "worker-release"):
+            if release_uncertain and args[3] == "ctx_review":
+                return {"state": "release_pending"}
+            return {"ctx_merge": {"state": "released", "reason": "closed_agent_terminal"},
+                    "ctx_review": {"state": "already_released"},
+                    "ctx_initial": {"state": "retained", "reason": "ownership_transferred"}}[args[3]]
+        if args[:2] == ("terminal", "list"):
+            return {"truncated": False, "terminals": []}
+        if args[:2] == ("worktree", "rm"):
+            assert args == ("worktree", "rm", "--worktree", "id:" + worktree)
+            if refused:
+                raise tick.OrcaError("untracked leftovers")
+            present = False
+            return {"removed": True}
+        if args[:2] == ("orchestration", "send"):
+            return {}
+        raise AssertionError(args)
+
+    with sqlite3.connect(":memory:") as db, patch.object(pick, "HOLDS", holds), \
+            patch.object(tick, "supervisor", return_value=([], "run")), \
+            patch.object(tick, "project_fields", return_value=("project", [("status", "progress"),
+                         ("stage", "coding"), ("agent", None)], ("stage", "needs"))), \
+            patch.object(tick, "runtime", side_effect=orca), patch.object(tick, "command", side_effect=cli), \
+            redirect_stdout(io.StringIO()) as output:
+        tick.close_tick(args, db)
+    assert [event[3] for event in events if event[:2] == REL] == ["ctx_merge", "ctx_review", "ctx_initial"]
+    expected_holds = {"term_other", "term_reviewer"} if release_uncertain else {"term_other"}
+    assert set(json.loads(holds.read_text())) == expected_holds
+    edits = [event[-3:] for event in events if event[:3] == ("gh", "project", "item-edit")]
+    if merged and not dirty and not refused and not release_uncertain:
+        assert not present and not local_ref
+        assert edits == [("--field-id", "agent", "--clear"), ("--field-id", "stage", "--clear")]
+        assert any(event[0] == "git" and event[3] == "push" for event in events) == remote_race
+    else:
+        assert present and local_ref == sha
+        assert edits == [("stage", "--single-select-option-id", "needs")]
+        assert "Needs you" in output.getvalue()
+        assert any(event[:2] == ("orchestration", "send") for event in events)
+        assert any(event[:2] == RM for event in events) == refused
+
+
+for scenario in ({}, {"merged": False}, {"dirty": True}, {"refused": True},
+                 {"release_uncertain": True}, {"remote_race": True}):
+    with TemporaryDirectory() as tmp:
+        close_fixture(tmp, **scenario)
+
 print("ok")

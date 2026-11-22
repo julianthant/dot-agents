@@ -74,13 +74,17 @@ Run `scripts/tick.py watch` from the coordinating Run (or pass its launchd
 the current attempt of every live worker in the Run and logs one `watch` line:
 
 - A limit screen, the Codex model-switch menu or a switched Codex model:
-  `worker-stop`, then a fresh worker on another account `pick.py` gives,
-  started from the Task's spec plus the predecessor's last report.
+  once `pick.py` gives a different account, `worker-stop`, then the same Task
+  restarts with `worker-start --task <task> --retry-of <dispatch>`. The
+  replacement then gets mail with the predecessor's `reportPath` and report.
 - A near-limit screen or an account `pick.py due` lists: one handoff request
-  to the Dispatch. Its failed `worker_done` starts the fresh worker.
+  to the Dispatch. Its failed `worker_done` starts the replacement.
+- The limited account comes from the worker's hold, remembered while it runs.
+  With none recorded, the watch stops nothing and escalates to the Run.
 - The card shows **Handed off** until the replacement starts; with no seat it
   stays there and each tick retries.
-- A crash relaunches once, then goes to the Run as an escalation (Needs you).
+- A crash relaunches once in the worker's own phase, then goes to the Run as
+  an escalation (Needs you).
 - A screen unchanged for 20 minutes gets one nudge, then an escalation.
 - A permission prompt goes to the Run and the card goes to **Needs you**.
 

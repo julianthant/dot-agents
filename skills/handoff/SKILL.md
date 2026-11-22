@@ -3,8 +3,8 @@ name: handoff
 description: >-
   Use this skill when this session must stop and another agent will continue the work: the context
   is nearly full, you were told to hand off, or the task is pausing mid-way. It compacts the
-  conversation into a handoff on the session's Concord ticket, or a temp file when there is no
-  ticket; not for final reports, PR bodies or specs.
+  conversation into a scratch file and reports its path so the next agent can resume. Final
+  reports, PR bodies and specs have their own workflows.
 argument-hint: "What will the next session be used for?"
 metadata:
   source: "https://github.com/mattpocock/skills"
@@ -15,12 +15,21 @@ metadata:
 
 Write a handoff document summarising the current conversation so a fresh agent can continue the work.
 
-Where it goes:
+Save a uniquely named Markdown file in an existing, writable worktree scratch area. Before
+writing there, verify the file path is already ignored with `git check-ignore -- <relative-path>`.
+Use the session scratchpad if no worktree scratch location meets these conditions.
 
-- **The session has a ticket** (`CONCORD_AGENT_ID` is set): record the handoff on that Concord ticket with `update_work` (`task_id` of the ticket, `kind: "progress"`, content starting `Handoff:`). Do not write a temp file. If the call fails with `database is locked`, retry it unchanged after a short pause.
-- **Otherwise:** save to the temporary directory of the user's OS (`$TMPDIR`, else `/tmp`; `%TEMP%` on Windows) - not the current workspace.
+Record the goal, verified state, remaining work, and the next action. Include the GitHub issue and
+PR URLs when applicable, plus the branch and commit if the next session needs them. Include a
+"Suggested skills" section naming the skills the next agent should load.
 
-Include a "suggested skills" section in the document, naming which skills the next agent should call the Skill tool for.
+Verify the file is readable and report its absolute path. For a dispatched Orca worker, finish
+with the dispatch's `worker_done` command and pass the path with `--report-path`. Use
+`--outcome failed` if the assignment is unfinished. In other sessions, give the path to the user.
+
+For example, when work on issue #42 pauses in a worktree with no ignored scratch area, save
+`handoff-issue-42.md` in the session scratchpad and pass its absolute path with `--report-path`
+when sending `worker_done`.
 
 Do not duplicate content already captured in other artifacts (specs, plans, ADRs, issues, commits, diffs). Reference them by path or URL instead.
 

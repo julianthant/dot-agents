@@ -38,10 +38,20 @@ class OrcaError(RuntimeError):
 def orca(*args, ok=True):
     # Headless: launchd gives no ORCA_* pane variables, so strip ours to prove the same path.
     env = {k: v for k, v in os.environ.items() if not k.startswith("ORCA_") or k == "ORCA_CLI_COMMAND"}
-    out = subprocess.run([ORCA, *args, "--json"], capture_output=True, text=True, env=env, timeout=900)
-    data = json.loads(out.stdout or "{}")
+    try:
+        out = subprocess.run([ORCA, *args, "--json"], capture_output=True, text=True, env=env, timeout=900)
+        data = json.loads(out.stdout)
+        if not isinstance(data, dict):
+            raise ValueError(data)
+    except subprocess.TimeoutExpired:
+        data = {"ok": False, "error": "timed out"}
+    except ValueError:
+        data = {"ok": False, "error": f"invalid JSON, exit {out.returncode}: {out.stderr.strip()[:200]}"}
+    else:
+        if out.returncode and data.get("ok"):
+            data = {**data, "ok": False, "error": f"exit {out.returncode}"}
     if ok and not data.get("ok"):
-        raise OrcaError(f"orca {' '.join(args[:2])}: {data.get('error') or out.stderr.strip()}")
+        raise OrcaError(f"orca {' '.join(args[:2])}: {data.get('error')}")
     return data
 
 
@@ -102,6 +112,37 @@ def mail(me, run, kind, minutes=5):
     raise OrcaError(f"no {kind} for {run} in {minutes} minutes")
 
 
+def completion(m, run, dispatch):
+    """A worker_done that succeeded for this Run's expected Dispatch; anything else raises."""
+    p = m.get("payload") or {}
+    if p.get("dispatchId") != dispatch or p.get("outcome") != "succeeded":
+        raise OrcaError(f"rejected worker_done {m.get('id')}: {p.get('dispatchId')} {p.get('outcome')}, expected {dispatch} succeeded")
+    owner = orca("orchestration", "worker-show", "--dispatch", dispatch)["result"].get("runId")
+    if owner != run:
+        raise OrcaError(f"rejected worker_done {m.get('id')}: Dispatch {dispatch} belongs to {owner}, not {run}")
+    return m
+
+
+def close_anchor(st):
+    """Close the anchor; its handle is kept until Orca confirms the pane was killed."""
+    r = orca("terminal", "close", "--terminal", st["anchor"], ok=False)
+    if r.get("ok") and ((r.get("result") or {}).get("close") or {}).get("ptyKilled"):
+        st.pop("anchor")
+        return None
+    return f"anchor close not confirmed: {r.get('error') or r.get('result')}"
+
+
+def leftovers(st):
+    """The scratch checkout or branch git still shows after removal."""
+    left = [st["path"]] if os.path.exists(st["path"]) else []
+    git = ["git", "--git-dir", st["git"]]
+    if st["path"] in subprocess.run([*git, "worktree", "list", "--porcelain"], capture_output=True, text=True).stdout:
+        left.append(f"worktree {st['path']}")
+    if subprocess.run([*git, "show-ref", "--verify", "--quiet", f"refs/heads/{st['branch']}"]).returncode == 0:
+        left.append(f"branch {st['branch']}")
+    return left
+
+
 def log(step, value):
     print(f"{step:<12} {json.dumps(value, ensure_ascii=False)}", flush=True)
 
@@ -115,30 +156,35 @@ def cleanup(st):
     """Release the worker, then drop the anchor and scratch checkout; [] when all three are proven.
     The checkout and branch go only after a confirmed release, or when no start was attempted."""
     errs = []
+    if st.get("followup"):
+        errs.append("a follow-up was sent but its receipt is unresolved; its worker may be live")
     if st.get("dispatch"):
         r = orca("orchestration", "worker-release", "--dispatch", st["dispatch"], ok=False)
         state = (r.get("result") or {}).get("state")
         log("release", r.get("result") or r.get("error"))
-        if state not in RELEASED:
+        if not r.get("ok") or state not in RELEASED:
             errs.append(f"release of {st['dispatch']} not confirmed: {state or r.get('error')}")
     elif st.get("started"):
         errs.append("worker-start was attempted but returned no dispatch; its worker may be live")
     if st.get("anchor"):
-        r = orca("terminal", "close", "--terminal", st["anchor"], ok=False)
-        if not r.get("ok"):
-            errs.append(f"anchor close failed: {r.get('error')}")
+        errs += filter(None, [close_anchor(st)])
     if errs:
         return [*errs, f"kept scratch worktree {st['worktree']}"]
     r = orca("worktree", "rm", "--worktree", st["worktree"], "--force", "--delete-branch", ok=False)
     log("cleanup", r.get("result") or r.get("error"))
-    if not (r.get("result") or {}).get("removed"):
-        errs.append(f"worktree rm failed: {r.get('error')}")
-    return errs
+    if not r.get("ok") or not (r.get("result") or {}).get("removed"):
+        return [f"worktree rm not confirmed: {r.get('error') or r.get('result')}"]
+    left = leftovers(st)
+    log("absent", {"worktree": st["path"] not in str(left), "branch": f"branch {st['branch']}" not in left})
+    return [f"still present after rm: {x}" for x in left]
 
 
 def finish(st, failure=None):
     """Clean up; a proof failure is re-raised as is, and a cleanup failure exits 1."""
-    errs = cleanup(st) if st.get("worktree") else []
+    try:
+        errs = cleanup(st) if st.get("worktree") else []
+    except Exception as e:  # a crash in cleanup must not hide `failure`
+        errs = [f"cleanup crashed: {e!r}", f"kept scratch worktree {st['worktree']}"]
     for e in errs:
         print(f"cleanup: {e}", file=sys.stderr)
     if failure:
@@ -164,7 +210,9 @@ def start(repo, path):
         wt = orca("worktree", "create", "--repo", repo, "--name", name, "--branch", f"scratch/{name}",
                   "--base-branch", "origin/main", "--setup", "skip", "--no-parent",
                   "--comment", "throwaway dev-auto proof; removed by tick.py")["result"]["worktree"]
-        st["worktree"] = f"path:{wt['path']}"
+        st.update(worktree=f"path:{wt['path']}", path=wt["path"], branch=f"scratch/{name}")
+        st["git"] = subprocess.run(["git", "-C", wt["path"], "rev-parse", "--path-format=absolute",
+                                    "--git-common-dir"], capture_output=True, text=True, check=True).stdout.strip()
         log("worktree", name)
         st["anchor"] = anchor(st["worktree"])
         st["run"] = orca("orchestration", "run-create", "--objective", f"scratch: {name}",
@@ -185,8 +233,10 @@ def start(repo, path):
         orca("orchestration", "reply", "--from", st["anchor"], "--run", st["run"], "--id", ask["id"],
              "--body", "PELICAN-549")
         log("reply", "PELICAN-549")
-        orca("terminal", "close", "--terminal", st.pop("anchor"))
+        err = close_anchor(st)
         save(path, st)
+        if err:
+            raise OrcaError(err)
         log("exit", {"pid": st["pid"], "anchor": "closed", "state": "saved"})
     except BaseException as e:
         finish(st, e)
@@ -207,19 +257,21 @@ def resume(path):
         peek = orca("orchestration", "check", "--terminal", st["anchor"], "--run", st["run"], "--peek")
         log("resume", {"pid": os.getpid(), "previous": st["pid"], "previous_alive": False,
                        "run": st["run"], "peek": [m["type"] for m in peek["result"]["messages"]]})
-        done = mail(st["anchor"], st["run"], "worker_done")
-        if done["payload"]["dispatchId"] != st["dispatch"]:
-            raise OrcaError(f"worker_done from {done['payload']['dispatchId']}, expected {st['dispatch']}")
+        done = completion(mail(st["anchor"], st["run"], "worker_done"), st["run"], st["dispatch"])
         log("done", {"dispatch": st["dispatch"], "outcome": done["payload"]["outcome"], "body": done["body"][:120]})
         log("watch", watch(st["dispatch"], time.time()))
 
+        st["followup"] = True
         fu = orca("orchestration", "send", "--from", st["anchor"], "--run", st["run"],
                   "--to", f"dispatch:{st['dispatch']}", "--subject", "PROOF-FOLLOWUP",
                   "--body", "Run the inert, authorized `touch proof-perm.txt` here, then send worker_done "
                             "--outcome succeeded saying whether a permission prompt appeared.")["result"]
+        if fu.get("delivery") != "follow_up" or not fu.get("dispatchId"):
+            raise OrcaError(f"follow-up receipt unresolved: {fu}")
         st["dispatch"] = fu["dispatchId"]
+        del st["followup"]
         log("follow-up", {k: fu[k] for k in ("delivery", "dispatchId", "state")})
-        done = mail(st["anchor"], st["run"], "worker_done")
+        done = completion(mail(st["anchor"], st["run"], "worker_done"), st["run"], st["dispatch"])
         log("done", {"dispatch": done["payload"]["dispatchId"], "outcome": done["payload"]["outcome"],
                      "body": done["body"][:160]})
         # Simulated guards only: no prompt is pending, since workers follow Orca's new-tab setting.

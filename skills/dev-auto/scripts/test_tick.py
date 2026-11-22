@@ -620,4 +620,125 @@ check.assertEqual([(t.get("occupied", False), t["busy"]) for t in items],
 check.assertIn("task/closed/lane", out.getvalue())
 check.assertEqual([t["number"] for t, _ in plan], [484])
 
+# A task report needs the current remote branch SHA and its own successful task workflow.
+review_ticket = {"number": 41, "branch": "task/ui/header", "repo": "hr-relay"}
+sha = "a" * 40
+def green_check(head, conclusion, body=sha):
+    with patch.object(tick, "command", side_effect=[
+        head, json.dumps([{"headSha": head, "headBranch": "task/ui/header", "status": "completed",
+                              "conclusion": conclusion}])]):
+        return tick.green_report(review_ticket, body)
+assert green_check(sha, "success") == sha
+assert green_check(sha, "failure") is None
+assert green_check("b" * 40, "success") is None
+
+# Redacted inbox --full records retain JSON-string payloads even after the owner reads them.
+def report(dispatch, body, kind="worker_done", msg_id="report"):
+    return {"id": msg_id, "type": kind, "read": 1, "body": body, "subject": "worker report", "sequence": 1,
+                "payload": json.dumps({"taskId": "task", "dispatchId": dispatch, "outcome": "succeeded"})}
+
+recorded = report("coder", f"I pushed {sha} with host-local account selection.")
+assert tick.review_mail([recorded], "coder") == [recorded]
+assert not tick.review_mail([report("coder", sha, "question"), recorded], "other")
+assert not tick.review_mail([report("coder", sha, "question")], "coder")
+
+assert tick.review_route("Coder: codex / gpt-6.2-sol / medium. Reviewer: none (UI, simple; green task CI clears it). Tier: UI, simple.") is None
+check.assertEqual(tick.review_route("Reviewer: Claude Sonnet 5.5 medium with Opus advisor"),
+                  ("claude", "claude-sonnet-5-5", "medium", "opus"))
+with check.assertRaises(tick.OrcaError):
+    tick.review_route("Reviewer: none (the orchestrator reads the diff) · Tier: easy")
+
+# Drive independent ticks through a reviewer report, restart and duplicate delivery.
+def review_fixture():
+    ticket = dict(review_ticket, body="Reviewer: claude / claude-sonnet-5-5 / medium", item="card",
+                  base="origin/development", route=("codex", "gpt-6.2-sol", "medium", None))
+    state = {"coder": "coder", "expected": "coder", "path": "/fixture", "model": "gpt-6.2-sol",
+                 "agent": "coder gpt-6.2-sol medium @seat", "history": [], "stage": "Coding"}
+    return ticket, state
+
+ticket, state = review_fixture()
+db = sqlite3.connect(":memory:")
+with patch.object(tick, "green_report", return_value=sha), \
+        patch.object(tick, "review_account", return_value={"id": "seat", "label": "review"}), \
+        patch.object(tick, "worker_settings"), patch.object(tick, "record_hold") as hold, \
+        patch.object(tick, "review_card") as card, patch.object(tick, "runtime") as cli:
+    cli.side_effect = [{}, {"claude": {"activeAccountId": "seat"}}, {"dispatchId": "reader", "terminal": "pane"}]
+    tick.review_step(db, "run", [], ticket, state, [recorded])
+    assert card.call_args.args[1] == "Reviewing" and hold.call_count == 1
+    spec = cli.call_args.args[cli.call_args.args.index("--spec") + 1]
+    assert spec.splitlines()[1] == "Role: follow ~/.agents/roles/reviewer.md."
+    tick.review_step(db, "run", [], ticket, state, [recorded])
+    assert cli.call_count == 3
+    verdict = report("reader", "REVIEW VERDICT: PUSH " + sha + "\nReviewed the diff.", msg_id="v")
+    cli.side_effect = [{"delivery": "follow_up", "dispatchId": "landing"}]
+    tick.review_step(db, "run", [], ticket, state, [recorded, verdict])
+    assert card.call_args.args[1] == "Merging"
+    assert "auto-merge" in cli.call_args.args[-1] and "Closes #41" in cli.call_args.args[-1]
+
+# A no-review route can land only on green. A red report receives a new coder dispatch.
+ticket, state = review_fixture()
+ticket["body"] = "Reviewer: none (green CI clears it). Tier: UI, simple."
+db = sqlite3.connect(":memory:")
+with patch.object(tick, "green_report", side_effect=[None, sha]), patch.object(tick, "review_card") as card, \
+        patch.object(tick, "runtime", side_effect=[{"delivery": "follow_up", "dispatchId": "fix"},
+                                                 {"delivery": "follow_up", "dispatchId": "land"}]) as cli:
+    tick.review_step(db, "run", [], ticket, state, [recorded])
+    assert card.call_args.args[1:] == ("Fixing", state["agent"])
+    tick.review_step(db, "run", [], ticket, state, [report("fix", sha, msg_id="green")])
+    assert card.call_args.args[1:] == ("Merging", state["agent"])
+    assert all(call.args[1] == "send" for call in cli.call_args_list)
+
+# Third FIX sends all findings to the owning Run, once, and retires the ticket.
+ticket, state = review_fixture()
+for i in range(3):
+    db = sqlite3.connect(":memory:")
+    state.update(stage="Reviewing", expected="reader", sha=sha, history=["round one", "round two"][:i])
+    with patch.object(tick, "review_card") as card, patch.object(tick, "runtime",
+            return_value={"delivery": "follow_up", "dispatchId": "fix"}) as cli:
+        verdict = report("reader", "REVIEW VERDICT: FIX " + sha + "\nmissing a check")
+        tick.review_step(db, "run", [], ticket, state, [verdict])
+        if i < 2:
+            assert card.call_args.args[1] == "Fixing" and "dispatch:coder" in cli.call_args.args
+        else:
+            assert card.call_args.args[1] == "Needs you" and "run:run" in cli.call_args.args
+            assert all(text in cli.call_args.args[-1] for text in ["round one", "round two", "missing a check"])
+        tick.review_step(db, "run", [], ticket, state, [verdict])
+        assert cli.call_count == 1
+
+ticket, state = review_fixture()
+db = sqlite3.connect(":memory:")
+with patch.object(tick, "green_report", return_value=None), patch.object(tick, "runtime",
+        side_effect=tick.OrcaError("lost receipt")) as cli:
+    with check.assertRaisesRegex(tick.OrcaError, "lost receipt"):
+        tick.review_step(db, "run", [], ticket, state, [recorded])
+    with check.assertRaisesRegex(tick.OrcaError, "inspect uncertain"):
+        tick.review_step(db, "run", [], ticket, state, [recorded])
+    assert cli.call_count == 1
+
+# Load the coordinator's handled mail through the review command, using fill's task title.
+args = SimpleNamespace(issue=41, coder=None, run=None, anchor=None)
+ticket, state = review_fixture()
+ticket.update(agent=state["agent"], stage="Coding")
+with patch.object(tick, "tickets", return_value=[ticket]), patch.object(tick, "supervisor", return_value=([], "run")), \
+        patch.object(tick, "command", return_value="https://github.com/julianthant/hr-relay.git\n"), \
+        patch.object(tick, "review_step") as step, patch.object(tick, "runtime") as cli:
+    cli.side_effect = [{"messages": [recorded]}, {"tasks": [{"title": "#41 coder", "id": "task"}]},
+                       {"dispatch": {"id": "coder"}}, {"dispatch": {"id": "coder", "runId": "run", "taskId": "task"},
+                           "worker": {"worktreeId": "tree", "startOptions": {"launch": {"effective": {"model": "gpt-6.2-sol"}}}}},
+                       {"worktree": {"id": "tree", "path": "/fixture", "branch": "refs/heads/task/ui/header"}}]
+    tick.review_tick(args, sqlite3.connect(":memory:"))
+    assert step.call_args.args[-1] == [recorded] and step.call_args.args[-2]["expected"] == "coder"
+    assert cli.call_args_list[0].args == ("orchestration", "inbox", "--terminal", "run:run", "--limit", "10000", "--full")
+
+# A partial Project write resumes on restart without a second follow-up.
+ticket, state = review_fixture()
+db = sqlite3.connect(":memory:")
+with patch.object(tick, "green_report", return_value=None), patch.object(tick, "review_card",
+        side_effect=[tick.OrcaError("Project unavailable"), None]) as card, patch.object(tick, "runtime",
+        return_value={"delivery": "follow_up", "dispatchId": "fix"}) as cli:
+    with check.assertRaisesRegex(tick.OrcaError, "Project unavailable"):
+        tick.review_step(db, "run", [], ticket, state, [recorded])
+    tick.review_step(db, "run", [], ticket, state, [recorded])
+    assert card.call_count == 2 and cli.call_count == 1
+
 print("ok")

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Dev Auto"
+  short_description: "Pick worker accounts, record holds, and check handoffs"
+  default_prompt: "Use $dev-auto to pick an eligible account for an Orca worker."
+policy:
+  allow_implicit_invocation: false

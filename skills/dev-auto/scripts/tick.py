@@ -267,10 +267,26 @@ def start(repo, path):
         finish(st, e)
 
 
-def followup_dispatch(receipt, previous):
+def in_coder_chain(dispatch, previous, run):
+    seen = set()
+    while dispatch and dispatch not in seen:
+        if dispatch == previous:
+            return True
+        if not run:
+            break
+        seen.add(dispatch)
+        attempt = runtime("orchestration", "worker-show", "--dispatch", dispatch, "--full")["dispatch"]
+        if attempt["id"] != dispatch or attempt["runId"] != run:
+            break
+        dispatch = attempt.get("followUpOf")
+    return False
+
+
+def followup_dispatch(receipt, previous, run=None):
     dispatch = receipt.get("dispatchId")
     if (receipt.get("delivery") not in ("follow_up", "reopened", "started_fresh") or not dispatch
-            or dispatch == previous or receipt.get("followUpOf") != previous):
+            or dispatch == previous or dispatch == receipt.get("followUpOf")
+            or not in_coder_chain(receipt.get("followUpOf"), previous, run)):
         raise OrcaError("incomplete coder follow-up receipt")
     return dispatch
 
@@ -299,7 +315,7 @@ def resume(path):
                   "--to", f"dispatch:{st['dispatch']}", "--subject", "PROOF-FOLLOWUP",
                   "--body", "Run the inert, authorized `touch proof-perm.txt` here, then send worker_done "
                             "--outcome succeeded saying whether a permission prompt appeared.")["result"]
-        st["dispatch"] = followup_dispatch(fu, st["dispatch"])
+        st["dispatch"] = followup_dispatch(fu, st["dispatch"], st["run"])
         del st["followup"]
         log("follow-up", {k: fu[k] for k in ("delivery", "dispatchId", "state")})
         done = completion(mail(st["anchor"], st["run"], "worker_done"), st["run"], st["dispatch"])
@@ -983,17 +999,38 @@ def review_route(body):
     return route
 
 
+def mail_payload(message):
+    payload = message["payload"]
+    return json.loads(payload) if isinstance(payload, str) else payload
+
+
 def review_mail(messages, dispatch):
     reports = []
     for message in messages:
         if message["type"] != "worker_done":
             continue
-        payload = message["payload"]
-        if isinstance(payload, str):
-            payload = json.loads(payload)
+        payload = mail_payload(message)
         if payload.get("dispatchId") == dispatch and payload.get("outcome") == "succeeded":
             reports.append(message)
     return sorted(reports, key=lambda m: m["sequence"])
+
+
+def latest_coder_report(state, run, messages):
+    reports = review_mail(messages, state["coder"])
+    latest = reports[-1] if reports else {}
+    terminal = latest.get("from_handle") or state.get("coder_terminal")
+    if terminal:
+        for message in sorted(messages, key=lambda m: m["sequence"], reverse=True):
+            if latest and message["sequence"] <= latest["sequence"]:
+                break
+            if message["type"] != "worker_done" or message.get("from_handle") != terminal:
+                continue
+            payload = mail_payload(message)
+            dispatch = payload.get("dispatchId")
+            if payload.get("outcome") == "succeeded" and in_coder_chain(dispatch, state["coder"], run):
+                state["coder"] = state["expected"] = dispatch
+                return [message]
+    return [latest] if latest else []
 
 
 def green_report(ticket, body):
@@ -1113,6 +1150,54 @@ def adopt_reviewer(db, run, ticket, state, messages):
     save_review(db, run, number, state)
 
 
+GREEN_INSTRUCTIONS = "Report the pushed branch head as a full SHA after its task CI is green."
+
+
+def coder_spec(ticket, stage, instructions):
+    goal = "Land the approved change through its PR." if stage == "Merging" else "Return a green task SHA."
+    return (f"/goal {goal}\nRole: follow ~/.agents/roles/coder.md.\n"
+            f"Issue {OWNER}/hr-relay#{ticket['number']}. Branch {ticket['branch']}, base {ticket['base']}.\n{instructions}")
+
+
+def finish_followup(state, stage, dispatch):
+    state["coder"] = state["expected"] = dispatch
+    state["card_agent"] = state["agent"]
+    if stage == "Fixing" and state.get("reviewer"):
+        state["release"] = state.pop("reviewer")
+    state.pop("followup", None)
+
+
+def recover_followup(run, ticket, state, messages, message_id):
+    report = next((m for m in review_mail(messages, state["expected"]) if m["id"] == message_id), None)
+    if not report or not report.get("created_at"):
+        return False
+    followup = state.get("followup")
+    if not followup:
+        # The old reservation for a stale PUSH did not save its outbound spec.
+        if (state["stage"] != "Reviewing" or not state.get("sha")
+                or f"REVIEW VERDICT: PUSH {state['sha']}" not in (report["subject"], *report["body"].splitlines()[:1])):
+            return False
+        followup = {"stage": "Fixing", "spec": coder_spec(ticket, "Fixing", GREEN_INSTRUCTIONS)}
+    stage = followup["stage"]
+    tasks = runtime("orchestration", "task-list", "--run", run, "--full")["tasks"]
+    matches = [t for t in tasks if t["run_id"] == run and t["task_title"] == f"#{ticket['number']}: {stage}"
+               and t["spec"] == followup["spec"]
+               and t["created_at"].replace(" ", "T")[:19] >= report["created_at"][:19]]
+    if len(matches) != 1:
+        return False
+    task = matches[0]["id"]
+    dispatch = (runtime("orchestration", "dispatch-show", "--task", task, "--full").get("dispatch") or {}).get("id")
+    if not dispatch:
+        return False
+    attempt = runtime("orchestration", "worker-show", "--dispatch", dispatch, "--full")["dispatch"]
+    if (attempt["id"] != dispatch or attempt["taskId"] != task or attempt["runId"] != run
+            or not in_coder_chain(attempt.get("followUpOf"), state["coder"], run)):
+        return False
+    finish_followup(state, stage, dispatch)
+    state.update(stage=stage, publish=True)
+    return True
+
+
 def publish_review(db, run, ticket, state):
     if state.get("release"):
         import pick
@@ -1137,14 +1222,28 @@ def review_step(db, run, actor, ticket, initial, messages):
     import pick
     number = ticket["number"]
     state = review_state(db, run, number) or initial.copy()
-    if state.get("pending"):
-        adopt_reviewer(db, run, ticket, state, messages)
+    reservation = state.get("pending") or state.get("released")
+    if reservation:
+        if recover_followup(run, ticket, state, messages, reservation):
+            state.pop("pending", None)
+            state.pop("released", None)
+            save_review(db, run, number, state)
+        elif state.get("pending"):
+            adopt_reviewer(db, run, ticket, state, messages)
+        else:
+            state.pop("released")
+            state.pop("followup", None)
+            state.pop("review_title", None)
+            state.pop("hold", None)
+            save_review(db, run, number, state)
     if state.get("publish"):
         publish_review(db, run, ticket, state)
     if state["stage"] in ("Merging", "Needs you"):
         return
     db.execute("CREATE TABLE IF NOT EXISTS review_mail (run TEXT, id TEXT, PRIMARY KEY(run,id))")
-    for message in review_mail(messages, state["expected"]):
+    reports = (review_mail(messages, state["expected"]) if state["stage"] == "Reviewing"
+               else latest_coder_report(state, run, messages))
+    for message in reports:
         if not db.execute("SELECT 1 FROM review_mail WHERE run=? AND id=?", (run, message["id"])).fetchone():
             break
     else:
@@ -1152,7 +1251,7 @@ def review_step(db, run, actor, ticket, initial, messages):
 
     body = message["body"]
     stage = "Fixing"
-    instructions = "Report the pushed branch head as a full SHA after its task CI is green."
+    instructions = GREEN_INSTRUCTIONS
     account = None
     if state["stage"] == "Reviewing":
         header = body.splitlines()[0] if body else ""
@@ -1206,9 +1305,9 @@ def review_step(db, run, actor, ticket, initial, messages):
         state["hold"] = {"account": account["id"], "label": account["label"], "route": route,
                          "time": int(time.time()), "holds": str(pick.HOLDS)}
     else:
-        goal = "Land the approved change through its PR." if stage == "Merging" else "Return a green task SHA."
-        spec = (f"/goal {goal}\nRole: follow ~/.agents/roles/coder.md.\n"
-                f"Issue {OWNER}/hr-relay#{number}. Branch {ticket['branch']}, base {ticket['base']}.\n{instructions}")
+        spec = coder_spec(ticket, stage, instructions)
+        if stage != "Needs you":
+            state["followup"] = {"stage": stage, "spec": spec}
     # A lost response may already have launched a worker. Reserve before issuing the command.
     state["pending"] = message["id"]
     with db:
@@ -1230,8 +1329,8 @@ def review_step(db, run, actor, ticket, initial, messages):
     else:
         result = runtime("orchestration", "send", *actor, "--to", "dispatch:" + state["coder"],
                          "--subject", f"#{number}: {stage}", "--body", spec)
-        state["coder"] = state["expected"] = followup_dispatch(result, state["coder"])
-    if stage in ("Fixing", "Needs you") and state.get("reviewer"):
+        finish_followup(state, stage, followup_dispatch(result, state["coder"], run))
+    if stage == "Needs you" and state.get("reviewer"):
         state["release"] = state.pop("reviewer")
     state.pop("pending")
     state.update(stage=stage, publish=True)
@@ -1282,7 +1381,8 @@ def review_tick(args, db):
                     raise OrcaError("coder worktree does not match the issue repository and branch")
                 model = worker["startOptions"]["launch"]["effective"]["model"]
                 agent = (ticket["agent"] or "").split(" · ")[0] or f"coder {model}"
-                state = {"coder": dispatch, "expected": dispatch, "path": tree["path"], "model": model,
+                state = {"coder": dispatch, "expected": dispatch, "coder_terminal": show["dispatch"].get("assigneeHandle"),
+                         "path": tree["path"], "model": model,
                          "agent": agent, "history": [], "stage": "Coding"}
             review_step(db, run, actor, ticket, state, messages)
         except (OrcaError, OSError, KeyError, ValueError, subprocess.TimeoutExpired) as e:
@@ -1296,6 +1396,22 @@ def review(args):
     state = Path.home() / ".local/state/dev-auto"
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (state / "fill.lock").open("a+") as lock:
+        if args.release is not None:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise OrcaError("another tick is active; retry release after it finishes") from None
+            _, run = supervisor(args)
+            with sqlite3.connect(state / "starts.sqlite") as db:
+                row = review_state(db, run, args.release)
+                if row and row.get("pending"):
+                    # Keep the handled message ID. The next tick may adopt a proven send, never replay it.
+                    row["released"] = row.pop("pending")
+                    save_review(db, run, args.release, row)
+                    log("released", {"issue": args.release})
+                else:
+                    log("no pending reservation", {"issue": args.release})
+            return
         fcntl.flock(lock, fcntl.LOCK_EX)
         with sqlite3.connect(state / "starts.sqlite") as db:
             review_tick(args, db)
@@ -1318,11 +1434,14 @@ def main(argv=None):
     f.add_argument("--run", help="Run already bound to that anchor")
     r = sub.add_parser("review", help="advance coder reports and review verdicts in the coordinating Run")
     r.add_argument("--issue", type=int, help="restrict review to this ticket")
+    r.add_argument("--release", type=int, help="release one inspected pending review in the owning Run, then exit")
     r.add_argument("--coder", help="initial coder Dispatch for a manually started ticket")
     r.add_argument("--anchor", help="pane-less supervisor anchor")
     r.add_argument("--run", help="Run already bound to the anchor")
     args = ap.parse_args(argv)
     if args.cmd == "review":
+        if args.release is not None and (args.release <= 0 or args.issue is not None or args.coder):
+            r.error("--release requires a positive issue number and cannot combine with --issue or --coder")
         if args.coder and not args.issue:
             r.error("--coder requires --issue")
         try:

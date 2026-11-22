@@ -819,4 +819,71 @@ with patch.object(tick, "review_card") as card, patch.object(tick, "runtime") as
     assert "bad-verdict" in card.call_args.args[2]
     cli.assert_not_called()
 
+# Recorded Run history: a manual coder follow-up intervened before the tick's send.
+root, manual, delivered = "first-coder", "manual-fix", "return-green"
+verdict = report("reader", f"REVIEW VERDICT: PUSH {sha}", msg_id="push-verdict")
+verdict["created_at"] = "2026-11-22T22:37:23Z"
+follow_task = {"id": "green-task", "run_id": "run", "task_title": "#41: Fixing",
+               "created_at": "2026-11-22 22:42:30", "spec": "/goal Return a green task SHA.\n"
+               "Role: follow ~/.agents/roles/coder.md.\nIssue julianthant/hr-relay#41. Branch task/ui/header, "
+               "base origin/development.\nReport the pushed branch head as a full SHA after its task CI is green."}
+def ancestry(*args):
+    if args[1] == "worker-show":
+        dispatch = args[3]
+        return {"dispatch": {"id": dispatch, "runId": "run", "taskId": "green-task" if dispatch == delivered else "manual",
+                             "followUpOf": {manual: root, delivered: manual}.get(dispatch)}}
+    if args[1] == "task-list":
+        return {"tasks": [follow_task]}
+    if args[1] == "dispatch-show":
+        return {"dispatch": {"id": delivered}}
+    raise AssertionError(args)
+
+with patch.object(tick, "runtime", side_effect=ancestry):
+    receipt = {"delivery": "follow_up", "followUpOf": manual, "dispatchId": delivered}
+    assert tick.followup_dispatch(receipt, root, "run") == delivered
+    with check.assertRaises(tick.OrcaError):
+        tick.followup_dispatch(receipt, "unrelated", "run")
+
+for release_first in (False, True):
+    ticket, state = review_fixture()
+    state.update(stage="Reviewing", coder=root, expected="reader", sha=sha, pending=verdict["id"])
+    with TemporaryDirectory() as tmp, patch.object(tick.Path, "home", return_value=Path(tmp)), patch.object(
+            tick, "supervisor", return_value=([], "run")), patch.object(tick, "runtime", side_effect=ancestry) as cli:
+        directory = Path(tmp) / ".local/state/dev-auto"
+        directory.mkdir(parents=True)
+        with sqlite3.connect(directory / "starts.sqlite") as db:
+            tick.review_state(db, "run", 41)
+            tick.save_review(db, "run", 41, state)
+            tick.save_review(db, "another-run", 41, state)
+            db.execute("CREATE TABLE review_mail (run TEXT, id TEXT, PRIMARY KEY(run,id))")
+            db.execute("INSERT INTO review_mail VALUES ('run','push-verdict')")
+            db.commit()
+            if release_first:
+                tick.main(["review", "--release", "41"])
+                assert "pending" not in tick.review_state(db, "run", 41)
+                assert tick.review_state(db, "another-run", 41)["pending"] == verdict["id"]
+                cli.assert_not_called()
+            with patch.object(tick, "review_card") as card:
+                tick.review_step(db, "run", [], ticket, state, [verdict])
+                assert tick.review_state(db, "run", 41)["expected"] == delivered
+                assert card.call_args.args[1] == "Fixing"
+            green = report(delivered, "I verified the pushed head is " + sha, msg_id="green-task-result")
+            with patch.object(tick, "green_report", return_value=sha) as verify, patch.object(tick, "review_account",
+                    side_effect=tick.OrcaError("seat unavailable")):
+                with check.assertRaisesRegex(tick.OrcaError, "seat unavailable"):
+                    tick.review_step(db, "run", [], ticket, state, [verdict, green])
+                verify.assert_called_once()
+            assert not any(c.args[1] in ("worker-start", "send") for c in cli.call_args_list)
+
+# The newest manual follow-up can report before the tick reads the older green report.
+ticket, state = review_fixture()
+old = dict(report(root, "older head"), from_handle="coder-pane")
+new = dict(report(manual, sha, msg_id="manual-result"), from_handle="coder-pane", sequence=2)
+state.update(coder=root, expected=root, coder_terminal="coder-pane")
+with patch.object(tick, "runtime", side_effect=ancestry), patch.object(tick, "green_report", return_value=sha) as verify, \
+        patch.object(tick, "review_account", side_effect=tick.OrcaError("no reviewer seat")):
+    with check.assertRaisesRegex(tick.OrcaError, "no reviewer seat"):
+        tick.review_step(sqlite3.connect(":memory:"), "run", [], ticket, state, [new, old])
+    assert sha in verify.call_args.args[1]
+
 print("ok")

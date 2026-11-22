@@ -1677,7 +1677,8 @@ def main(argv=None):
     r.add_argument("--coder", help="initial coder Dispatch for a manually started ticket")
     r.add_argument("--anchor", help="pane-less supervisor anchor")
     r.add_argument("--run", help="Run already bound to the anchor")
-    c = sub.add_parser("close", help="release the coordinating Run's workers for closed issues")
+    c = sub.add_parser("close", help="release the coordinating Run's workers for closed issues",
+                       description="Clean up closed issues and report blocked cleanup to the coordinator that owns the Run.")
     c.add_argument("--repo-path", type=Path, required=True, help="registered repository root checkout")
     c.add_argument("--issue", type=int, help="restrict cleanup to one ticket")
     c.add_argument("--holds", type=Path, help="existing fleet picker's holds.json")

@@ -48,9 +48,9 @@ def orca(*args, ok=True):
     except ValueError:
         data = {"ok": False, "error": f"invalid JSON, exit {out.returncode}: {out.stderr.strip()[:200]}"}
     else:
-        if out.returncode and data.get("ok"):
+        if out.returncode and data.get("ok") is True:
             data = {**data, "ok": False, "error": f"exit {out.returncode}"}
-    if ok and not data.get("ok"):
+    if ok and data.get("ok") is not True:
         raise OrcaError(f"orca {' '.join(args[:2])}: {data.get('error')}")
     return data
 
@@ -126,19 +126,30 @@ def completion(m, run, dispatch):
 def close_anchor(st):
     """Close the anchor; its handle is kept until Orca confirms the pane was killed."""
     r = orca("terminal", "close", "--terminal", st["anchor"], ok=False)
-    if r.get("ok") and ((r.get("result") or {}).get("close") or {}).get("ptyKilled"):
+    if r.get("ok") is True and ((r.get("result") or {}).get("close") or {}).get("ptyKilled") is True:
         st.pop("anchor")
         return None
     return f"anchor close not confirmed: {r.get('error') or r.get('result')}"
 
 
+def git(st, *args):
+    out = subprocess.run(["git", "--git-dir", st["git"], *args], capture_output=True, text=True)
+    if out.returncode:
+        raise OrcaError(f"git {' '.join(args[:2])} exit {out.returncode}: {out.stderr.strip()[:200]}")
+    return out.stdout.splitlines()
+
+
 def leftovers(st):
-    """The scratch checkout or branch git still shows after removal."""
-    left = [st["path"]] if os.path.exists(st["path"]) else []
-    git = ["git", "--git-dir", st["git"]]
-    if st["path"] in subprocess.run([*git, "worktree", "list", "--porcelain"], capture_output=True, text=True).stdout:
-        left.append(f"worktree {st['path']}")
-    if subprocess.run([*git, "show-ref", "--verify", "--quiet", f"refs/heads/{st['branch']}"]).returncode == 0:
+    """The scratch checkout or branch git still lists after removal; raises when git can't say."""
+    trees = [line[9:] for line in git(st, "worktree", "list", "--porcelain") if line.startswith("worktree ")]
+    refs = git(st, "for-each-ref", "--format=%(refname)", "refs/heads/")
+    if not trees or not all(r.startswith("refs/heads/") for r in refs):
+        raise OrcaError(f"unreadable git output: {trees[:3]} {refs[:3]}")
+    path = os.path.realpath(st["path"])
+    left = [f"worktree {st['path']}" for t in trees if os.path.realpath(t) == path]
+    if os.path.exists(st["path"]):
+        left.append(f"directory {st['path']}")
+    if f"refs/heads/{st['branch']}" in refs:
         left.append(f"branch {st['branch']}")
     return left
 
@@ -162,7 +173,7 @@ def cleanup(st):
         r = orca("orchestration", "worker-release", "--dispatch", st["dispatch"], ok=False)
         state = (r.get("result") or {}).get("state")
         log("release", r.get("result") or r.get("error"))
-        if not r.get("ok") or state not in RELEASED:
+        if r.get("ok") is not True or state not in RELEASED:
             errs.append(f"release of {st['dispatch']} not confirmed: {state or r.get('error')}")
     elif st.get("started"):
         errs.append("worker-start was attempted but returned no dispatch; its worker may be live")
@@ -172,10 +183,14 @@ def cleanup(st):
         return [*errs, f"kept scratch worktree {st['worktree']}"]
     r = orca("worktree", "rm", "--worktree", st["worktree"], "--force", "--delete-branch", ok=False)
     log("cleanup", r.get("result") or r.get("error"))
-    if not r.get("ok") or not (r.get("result") or {}).get("removed"):
+    if r.get("ok") is not True or (r.get("result") or {}).get("removed") is not True:
         return [f"worktree rm not confirmed: {r.get('error') or r.get('result')}"]
-    left = leftovers(st)
-    log("absent", {"worktree": st["path"] not in str(left), "branch": f"branch {st['branch']}" not in left})
+    try:
+        left = leftovers(st)
+    except OrcaError as e:
+        return [f"absence not verified: {e}"]
+    log("absent", {"worktree": not any(x.startswith(("worktree", "directory")) for x in left),
+                   "branch": f"branch {st['branch']}" not in left})
     return [f"still present after rm: {x}" for x in left]
 
 

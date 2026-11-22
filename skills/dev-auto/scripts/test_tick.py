@@ -1,5 +1,7 @@
 import io
+import subprocess
 from contextlib import redirect_stderr, redirect_stdout
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import tick
@@ -139,5 +141,58 @@ with patch.object(tick, "orca", run):
             raise AssertionError(f"accepted {m} for {r}")
         except tick.OrcaError as e:
             assert "rejected" in str(e)
+
+# orca(): only a literal JSON true is success.
+with patch.object(tick.subprocess, "run") as run:
+    run.return_value.returncode, run.return_value.stderr = 0, ""
+    for v in ('"false"', '"true"', "1", "{}"):
+        run.return_value.stdout = '{"ok": %s}' % v
+        try:
+            tick.orca("x")
+            raise AssertionError(f"accepted ok={v}")
+        except tick.OrcaError:
+            pass
+
+# Non-boolean release, close and removal fields keep the checkout or fail the removal.
+for v in ("true", "false", 1):
+    for bad in ({REL: {"ok": v, "result": {"state": "released"}}},
+                {CLOSE: {"ok": v, "result": {"close": {"ptyKilled": True}}}},
+                {CLOSE: {"ok": True, "result": {"close": {"ptyKilled": v}}}}):
+        errs, calls, _ = clean(bad)
+        assert RM not in calls and errs[-1] == KEPT, (bad, errs)
+    for bad in ({RM: {"ok": v, "result": {"removed": True}}}, {RM: {"ok": True, "result": {"removed": v}}}):
+        assert "worktree rm not confirmed" in clean(bad)[0][0], bad
+
+# leftovers() against a real repo: present, then absent; a failed or unreadable git raises.
+with TemporaryDirectory() as tmp:
+    repo, wt = f"{tmp}/repo", f"{tmp}/wt"
+    g = lambda *a: subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", *a],
+                                  check=True, capture_output=True)
+    subprocess.run(["git", "init", "-q", repo], check=True)
+    g("commit", "-q", "--allow-empty", "-m", "init")
+    g("worktree", "add", "-q", "-b", "scratch/x", wt)
+    real = {"path": wt, "branch": "scratch/x", "git": f"{repo}/.git"}
+    assert tick.leftovers(real) == [f"worktree {wt}", f"directory {wt}", "branch scratch/x"]
+    assert tick.leftovers({**real, "branch": "scratch/x-other"})[-1] == f"directory {wt}"
+    g("worktree", "remove", wt)
+    assert tick.leftovers(real) == ["branch scratch/x"]
+    g("branch", "-q", "-D", "scratch/x")
+    assert tick.leftovers(real) == []
+    try:
+        tick.leftovers({**real, "git": f"{tmp}/missing"})
+        raise AssertionError("missing git dir passed")
+    except tick.OrcaError as e:
+        assert "exit 128" in str(e), e
+    with patch.object(tick, "git", side_effect=[["garbage"], []]):
+        try:
+            tick.leftovers(real)
+            raise AssertionError("unreadable output passed")
+        except tick.OrcaError as e:
+            assert "unreadable" in str(e)
+    # Through cleanup: a git that cannot answer is not clean.
+    run, _ = fake(good)
+    with patch.object(tick, "orca", run), redirect_stdout(io.StringIO()):
+        errs = tick.cleanup({**st, **real, "git": f"{tmp}/missing"})
+    assert errs[0].startswith("absence not verified: git worktree list exit 128"), errs
 
 print("ok")

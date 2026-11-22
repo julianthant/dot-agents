@@ -52,15 +52,18 @@ Each result below was proven separately; do not read one as another.
 | Release | `worker-release --dispatch <newest id>` | `released`, `closed_agent_terminal`; older ids in the chain report `retained` / `ownership_transferred` |
 | Cleanup | `terminal close --terminal <anchor>`, then `worktree rm --worktree path:<wt> --force --delete-branch` | `removed: true` |
 
-A receipt counts only when the command exits 0 with valid JSON, `ok: true` and the expected
-result field. A timeout or invalid JSON is a failed receipt. `tick.py` removes the checkout and
+A receipt counts only when the command exits 0 with valid JSON, `ok` is literally `true` and the
+expected result field (`removed`, `ptyKilled`) is literally `true`; a string, a number or any
+other truthy value fails. A timeout or invalid JSON is a failed receipt. `tick.py` removes the checkout and
 branch only when all of these hold:
 
 - `worker-release` reported `released` or `already_released`, or no `worker-start` was attempted;
 - no follow-up `send` is still waiting on its receipt;
 - `terminal close` reported `ptyKilled` for the anchor. The anchor handle is kept until it does.
 
-After `worktree rm` reports `removed`, git must show neither the checkout nor the branch. If any
+After `worktree rm` reports `removed`, `git worktree list --porcelain` and
+`git for-each-ref refs/heads/` must both succeed, give readable output, and name neither the
+checkout path nor the branch exactly; a failed git (such as exit 128) fails cleanup. If any
 of these checks fails, the scratch worktree stays, the reasons go to stderr and the exit status
 is 1. A failed proof step re-raises its own error, even when cleanup crashes.
 

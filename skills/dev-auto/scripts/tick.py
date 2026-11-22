@@ -1,6 +1,7 @@
 """Headless Orca coordinator stub for dev-auto: no terminal of its own, run by launchd.
 
   tick.py review [--issue N]                         advance reports from the owning Run mailbox
+  tick.py close --repo-path <checkout> [--issue N]   release workers and clean up closed tickets
   tick.py fill --repo-path <checkout> [--issue N] [--dry-run]
   tick.py start --repo id:<repo-id> --state <file>   process 1: scratch worker started, its ask answered
   tick.py resume --state <file>                      process 2: rebinds the stored Run, finishes, cleans up
@@ -1417,6 +1418,244 @@ def review(args):
             review_tick(args, db)
 
 
+CLOSE_QUERY = """
+query($endCursor:String) {
+  repository(owner:"julianthant",name:"hr-relay") {
+    issues(first:50,states:CLOSED,after:$endCursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number title body
+        projectItems(first:20) { totalCount nodes {
+          id project { number owner { ... on User { login } ... on Organization { login } } }
+          agent:fieldValueByName(name:"Agent") { ... on ProjectV2ItemFieldTextValue { text } }
+          stage:fieldValueByName(name:"Agent state") { ... on ProjectV2ItemFieldSingleSelectValue { name } }
+        }}
+        closedByPullRequestsReferences(first:50) { totalCount nodes {
+          merged headRefName headRefOid isCrossRepository repository { nameWithOwner }
+        }}
+      }
+    }
+  }
+}
+"""
+
+
+def close_cards(repo, issue):
+    pages = json.loads(command("gh", "api", "graphql", "--paginate", "--slurp", "-f", "query=" + CLOSE_QUERY))
+    for page in pages:
+        for row in page["data"]["repository"]["issues"]["nodes"]:
+            if issue and row["number"] != issue:
+                continue
+            branch_section = section(row["body"], "Branch")
+            if repo != ("dot-agents" if "dot-agents" in branch_section else "hr-relay"):
+                continue
+            card = next((c for c in nodes(row["projectItems"])
+                         if c["project"] == {"number": PROJECT, "owner": {"login": OWNER}}), None)
+            if not card or not (card["agent"] or card["stage"]):
+                continue
+            match = re.search(r"\btask/[\w-]+/[\w-]+", branch_section)
+            branch = match[0] if match else None
+            if not branch:
+                slug = re.fullmatch(r"([\w-]+)\s*/\s*([\w-]+(?:[ \t]+[\w-]+)*)(?:\s*:.*)?", row["title"].strip())
+                if slug:
+                    branch = f"task/{slug[1].lower()}/" + "-".join(slug[2].lower().split())
+            yield row, card, branch
+
+
+def close_workers(run):
+    cursor = []
+    seen = set()
+    while True:
+        inventory = runtime("orchestration", "worker-list", "--run", run, "--full", "--limit", "100", *cursor)
+        for worker in inventory["workers"]:
+            if worker["runId"] != run:
+                raise OrcaError("worker-list returned a different Run")
+            if worker["projection"]["host"]["kind"] == "local":
+                yield worker
+        page = inventory["page"]
+        if not page["hasMore"]:
+            return
+        next_cursor = page["nextCursor"]
+        if not next_cursor or next_cursor in seen:
+            raise OrcaError("incomplete Orca worker inventory")
+        seen.add(next_cursor)
+        cursor = ["--cursor", next_cursor]
+
+
+def release_close_workers(workers, workspace, run, paths):
+    import pick
+    releases, errors = [], []
+    for worker in workers:
+        dispatch = worker["dispatchId"]
+        terminal = worker["agentTerminalHandle"]
+        try:
+            if not terminal:
+                # Predecessors can lose their resource row when a follow-up reuses the pane.
+                show = runtime("orchestration", "worker-show", "--dispatch", dispatch, "--full")
+                attempt, receipt = show["dispatch"], show.get("worker")
+                if attempt["id"] != dispatch or attempt["runId"] != run:
+                    raise OrcaError("Dispatch identity changed")
+                terminal = attempt.get("assigneeHandle")
+                if receipt and receipt["worktreeId"] != workspace:
+                    raise OrcaError("Dispatch worktree changed")
+                if receipt and any(e.get("kind") == "terminal" and e.get("role") == "agent" for e in receipt["effects"]):
+                    if start_identity(receipt) != (dispatch, terminal):
+                        raise OrcaError("Dispatch terminal changed")
+            result = runtime("orchestration", "worker-release", "--dispatch", dispatch, "--full")
+            releases.append((worker, terminal, result))
+        except (OrcaError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as e:
+            errors.append(f"{dispatch}: {e}")
+    inventory = runtime("terminal", "list", "--limit", "10000")
+    if inventory["truncated"]:
+        raise OrcaError("incomplete terminal inventory after release")
+    live = {t["handle"] for t in inventory["terminals"]}
+    dropped = set()
+    for worker, terminal, result in releases:
+        state = result.get("state")
+        if terminal not in live and (state in RELEASED or
+                (state == "retained" and worker["dispatchStatus"] == "completed"
+                 and (terminal or result.get("reason") == "ownership_transferred"))):
+            if terminal:
+                dropped.add(terminal)
+        else:
+            errors.append(f"{worker['dispatchId']}: release unconfirmed ({state}, {result.get('reason')})")
+    for path in paths:
+        if dropped and path.exists():
+            with pick.edit_holds(path) as holds:
+                for terminal in dropped:
+                    holds.pop(terminal, None)
+    if any(t.get("worktreeId") == workspace and t.get("agentIdentity") for t in inventory["terminals"]):
+        errors.append("worktree still has a live agent terminal")
+    if errors:
+        raise OrcaError("; ".join(errors))
+
+
+def remove_closed_tree(repo, workspace, tree, branch, sha):
+    ref = "refs/heads/" + branch
+    git_repo = ("git", "-C", str(repo))
+    path = workspace.partition("::")[2]
+    if not Path(path).is_absolute():
+        raise OrcaError("invalid Orca worktree path")
+    checkouts = [row.split("\0") for row in
+                 command(*git_repo, "worktree", "list", "--porcelain", "-z").split("\0\0") if row]
+    matching = [row for row in checkouts if "branch " + ref in row or row[0] == "worktree " + path]
+    if tree:
+        if (tree["isMainWorktree"] or path != tree["path"] or path == str(repo) or
+                len(matching) != 1 or matching[0][:3] != ["worktree " + path, "HEAD " + sha, "branch " + ref]
+                or matching[0] == checkouts[0]):
+            raise OrcaError("worktree does not match the merged PR head")
+        if command("git", "-C", path, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none"):
+            raise OrcaError("worktree contains local changes or untracked files")
+    elif matching or Path(path).exists():
+        raise OrcaError("worktree still exists outside the verified Orca inventory")
+
+    local_tips = command(*git_repo, "for-each-ref", "--format=%(objectname) %(refname)", ref).splitlines()
+    local = [line for line in local_tips if line.endswith(" " + ref)]
+    if local and local != [sha + " " + ref]:
+        raise OrcaError("local task branch differs from the merged PR head")
+    remote = command(*git_repo, "ls-remote", "--heads", "origin", ref).split()
+    if remote and remote != [sha, ref]:
+        raise OrcaError("remote task branch differs from the merged PR head")
+    if tree:
+        receipt = runtime("worktree", "rm", "--worktree", "id:" + workspace)
+        if receipt.get("removed") is not True or Path(path).exists() or (
+                f"worktree {path}\0" in command(*git_repo, "worktree", "list", "--porcelain", "-z")):
+            raise OrcaError("worktree removal not confirmed")
+    if remote:
+        try:
+            command(*git_repo, "push", f"--force-with-lease={ref}:{sha}", "origin", ":" + ref)
+        except OrcaError:
+            if command(*git_repo, "ls-remote", "--heads", "origin", ref).strip():
+                raise
+    if local:
+        if "branch " + ref + "\0" in command(*git_repo, "worktree", "list", "--porcelain", "-z"):
+            raise OrcaError("task branch was checked out during cleanup")
+        command(*git_repo, "update-ref", "-d", ref, sha)
+
+
+def close_tick(args, db):
+    import pick
+    repo = args.repo_path.resolve()
+    remote = command("git", "-C", str(repo), "remote", "get-url", "origin").strip()
+    match = re.fullmatch(r"(?:https://github\.com/|git@github\.com:)julianthant/(hr-relay|dot-agents)(?:\.git)?", remote)
+    if not match:
+        raise OrcaError("target checkout must belong to julianthant/hr-relay or julianthant/dot-agents")
+    repo_name = match[1]
+    candidates = list(close_cards(repo_name, args.issue))
+    if not candidates:
+        log("close", "no closed tickets with Agent fields")
+        return
+    actor, run = supervisor(args)
+    roster = {}
+    for worker in close_workers(run):
+        workspace = worker["projection"].get("workspace")
+        if workspace:
+            roster.setdefault(workspace["id"], []).append(worker)
+    trees = runtime("worktree", "list", "--repo", "path:" + str(repo), "--limit", "10000")
+    if trees["truncated"]:
+        raise OrcaError("incomplete Orca worktree inventory")
+    project, (_, (stage, _), (agent, _)), (_, needs_you) = project_fields()
+    # Retry the same workspace if a partial close already removed the checkout.
+    db.execute("CREATE TABLE IF NOT EXISTS closing (run TEXT, issue INTEGER, workspace TEXT, PRIMARY KEY(run,issue))")
+    for issue, card, branch in candidates:
+        number = issue["number"]
+        review = review_state(db, run, number) or {}
+        saved = db.execute("SELECT workspace FROM closing WHERE run=? AND issue=?", (run, number)).fetchone()
+        matching = [tree for tree in trees["worktrees"] if
+                    tree["branch"] and tree["branch"].removeprefix("refs/heads/") == branch and not tree["isMainWorktree"]]
+        tree = matching[0] if len(matching) == 1 else None
+        recorded_path = review.get("path")
+        historical = [identity for identity in roster if recorded_path and identity.partition("::")[2] == recorded_path]
+        workspace = historical[0] if len(historical) == 1 else None
+        if saved:
+            workspace = saved[0]
+        if tree:
+            workspace = tree["id"]
+        workers = roster.get(workspace)
+        if not workers and not args.issue and not saved and not review:
+            continue
+        edit = ("gh", "project", "item-edit", "--project-id", project, "--id", card["id"], "--field-id")
+        try:
+            if (not workers or not branch or len(matching) > 1 or (saved and workspace != saved[0])
+                    or (recorded_path and workspace.partition("::")[2] != recorded_path)):
+                raise OrcaError("no unique ticket worktree and worker inventory in this Run")
+            with db:
+                db.execute("INSERT OR IGNORE INTO closing VALUES (?,?,?)", (run, number, workspace))
+            paths = {pick.HOLDS, args.holds or pick.HOLDS}
+            paths.update(Path(review[key]["holds"]) for key in ("hold", "reviewer", "release")
+                         if review.get(key) and review[key].get("holds"))
+            release_close_workers(workers, workspace, run, paths)
+            heads = {pr["headRefOid"] for pr in nodes(issue["closedByPullRequestsReferences"])
+                     if pr["merged"] and not pr["isCrossRepository"] and pr["headRefName"] == branch
+                     and pr["repository"]["nameWithOwner"] == f"{OWNER}/{repo_name}"}
+            if len(heads) != 1:
+                raise OrcaError("closed without a uniquely verified merged task PR")
+            sha = heads.pop()
+            if not re.fullmatch(r"[0-9a-f]{40}", sha or ""):
+                raise OrcaError("invalid merged PR head")
+            remove_closed_tree(repo, workspace, tree, branch, sha)
+            command(*edit, agent, "--clear")
+            command(*edit, stage, "--clear")
+            with db:
+                db.execute("DELETE FROM closing WHERE run=? AND issue=?", (run, number))
+            log("closed", {"issue": number, "branch": branch, "head": sha})
+        except (OrcaError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as e:
+            log("Needs you", {"issue": number, "reason": str(e)})
+            if args.issue or (card["stage"] or {}).get("name") != "Needs you":
+                runtime("orchestration", "send", *actor, "--to", "run:" + run, "--type", "escalation",
+                        "--subject", f"#{number}: Needs you after close", "--body", str(e))
+                command(*edit, stage, "--single-select-option-id", needs_you)
+
+
+def close(args):
+    import fcntl
+    state = Path.home() / ".local/state/dev-auto"
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (state / "fill.lock").open("a+") as lock, sqlite3.connect(state / "starts.sqlite") as db:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        close_tick(args, db)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1438,7 +1677,21 @@ def main(argv=None):
     r.add_argument("--coder", help="initial coder Dispatch for a manually started ticket")
     r.add_argument("--anchor", help="pane-less supervisor anchor")
     r.add_argument("--run", help="Run already bound to the anchor")
+    c = sub.add_parser("close", help="release the coordinating Run's workers for closed issues",
+                       description="Clean up closed issues and report blocked cleanup to the coordinator that owns the Run.")
+    c.add_argument("--repo-path", type=Path, required=True, help="registered repository root checkout")
+    c.add_argument("--issue", type=int, help="restrict cleanup to one ticket")
+    c.add_argument("--holds", type=Path, help="existing fleet picker's holds.json")
+    c.add_argument("--anchor", help="pane-less supervisor anchor")
+    c.add_argument("--run", help="Run already bound to the anchor")
     args = ap.parse_args(argv)
+    if args.cmd == "close":
+        if args.issue is not None and args.issue <= 0:
+            c.error("--issue requires a positive issue number")
+        try:
+            return close(args)
+        except (OSError, OrcaError, ValueError, KeyError, sqlite3.Error, subprocess.TimeoutExpired) as e:
+            ap.exit(1, f"close: {e}\n")
     if args.cmd == "review":
         if args.release is not None and (args.release <= 0 or args.issue is not None or args.coder):
             r.error("--release requires a positive issue number and cannot combine with --issue or --coder")

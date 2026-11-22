@@ -493,7 +493,9 @@ def fill_plan(tickets, seat, issue=None):
 
 def runtime(*args):
     # Production calls inherit the caller's Orca identity, including its worker restrictions.
-    response = json.loads(command(ORCA, *args, "--environment", "local", "--json"))
+    # Orca account commands always operate on this host.
+    target = () if args[0] == "account" else ("--environment", "local")
+    response = json.loads(command(ORCA, *args, *target, "--json"))
     if response.get("ok") is not True:
         raise OrcaError(str(response.get("error")))
     return response["result"]

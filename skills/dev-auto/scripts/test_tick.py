@@ -32,7 +32,13 @@ with patch.dict(tick.os.environ, {"ORCA_TERMINAL_HANDLE": "term_x", "ORCA_CLI_CO
     assert "ORCA_TERMINAL_HANDLE" not in env and env["ORCA_CLI_COMMAND"] == "orca"
     assert run.call_args.args[0] == ["orca", "status", "--json"]
 
-
+with patch.object(tick, "command", return_value='{"ok": true, "result": {}}') as cli:
+    tick.runtime("account", "select", "--agent", "codex", "--account", "seat")
+    cli.assert_called_once_with(tick.ORCA, "account", "select", "--agent", "codex", "--account", "seat", "--json")
+    tick.runtime("account", "list")
+    cli.assert_called_with(tick.ORCA, "account", "list", "--json")
+    tick.runtime("terminal", "list")
+    cli.assert_called_with(tick.ORCA, "terminal", "list", "--environment", "local", "--json")
 
 # orca(): a nonzero exit, invalid JSON or a timeout is a failed receipt, raised unless ok=False.
 with patch.object(tick.subprocess, "run") as run:

@@ -15,10 +15,9 @@ metadata:
 
 Write a handoff document summarising the current conversation so a fresh agent can continue the work.
 
-Save a uniquely named Markdown file in the worktree's ignored scratch area. Verify the chosen
-path with `git check-ignore -- <relative-path>` before writing. If the worktree has no ignored
-scratch area, use the session scratchpad (or a session-specific directory in the OS temp area
-when the host has no scratchpad).
+Save a uniquely named Markdown file in an existing, writable worktree scratch area. Before
+writing there, verify the file path is already ignored with `git check-ignore -- <relative-path>`.
+Use the session scratchpad if no worktree scratch location meets these conditions.
 
 Record the goal, verified state, remaining work, and the next action. Include the GitHub issue and
 PR URLs when applicable, plus the branch and commit if the next session needs them. Include a
@@ -28,10 +27,9 @@ Verify the file is readable and report its absolute path. For a dispatched Orca 
 with the dispatch's `worker_done` command and pass the path with `--report-path`. Use
 `--outcome failed` if the assignment is unfinished. In other sessions, give the path to the user.
 
-For example, if `.scratch/` is the worktree's ignored scratch area, verify
-`.scratch/handoff-issue-42.md`, write the handoff there, and pass its absolute path with
-`--report-path` when sending `worker_done`. If there is no ignored scratch area, write the file in
-the session scratchpad and report that path the same way.
+For example, when work on issue #42 pauses in a worktree with no ignored scratch area, save
+`handoff-issue-42.md` in the session scratchpad and pass its absolute path with `--report-path`
+when sending `worker_done`.
 
 Do not duplicate content already captured in other artifacts (specs, plans, ADRs, issues, commits, diffs). Reference them by path or URL instead.
 

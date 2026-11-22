@@ -1,0 +1,49 @@
+# Per-plan session limits. Each account in accounts.toml names its plan; the orchestrator
+# reads usage (5-hour and weekly %) and applies the rules below before every worker start.
+# Accounts switch only through /handoff: the worker writes its handoff, then a fresh session
+# continues it. Never --resume a handed-off session.
+# Fable counts as Opus. Caps count live sessions on the account across every host.
+
+# Claude: a session idle past its 1-hour prompt cache re-reads its whole context, so a
+# handed-off Claude ticket waits for its own account's 5-hour reset and restarts fresh there.
+[claude.pro]
+opus = 2
+sonnet = 2
+reduced_above_5h = 60   # above 60% 5-hour use: caps drop to the reduced ones (new starts only)
+reduced_opus = 1
+reduced_sonnet = 1
+handoff_5h = 95         # every working session hands off
+
+[claude.team]           # same as pro
+opus = 2
+sonnet = 2
+reduced_above_5h = 60
+reduced_opus = 1
+reduced_sonnet = 1
+handoff_5h = 95
+
+[claude.max]
+sessions = 8
+opus = 6
+reduced_above_5h = 90   # caps halve: 4 sessions, 3 Opus
+reduced_sessions = 4
+reduced_opus = 3
+handoff_5h = 97
+
+# Codex: its cache lasts a day, so no 5-hour start rules. At handoff_5h a worker hands off and
+# continues in a fresh session on another account.
+[codex.plus]
+capacity = 4            # weights below; e.g. 4 medium, or 2 high, or 1 high + 2 medium
+weights = { "gpt-6.2-sol:medium" = 1, "gpt-6.2-sol:high" = 2, "gpt-6.2-sol:xhigh" = 2, "gpt-6.2-astra:medium" = 2, "gpt-6.2-astra:high" = 2 }
+handoff_5h = 95
+
+[codex.prolite]         # no 5-hour limit, no session cap
+weekly_handoff = 97     # at 97% weekly: every working session hands off to another account,
+weekly_single_sol = true  # then only one gpt-6.2-sol worker (any effort) runs here at a time
+
+# Weekly use narrows what runs on an account (Claude and Codex plus); only a window at 100%
+# blocks it, until that window resets. An account never read is skipped.
+[weekly]
+one_ticket = 90         # one ticket at a time: its coder and reviewer
+claude_sonnet_only = 97
+codex_sol_medium_only = 97

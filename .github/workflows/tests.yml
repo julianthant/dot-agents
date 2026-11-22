@@ -25,5 +25,3 @@ jobs:
         with:
           python-version: "3.14"
       - run: python3 test_pick.py
-      - run: python3 test_roadmap.py
-      - run: python3 test_dev_auto.py

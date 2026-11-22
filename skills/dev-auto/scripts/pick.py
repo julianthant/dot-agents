@@ -20,7 +20,7 @@ import time
 import tomllib
 from pathlib import Path
 
-import dev_auto as da
+import account_usage
 
 HERE = Path(__file__).resolve().parent
 LIMITS = HERE.parent / "limits.toml"
@@ -31,7 +31,7 @@ def live_handles(host):
     args = ["orca", "terminal", "list", "--json"]
     if host != "local":
         args += ["--environment", host]
-    out = subprocess.run(args, capture_output=True, text=True, timeout=30)
+    out = subprocess.run(args, check=False, capture_output=True, text=True, timeout=30)
     if out.returncode != 0:
         raise SystemExit(f"orca terminal list failed on {host}: {out.stderr.strip()}")
     return {t["handle"] for t in json.loads(out.stdout)["result"]["terminals"]}
@@ -49,7 +49,7 @@ def live_holds(host):
 def windows(cfg, row, now):
     """(five_hour %, weekly %) from the newest reading of any age, Orca's or the CLI file's; a
     window whose reset has passed reads 0. (None, None) when the account was never read."""
-    found = [r for r in (da.orca_usage(now).get(da.orca_key(row, now)), da.file_usage(row)) if r]
+    found = [r for r in (account_usage.orca_usage(now).get(account_usage.orca_key(row, now)), account_usage.file_usage(row)) if r]
     if not found:
         return None, None
     _at, read = max(found, key=lambda r: float(r[0]))
@@ -58,7 +58,7 @@ def windows(cfg, row, now):
 
 
 def claude_reason(plan, model, held, five, week):
-    want = "sonnet" if da.family(model) == "sonnet" else "opus"  # Fable counts as Opus
+    want = "sonnet" if account_usage.family(model) == "sonnet" else "opus"  # Fable counts as Opus
     if five >= plan["handoff_5h"]:
         return f"5-hour {five:.0f}% at handoff {plan['handoff_5h']}%"
     reduced = five > plan["reduced_above_5h"]
@@ -73,7 +73,7 @@ def claude_reason(plan, model, held, five, week):
         return f"weekly {week:.0f}%: Sonnet only"
     if week >= LIM["weekly"]["one_ticket"]:
         total = min(total, 2)
-    count = sum((da.family(m) == "sonnet") == (want == "sonnet") for m in held)
+    count = sum((account_usage.family(m) == "sonnet") == (want == "sonnet") for m in held)
     cap = sonnet if want == "sonnet" else opus
     if len(held) >= total:
         return f"{len(held)} of {total} sessions"
@@ -84,9 +84,8 @@ def claude_reason(plan, model, held, five, week):
 
 def codex_reason(plan_name, plan, route, held, five, week):
     if plan_name == "prolite":
-        if week >= plan["weekly_handoff"]:
-            if not route.startswith("gpt-6.2-sol:") or held:
-                return f"weekly {week:.0f}%: one gpt-6.2-sol worker only"
+        if week >= plan["weekly_handoff"] and (not route.startswith("gpt-6.2-sol:") or held):
+            return f"weekly {week:.0f}%: one gpt-6.2-sol worker only"
         return None
     weights = plan["weights"]
     if route not in weights:
@@ -182,7 +181,7 @@ def main(argv=None):
     p.add_argument("--terminal")
     p.add_argument("--account")
     args = p.parse_args(argv)
-    cfg = da.load_config()
+    cfg = account_usage.load_config()
     if args.command == "due":
         found = due(cfg, args.host, time.time())
         for label, handle, why in found:

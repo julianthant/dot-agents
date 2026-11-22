@@ -7,3 +7,4 @@ node_modules/
 .concord/
 skills/dev-auto/accounts.toml
 skills/dev-auto/accounts.toml.bak*
+skills/dev-auto/holds.json

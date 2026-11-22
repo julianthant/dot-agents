@@ -87,3 +87,10 @@ with patch.object(pick, "windows", return_value=(100, 10)), patch.object(pick, "
 with patch.object(pick, "windows", return_value=(100, 10)), patch.object(pick, "pick", return_value=(None, [])):
     assert pick.coordinator(cfg, "local", 0, "a") is None
 assert pick.past_handoff(row, 10, 100).startswith("limit reached")
+
+# Fill: ready = open leaf Task, no open blocker, nobody on it, not parked.
+mk = lambda **k: {"open": True, "kids": 0, "type": "Task", "blockers": [], "later": False, "ms": "Staging cut", "status": "Todo", "agent": None, **k}
+data = {"issues": [mk(n=1), mk(n=2, blockers=[1]), mk(n=3, agent="Coding"), mk(n=4, later=True), mk(n=5, kids=3), mk(n=6, open=False)]}
+assert [i["n"] for i in pick.ready_tickets(data)] == [1]
+with patch.object(pick, "pick", return_value=(None, [])):
+    assert pick.fill({}, "local", 0, data)[1] is False

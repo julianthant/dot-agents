@@ -161,6 +161,23 @@ def coordinator(cfg, host, now, active):
     return new if new is not None and new["id"] != active else None
 
 
+ROADMAP = Path.home() / ".orca/bots/subaru-2/roadmap/data.json"
+
+
+def ready_tickets(data):
+    """Open Tasks with no open blocker that no agent works on and nobody parked for later."""
+    return [i for i in data["issues"] if i["open"] and i["kids"] == 0 and i.get("type") != "Feature"
+            and not i["blockers"] and not i["later"] and i.get("ms") != "Later"
+            and i.get("status") != "In Progress" and not i.get("agent")]
+
+
+def fill(cfg, host, now, data):
+    """Ready tickets and whether any Claude Sonnet or Codex Sol seat is free to take one."""
+    ready = ready_tickets(data)
+    seat = any(pick(cfg, a, m, "medium", host, now)[0] for a, m in (("claude", "claude-sonnet-5-5"), ("codex", "gpt-6.2-sol")))
+    return ready, seat
+
+
 def due(cfg, host, now):
     """Live holds whose account is past its handoff point, as (label, terminal, why)."""
     holds = json.loads(HOLDS.read_text()) if HOLDS.exists() else {}
@@ -193,7 +210,7 @@ LIM = tomllib.loads(LIMITS.read_text())
 
 def main(argv=None):
     p = argparse.ArgumentParser()
-    p.add_argument("command", choices=["pick", "hold", "due", "coordinator"])
+    p.add_argument("command", choices=["pick", "hold", "due", "coordinator", "fill"])
     p.add_argument("--agent", choices=["claude", "codex"])
     p.add_argument("--model")
     p.add_argument("--effort", default="medium")
@@ -207,6 +224,11 @@ def main(argv=None):
         for label, handle, why in found:
             print(f"{label} {handle} {why}")
         return 0 if found else 1
+    if args.command == "fill":
+        ready, seat = fill(cfg, args.host, time.time(), json.loads(ROADMAP.read_text()))
+        if ready and seat:
+            print(f"{len(ready)} ready tickets and a free seat: " + ", ".join(f"#{i['n']}" for i in ready[:10]))
+        return 0 if ready and seat else 1
     if args.command == "coordinator":
         out = subprocess.run(["orca", "account", "list", "--json"], capture_output=True, text=True, check=True).stdout
         active = json.loads(out)["result"]["codex"]["activeAccountId"]

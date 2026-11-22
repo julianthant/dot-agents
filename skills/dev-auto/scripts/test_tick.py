@@ -581,4 +581,37 @@ for interrupted in ("clean", "committed", "untracked", "preexisting"):
         if interrupted == "untracked":
             check.assertEqual((checkout / "notes").read_text(), "keep my working copy")
 
+# Legacy titles provide a branch when the body omits it; explicit branches win.
+empty = {"nodes": [], "totalCount": 0}
+def issue_row(number, title, body=""):
+    return dict(number=number, title=title, body=body, issueType={"name": "Task"}, milestone=None,
+                projectItems=empty, assignees=empty, subIssues=empty, closedByPullRequestsReferences=empty,
+                labels=empty, blockedBy=empty, blocking=empty)
+
+rows = [issue_row(473, "dashboard-frontend-speed / clock-tick-in-leaves: render labels"),
+        issue_row(497, "driver-reads / CRM SSO route recovery: recover sign-in"),
+        issue_row(506, "tests-reliability / timing-guesses: condition waits", "Branch: task/tests/explicit")]
+with patch.object(tick, "command", return_value=json.dumps([{"data": {"repository": {"issues": {"nodes": rows}}}}])):
+    parsed = tick.tickets()
+check.assertEqual([row["branch"] for row in parsed], ["task/dashboard-frontend-speed/clock-tick-in-leaves",
+                  "task/driver-reads/crm-sso-route-recovery", "task/tests/explicit"])
+
+# Orca identifies agent terminals separately from plain shells and links recovery worktrees to issues.
+items = [dict(base, number=row["number"], branch=row["branch"], paths=[str(row["number"])]) for row in parsed]
+items.append(dict(base, number=484, branch="task/speed/read", paths=["disjoint"]))
+trees = [{"id": "agent", "branch": "refs/heads/" + items[0]["branch"]},
+         {"id": "recovery", "branch": "refs/heads/task/driver-reads/crm-sso-recovery", "linkedIssue": 497},
+         {"id": "shell", "branch": "refs/heads/" + items[2]["branch"]},
+         {"id": "other", "branch": "refs/heads/task/closed/lane"}]
+terms = [{"worktreeId": t["id"], "handle": t["id"], **({"agentIdentity": "codex"} if t["id"] != "shell" else {})}
+         for t in trees]
+with patch.object(tick, "runtime", side_effect=[{"worktrees": trees, "truncated": False},
+                                               {"terminals": terms, "truncated": False}]), redirect_stdout(io.StringIO()) as out:
+    tick.inventory(Path("/fixture"), items, "hr-relay")
+    plan = list(tick.fill_plan(items, lambda *_: (account, []), 484))
+check.assertEqual([(t.get("occupied", False), t["busy"]) for t in items],
+                  [(True, True), (True, True), (True, False), (False, False)])
+check.assertIn("task/closed/lane", out.getvalue())
+check.assertEqual([t["number"] for t, _ in plan], [484])
+
 print("ok")

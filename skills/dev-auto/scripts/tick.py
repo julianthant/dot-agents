@@ -420,9 +420,11 @@ def tickets():
             branch_section = section(body, "Branch")
             m = re.search(r"\btask/([\w-]+)/([\w-]+)", branch_section)
             branch = m[0] if m else None
-            slug = re.match(r"^([\w-]+) / ([\w-]+)(?:\s*:|$)", i["title"])
-            if not branch and slug:
-                branch = f"task/{slug[1]}/{slug[2]}"
+            if not branch:
+                slug = re.fullmatch(r"([\w-]+)\s*/\s*([\w-]+(?:[ \t]+[\w-]+)*)(?:\s*:.*)?", i["title"].strip())
+                if slug:
+                    lane = "-".join(slug[2].lower().split())
+                    branch = f"task/{slug[1].lower()}/{lane}"
             dot = "dot-agents" in branch_section
             card = card or {}
             stage = (card.get("stage") or {}).get("name")
@@ -545,17 +547,21 @@ def inventory(repo_path, issues, repo):
     terms = runtime("terminal", "list", "--limit", "10000")
     if trees["truncated"] or terms["truncated"]:
         raise OrcaError("incomplete Orca inventory")
-    live = {term["worktreeId"] for term in terms["terminals"]}
-    by_branch = {t["branch"]: t for t in issues if t["repo"] == repo and t["branch"]}
+    agents = {term["worktreeId"] for term in terms["terminals"] if term.get("agentIdentity")}
+    repo_issues = [t for t in issues if t["repo"] == repo]
     for tree in trees["worktrees"]:
         branch = (tree["branch"] or "").removeprefix("refs/heads/")
-        if branch in by_branch:
-            # Existing task branches may contain user work; only live ones own other paths.
-            by_branch[branch]["occupied"] = True
-            if tree["id"] in live:
-                by_branch[branch]["busy"] = True
-        elif branch and branch.startswith("task/") and tree["id"] in live:
-            raise OrcaError(f"live {branch} has no matching open issue with owned paths")
+        if not branch.startswith("task/"):
+            continue
+        # Only hr-relay worktrees link directly to the scheduling repository's issue numbers.
+        linked = tree.get("linkedIssue") if repo == "hr-relay" else None
+        matches = [t for t in repo_issues if t["branch"] == branch or t["number"] == linked]
+        for t in matches:
+            t["occupied"] = True
+            if tree["id"] in agents:
+                t["busy"] = True
+        if not matches and tree["id"] in agents:
+            log("skip", {"branch": branch, "reason": "live worktree has no matching open issue with owned paths"})
     return {t["handle"] for t in terms["terminals"]}
 
 

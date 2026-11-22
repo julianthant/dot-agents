@@ -2,8 +2,7 @@
 """Deny a Bash command that already failed 3 times in a row.
 
 PostToolUseFailure records a failure, PostToolUse (success) clears the streak,
-PreToolUse denies the identical command after 3 failures. Worker sessions only
-(CONCORD_AGENT_ID set).
+PreToolUse denies the identical command after 3 failures. Orca workers only.
 """
 
 import json
@@ -12,11 +11,13 @@ import sys
 import tempfile
 from pathlib import Path
 
-REASON = "This command failed 3 times. Record the blocker on your ticket and try a different approach."
+from orca_worker import is_worker
+
+REASON = "This command failed 3 times. Record the blocker in your worker report and try a different approach."
 
 
 def main():
-    if not os.environ.get("CONCORD_AGENT_ID"):
+    if not os.environ.get("ORCA_TERMINAL_HANDLE"):
         return
     d = json.load(sys.stdin)
     if d.get("tool_name") != "Bash":
@@ -26,11 +27,15 @@ def main():
         Path(os.environ.get("TMPDIR") or tempfile.gettempdir())
         / f"repeat-failure-{d['session_id']}.json"
     )
+    event = d.get("hook_event_name")
+    if event != "PostToolUseFailure" and not state.exists():
+        return
+    if not is_worker():
+        return
     try:
         s = json.loads(state.read_text())
     except (OSError, ValueError):
         s = {"cmd": None, "n": 0}
-    event = d.get("hook_event_name")
     if event == "PreToolUse":
         if s["cmd"] == cmd and s["n"] >= 3:
             out = {
@@ -45,7 +50,8 @@ def main():
     if event == "PostToolUseFailure":
         s = {"cmd": cmd, "n": s["n"] + 1 if s["cmd"] == cmd else 1}
     elif event == "PostToolUse":
-        s = {"cmd": None, "n": 0}
+        state.unlink(missing_ok=True)
+        return
     else:
         return
     state.write_text(json.dumps(s))

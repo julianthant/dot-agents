@@ -7,6 +7,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from orca_worker import is_worker
+
 
 def context_tokens(path):
     latest = 0
@@ -36,7 +38,7 @@ def context_tokens(path):
 
 
 def main():
-    if not os.environ.get("CONCORD_AGENT_ID"):
+    if not os.environ.get("ORCA_TERMINAL_HANDLE"):
         return
     d = json.load(sys.stdin)
     limit = int(os.environ.get("HANDOFF_AT_TOKENS", "300000"))
@@ -46,10 +48,15 @@ def main():
     )
     if marker.exists() or context_tokens(d.get("transcript_path", "")) < limit:
         return
-    marker.touch()
+    if not is_worker():
+        return
+    try:
+        marker.touch(exist_ok=False)
+    except FileExistsError:
+        return
     msg = (
-        "Context limit reached. Finish your current step, write the handoff to your ticket, then stop. "
-        "Do not start new work."
+        "Context limit reached. Finish your current step, run /handoff, "
+        "report the handoff path with worker_done, then stop."
     )
     out = {
         "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": msg}

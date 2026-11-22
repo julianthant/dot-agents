@@ -34,7 +34,7 @@ handoff_5h = 97
 # continues in a fresh session on another account.
 [codex.plus]
 capacity = 4            # weights below; e.g. 4 medium, or 2 high, or 1 high + 2 medium
-weights = { "gpt-6.2-sol:medium" = 1, "gpt-6.2-sol:high" = 2, "gpt-6.2-sol:xhigh" = 2, "gpt-6.2-astra:high" = 2 }
+weights = { "gpt-6.2-sol:medium" = 1, "gpt-6.2-sol:high" = 2, "gpt-6.2-sol:xhigh" = 2, "gpt-6.2-astra:medium" = 2, "gpt-6.2-astra:high" = 2 }
 handoff_5h = 95
 
 [codex.prolite]         # no 5-hour limit, no session cap

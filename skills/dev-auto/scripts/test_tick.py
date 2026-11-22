@@ -1270,6 +1270,66 @@ with TemporaryDirectory() as tmp:
         f.tick(10)
     assert f.sent() == []
 
+# Only a limit dialog showing now counts: the same menu above newer healthy output is history.
+CODEX_HEALTHY = ["• Kept the current model; running the tests.", "› Ask Codex to do anything",
+                 "  gpt-6.2-astra medium · ~/work/repo"]
+assert tick.screen_limit([*CODEX_AT_LIMIT, *CODEX_HEALTHY], {"agent": "codex", "model": "gpt-6.2-astra"}) is None
+assert tick.screen_limit([*CODEX_AT_LIMIT[3:], ""], {"agent": "codex", "model": "gpt-6.2-astra"}) == "Approaching rate limits"
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=[*CODEX_AT_LIMIT, *CODEX_HEALTHY])
+    calls = f.tick()
+    assert ("orchestration", "worker-stop") not in calls and f.cards == [] and f.sent() == []
+
+# A limit restart parked for a seat rechecks the live screen: a recovered worker is not stopped and gets its card back.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    f.seats = ["jzaw"]
+    f.tick()
+    assert f.cards == [("Handed off", f.ticket["agent"])]
+    f.seats, f.screen = ["jzaw", "x2"], CODEX_HEALTHY
+    calls = f.tick(5)
+    assert ("orchestration", "worker-stop") not in calls and ("orchestration", "worker-start") not in calls
+    assert f.cards[-1][0] == "Coding" and "recovered" in f.lines[0]
+    f.screen = CODEX_AT_LIMIT  # a later limit is handled afresh
+    calls = f.tick(5)
+    assert calls.index(("orchestration", "worker-stop")) < calls.index(("orchestration", "worker-start"))
+
+# A cleared prompt gives the card back, so review_tick's discovery reads the coder's successful report.
+def discovered(ticket):
+    found = []
+    def orca(*args):
+        if args[1] == "inbox":
+            return {"messages": [report("ctx_coder", "green at " + sha)]}
+        if args[1] == "task-list":
+            return {"tasks": [{"id": "task_coder", "title": "#553 coder"}]}
+        if args[1] == "dispatch-show":
+            return {"dispatch": {"id": "ctx_coder"}}
+        if args[1] == "worker-show":
+            return {"dispatch": {"id": "ctx_coder", "runId": "run", "taskId": "task_coder", "assigneeHandle": "term_coder"},
+                    "worker": {"worktreeId": "repo::/wt", "startOptions": {"launch": {"effective": {"model": "gpt-6.2-astra"}}}}}
+        if args[:2] == ("worktree", "show"):
+            return {"worktree": {"id": "repo::/wt", "path": "/wt", "branch": "refs/heads/task/dev-auto/watch-workers"}}
+        raise AssertionError(args)
+    with patch.object(tick, "supervisor", return_value=([], "run")), patch.object(tick, "runtime", orca), \
+            patch.object(tick, "tickets", return_value=[ticket]), \
+            patch.object(tick, "command", return_value="https://github.com/julianthant/dot-agents.git"), \
+            patch.object(tick, "review_step", lambda *a: found.append(a[3]["number"])):
+        tick.review_tick(SimpleNamespace(issue=None, coder=None), sqlite3.connect(":memory:"))
+    return found
+
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.ticket.update(branch="task/dev-auto/watch-workers", repo="dot-agents")
+    f.wait = {"kind": "permission", "approvalId": "appr_1"}
+    f.tick()
+    assert f.ticket["stage"] == "Needs you" and discovered(f.ticket) == []
+    f.wait = None
+    f.tick(1)
+    assert f.cards[-1] == ("Coding", f.ticket["agent"]) and "prompt cleared" in f.lines[0]
+    assert discovered(f.ticket) == [553]
+    f.tick(1)
+    assert len(f.cards) == 2  # restored once
+
 # A permission prompt is forwarded to the Run once and the card goes to Needs you; nothing is typed or approved.
 with TemporaryDirectory() as tmp:
     f = Fleet(tmp, screen=CLAUDE_WORKING)

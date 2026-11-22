@@ -1679,7 +1679,11 @@ def screen_limit(tail, launch):
         return hit
     menu = codex_prompt(tail)
     if menu and not menu.lower().lstrip().startswith("hooks need review"):
-        return menu.splitlines()[0].strip()
+        lines = menu.splitlines()
+        below = tail[max(i for i, line in enumerate(tail) if line == lines[0]) + len(lines):]
+        # A menu counts only while it is showing: newer output or the input prompt below it makes it history.
+        if not any(line.lstrip().startswith(OUTPUT) or re.match(r"^\s*[›❯>](?!\s*\d+[.)] )", line) for line in below):
+            return lines[0].strip()
     if launch.get("agent") == "codex":
         status = next((m for line in reversed(tail[-6:]) if (m := CODEX_STATUS.match(line))), None)
         if status and status[1].lower() != (launch.get("model") or "").lower():
@@ -1867,8 +1871,10 @@ def watch_pass(args, db, actions, errors):
             stopped = (show.get("worker") or {}).get("state") == "stopped"
             exited = (show["projection"]["liveness"]["verdict"] == "exited"
                       or (show.get("observation") or {}).get("status") == "exited")
-            if state.get("pending"):
-                restart(w, show, state, state["pending"]["why"], state["pending"].get("crash", False))
+            pending = state.get("pending")
+            # A limit restart waiting for a seat stops the worker only if the limit is still on screen.
+            if pending and not (live and pending["why"].startswith("usage limit") and not pending.get("starting")):
+                restart(w, show, state, pending["why"], pending.get("crash", False))
                 continue
             if not live:
                 if state.get("handoff") and reported:
@@ -1895,6 +1901,20 @@ def watch_pass(args, db, actions, errors):
             hooks = codex_prompt(tail)
             prompt = wait or (hooks if hooks and hooks.lower().lstrip().startswith("hooks need review") else None)
             hit = screen_limit(tail, launch)
+            if pending and not hit:
+                stage(ticket, phase(ticket, state, title))
+                for key in ("pending", "previous_stage"):
+                    state.pop(key, None)
+                save(terminal, state)
+                actions.append({"issue": number, "dispatch": dispatch, "recovered": pending["why"]})
+            if not prompt and state.get("prompt"):
+                # The prompt was answered: give the card back so review_tick reads the coder's report.
+                if ticket and ticket["stage"] == "Needs you":
+                    stage(ticket, state.get("prompt_stage") or phase(ticket, state, title))
+                for key in ("prompt", "prompt_stage"):
+                    state.pop(key, None)
+                save(terminal, state)
+                actions.append({"issue": number, "dispatch": dispatch, "prompt cleared": True})
             if hit:
                 actions.append({"issue": number, "dispatch": dispatch, "limit": hit})
                 restart(w, show, state, f"usage limit ({hit})", False)
@@ -1902,6 +1922,7 @@ def watch_pass(args, db, actions, errors):
                 key = json.dumps(prompt, ensure_ascii=False, sort_keys=True)
                 if state.get("prompt") != key:
                     escalate(number, "permission prompt", f"Dispatch {dispatch} is waiting on: {key}")
+                    state.setdefault("prompt_stage", phase(ticket, state, title))
                     stage(ticket, "Needs you")
                     state["prompt"] = key
                     save(terminal, state)

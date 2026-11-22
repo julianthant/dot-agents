@@ -1,14 +1,15 @@
 # Headless Orca supervisor
 
-Proven on Orca 1.4.269 by `scripts/tick.py prove --repo id:<repo-id>`, run with every `ORCA_*`
-pane variable stripped, as launchd runs it. Every command below takes `--json`.
+Proven on Orca 1.4.269 by `scripts/tick.py start --repo id:<repo-id> --state <file>`, then
+`scripts/tick.py resume --state <file>` in a new process, each with every `ORCA_*` pane variable
+stripped, as launchd runs it. Every command below takes `--json`.
 
 ## Identity and mail
 
 Coordinator verbs (`run-create`, `run-use`, `worker-start`, `reply`, `send`, `deny`) refuse a
 caller with no Orca pane (`no_active_sender_terminal`), and refuse a made-up `--from` such as
-`script:x` or `bot:<name>` (`stable_pane_required`, seen on `run-current`). So the script opens its own plain shell pane,
-the anchor, and passes that handle as `--from` on every call:
+`script:x` or `bot:<name>` (`stable_pane_required`, seen on `run-current`). So the script opens
+its own plain shell pane, the anchor, and passes that handle as `--from` on every call:
 
 ```sh
 orca worktree create --repo id:<repo-id> --name <scratch> --base-branch origin/main --setup skip --no-parent
@@ -22,11 +23,22 @@ unread batch and marks it handled; `--wait --timeout-ms <n>` blocks for it; `--p
 without consuming. `orca orchestration inbox --terminal run:<run_id> --limit <n> --full` shows
 the history, handled mail included.
 
-After a restart, keep the run id (store it), open a new anchor and rebind:
-`orca orchestration run-use --id <run_id> --from <new-anchor>`. Proven: the anchor was closed
-while the worker answered; the new anchor's `check --peek` already held that `worker_done`, a
-consuming `check` returned it once and a second `check` returned nothing. A response lost in
-transit is replayed with the `--retry-request <id>` the command printed.
+## Recovery
+
+Each result below was proven separately; do not read one as another.
+
+- **Process recovery (proven).** `start` stores the Run id, worktree and Dispatch in its state
+  file, closes its anchor and exits after answering the worker's ask. With no supervisor process
+  alive for 60 seconds, `resume`, a new Python process, checks that the old pid is gone and then
+  works from the state file alone. It opens a new anchor, runs
+  `orca orchestration run-use --id <run_id> --from <new-anchor>`, and finds that the worker's
+  `worker_done` is already in `check --peek`. A consuming `check` returns it once, with the
+  stored Dispatch id, and `resume` then finishes the lifecycle.
+- **Anchor rebind (proven).** A closed anchor loses no mail: it lives in `run:<run_id>`, and
+  `run-use` binds the Run to any new pane.
+- **Lost response.** A `check` response lost in transit is replayed with the `--retry-request <id>`
+  the command printed. This comes from Orca's help and was not exercised.
+- **Orca app restart (not verified).** See below.
 
 ## Workers and messages
 
@@ -38,7 +50,13 @@ transit is replayed with the `--retry-request <id>` the command printed.
 | Done | worker sends `worker_done` | `type: worker_done`, `payload.outcome` |
 | Follow-up | `send --from <anchor> --run <run> --to dispatch:<id> --subject <s> --body <b>` | receipt `delivery: follow_up` with a **new** `dispatchId`; use it from then on |
 | Release | `worker-release --dispatch <newest id>` | `released`, `closed_agent_terminal`; older ids in the chain report `retained` / `ownership_transferred` |
-| Cleanup | `terminal close --terminal <anchor>`, `worktree rm --worktree path:<wt> --force --delete-branch` | `removed: true` |
+| Cleanup | `terminal close --terminal <anchor>`, then `worktree rm --worktree path:<wt> --force --delete-branch` | `removed: true` |
+
+`tick.py` removes the checkout and branch only after `worker-release` reports `released` or
+`already_released`, or when no `worker-start` was attempted. If the release reports anything
+else (`retained`, `release_pending`, `release_unknown`, an error), or a start returned no
+Dispatch, or the anchor won't close, the scratch worktree stays, the reasons go to stderr and
+the exit status is 1. A proof step that fails re-raises its own error after cleanup.
 
 `worker_done` also schedules release about two minutes later (`autoReleaseAt`); `send` reopens a
 released worker. `worker-stop` fences one that must be cancelled.
@@ -65,11 +83,13 @@ completed and `lastOutputAt` is over 30 minutes old.
 
 - **No pane-less identity.** The script needs its anchor pane; a closed anchor loses nothing but
   needs `run-use` from a new one.
-- **Live permission prompts were not exercised.** Workers launch under the person's own Orca
+- **Live permission prompts were not verified.** Workers launch under the person's own Orca
   setting for new agent tabs, which here is bypass permissions, and no flag overrides it. The
-  proof ran an inert `touch` with no prompt, and showed only the guards: `deny` on a settled
-  Dispatch returns `dispatch_inactive`, and `approve` returns `approval_requires_person`.
-- **An Orca app restart was not exercised;** only the script's process and pane restarted. Per
+  proof's inert `touch` raised no prompt. Only the guards were simulated, with a made-up approval
+  id: `deny` on a settled Dispatch returns `dispatch_inactive`, and `approve` returns
+  `approval_requires_person`.
+- **An Orca app restart was not verified;** only the script's process and its anchor pane
+  restarted. Per
   Orca's orchestration guide, `runtime_unavailable` while Orca restarts is retried after a few
   seconds, and `orca open` (which brings the window forward) is only for an app that
   `orca status --json` reports as not running, so a launchd tick skips rather than opens it.

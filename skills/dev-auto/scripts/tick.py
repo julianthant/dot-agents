@@ -548,7 +548,7 @@ def inventory(repo_path, issues, repo):
     live = {term["worktreeId"] for term in terms["terminals"]}
     by_branch = {t["branch"]: t for t in issues if t["repo"] == repo and t["branch"]}
     for tree in trees["worktrees"]:
-        branch = tree["branch"]
+        branch = (tree["branch"] or "").removeprefix("refs/heads/")
         if branch in by_branch:
             # Existing task branches may contain user work; only live ones own other paths.
             by_branch[branch]["occupied"] = True
@@ -726,8 +726,61 @@ def configure_codex_notice(path):
             if config.exists():
                 os.fchmod(f.fileno(), config.stat().st_mode & 0o777)
         os.replace(f.name, config)
-        return
+        return content
     log("Codex notice", "preserved existing config layout; forward any model-switch prompt")
+
+
+def worker_settings(path, route):
+    if route[0] == "codex":
+        settings = path / ".codex/config.toml"
+    elif route[3]:
+        settings = path / ".claude/settings.local.json"
+    else:
+        return None
+    if settings.parent.is_symlink() or settings.is_symlink():
+        raise OrcaError("worker setting points outside the worktree")
+    before = settings.read_bytes() if settings.exists() else None
+    if route[0] == "codex":
+        written = configure_codex_notice(path)
+        if written is None:
+            return None
+    else:
+        config = json.loads(before) if before is not None else {}
+        config["advisorModel"] = route[3]
+        written = json.dumps(config) + "\n"
+        settings.parent.mkdir(exist_ok=True)
+        settings.write_text(written)
+    return settings, before, written.encode()
+
+
+def remove_prelaunch_tree(repo, wt, existing_refs, settings_change):
+    path = Path(wt["path"]).resolve()
+    ref = "refs/heads/" + wt["branch"].removeprefix("refs/heads/")
+    sha = wt.get("head")
+    if not sha or ref in existing_refs or wt.get("isMainWorktree") or path == repo.resolve():
+        raise OrcaError("unverified worktree ownership")
+    trees = command("git", "-C", str(repo), "worktree", "list", "--porcelain", "-z").split("\0\0")
+    expected = ["worktree " + str(path), "HEAD " + sha, "branch " + ref]
+    if not any(tree.split("\0")[:3] == expected for tree in trees[1:]):
+        raise OrcaError("checkout moved or has a different commit")
+    if settings_change:
+        settings, before, written = settings_change
+        if settings.parent.is_symlink() or settings.is_symlink() or settings.read_bytes() != written:
+            raise OrcaError("worker settings changed since preparation")
+        if before is None:
+            settings.unlink()
+        else:
+            settings.write_bytes(before)
+    if command("git", "-C", str(path), "status", "--porcelain", "--untracked-files=all", "--ignored"):
+        raise OrcaError("worktree contains local changes")
+    removed = runtime("worktree", "rm", "--worktree", "id:" + wt["id"])
+    if not removed.get("removed") or path.exists():
+        raise OrcaError("worktree removal not confirmed")
+    left = command("git", "-C", str(repo), "for-each-ref", "--format=%(objectname) %(worktreepath)", ref)
+    if left:
+        if left.rstrip("\n") != sha + " ":
+            raise OrcaError("branch moved or is checked out elsewhere")
+        command("git", "-C", str(repo), "update-ref", "-d", ref, sha)
 
 
 def launch(db, repo_path, t, acct, args, holds_path):
@@ -739,34 +792,35 @@ def launch(db, repo_path, t, acct, args, holds_path):
             "SELECT 1 FROM starts WHERE issue=?", (number,)).fetchone():
         raise OrcaError(f"issue #{number} already reserved")
     branch = t["branch"]
+    existing_refs = set(command("git", "-C", str(repo_path), "for-each-ref", "--format=%(refname)", "refs/heads").splitlines())
     wt = runtime("worktree", "create", "--repo", "path:" + str(repo_path), "--name", branch[5:].replace("/", "."),
                  "--branch", branch, "--base-branch", t["base"], "--no-parent", "--setup", "skip")["worktree"]
     path = Path(wt["path"])
-    if wt["branch"] != branch or command("git", "-C", str(path), "branch", "--show-current").strip() != branch:
-        raise OrcaError("created worktree does not own the requested branch")
-    if command("git", "-C", str(path), "rev-parse", "HEAD").strip() != t["sha"]:
-        raise OrcaError("created worktree has a different base commit")
-    if route[0] == "codex":
-        configure_codex_notice(path)
-    if route[3]:
-        settings = path / ".claude/settings.local.json"
-        if settings.parent.is_symlink() or settings.is_symlink():
-            raise OrcaError("advisor setting points outside the worktree")
-        settings.parent.mkdir(exist_ok=True)
-        config = json.loads(settings.read_text()) if settings.exists() else {}
-        config["advisorModel"] = route[3]
-        settings.write_text(json.dumps(config) + "\n")
-    runtime("account", "select", "--agent", route[0], "--account", acct["id"])
-    task = runtime("orchestration", "task-create", *actor, "--task-title", f"#{number} coder",
-                   "--spec", spec, "--full")["task"]["id"]
-    selected = runtime("account", "list")[route[0]]["activeAccountId"]
-    if selected != acct["id"]:
-        raise OrcaError(f"selected account changed before worker start; inspect prepared Task {task} and worktree {path}")
-    rec = dict(task=task, run=run, worktree=wt["id"], account=acct["id"], label=acct["label"],
-               route=route, project=project, item=t["item"], fields=fields, time=int(time.time()),
-               holds=str(holds_path), waiting_field=waiting_field)
-    # The fill lock covers preparation. A durable Task identity precedes the only start call.
-    reserve(db, number, rec)
+    settings_change = None
+    try:
+        actual_branch = command("git", "-C", str(path), "branch", "--show-current").strip()
+        if wt["branch"].removeprefix("refs/heads/") != branch or actual_branch != branch:
+            raise OrcaError("created worktree does not own the requested branch")
+        if command("git", "-C", str(path), "rev-parse", "HEAD").strip() != t["sha"]:
+            raise OrcaError("created worktree has a different base commit")
+        settings_change = worker_settings(path, route)
+        runtime("account", "select", "--agent", route[0], "--account", acct["id"])
+        task = runtime("orchestration", "task-create", *actor, "--task-title", f"#{number} coder",
+                       "--spec", spec, "--full")["task"]["id"]
+        selected = runtime("account", "list")[route[0]]["activeAccountId"]
+        if selected != acct["id"]:
+            raise OrcaError(f"selected account changed before worker start; inspect prepared Task {task}")
+        rec = dict(task=task, run=run, worktree=wt["id"], account=acct["id"], label=acct["label"],
+                   route=route, project=project, item=t["item"], fields=fields, time=int(time.time()),
+                   holds=str(holds_path), waiting_field=waiting_field)
+        # The fill lock covers preparation. A durable Task identity precedes the only start call.
+        reserve(db, number, rec)
+    except Exception:
+        try:
+            remove_prelaunch_tree(repo_path, wt, existing_refs, settings_change)
+        except (OSError, OrcaError, subprocess.TimeoutExpired) as cleanup_error:
+            log("prelaunch cleanup", {"issue": number, "worktree": wt["path"], "reason": str(cleanup_error)})
+        raise
     try:
         started = runtime("orchestration", "worker-start", *actor, "--task", task, "--worktree", "path:" + str(path),
                           "--agent", route[0], "--model", route[1], "--effort", route[2], "--keep-open", "--full")

@@ -276,7 +276,7 @@ with TemporaryDirectory() as tmp, sqlite3.connect(":memory:") as db:
         if verb == ("orchestration", "run-current"):
             return {"runId": "fixture"}
         if verb == ("worktree", "create"):
-            return {"worktree": {"path": str(root), "branch": ticket["branch"], "id": "wt"}}
+            return {"worktree": {"path": str(root), "branch": "refs/heads/" + ticket["branch"], "head": "sha", "id": "wt"}}
         if verb == ("account", "select"):
             return {}
         if verb == ("account", "list"):
@@ -530,5 +530,55 @@ with patch.object(tick, "command", side_effect=[json.dumps({"id": "project"}), j
                                                            {"name": "Needs you", "id": "waiting"}]},
         {"name": "Agent", "id": "agent"}]})]):
     check.assertEqual(tick.project_fields()[2], ("stage", "waiting"))
+
+# Git owns the fixture worktree and refs; only the Orca transport is simulated.
+for interrupted in ("clean", "committed", "untracked", "preexisting"):
+    with TemporaryDirectory() as tmp, sqlite3.connect(":memory:") as db:
+        repo = Path(tmp) / "repo"
+        checkout = Path(tmp) / "worker"
+        def git_at(path, *argv):
+            return subprocess.run(["git", "-C", str(path), *argv], check=True, capture_output=True, text=True).stdout.strip()
+        repo.mkdir()
+        git_at(repo, "init", "-b", "main")
+        git_at(repo, "config", "user.name", "Fixture")
+        git_at(repo, "config", "user.email", "fixture@example.invalid")
+        git_at(repo, "commit", "--allow-empty", "-m", "base")
+        base_sha = git_at(repo, "rev-parse", "HEAD")
+        test_ticket = dict(ticket, base="main", sha=base_sha, route=base["route"])
+        branch = test_ticket["branch"]
+        if interrupted == "preexisting":
+            git_at(repo, "branch", branch, base_sha)
+        def worktree_runtime(*argv):
+            verb = argv[:2]
+            if verb == ("worktree", "create"):
+                if interrupted == "preexisting":
+                    git_at(repo, "worktree", "add", str(checkout), branch)
+                else:
+                    git_at(repo, "worktree", "add", "-b", branch, str(checkout), base_sha)
+                return {"worktree": {"id": "fixture-tree", "head": base_sha, "path": str(checkout),
+                                     "branch": "refs/heads/" + branch}}
+            if verb == ("worktree", "rm"):
+                check.assertNotIn("--force", argv)
+                git_at(repo, "worktree", "remove", str(checkout))
+                return {"removed": True}
+            if verb == ("account", "select"):
+                if interrupted == "committed":
+                    git_at(checkout, "commit", "--allow-empty", "-m", "someone's new commit")
+                if interrupted == "untracked":
+                    (checkout / "notes").write_text("keep my working copy")
+                raise tick.OrcaError("account selection failed")
+            raise AssertionError(argv)
+
+        with (patch.object(tick, "runtime", worktree_runtime),
+              patch.object(tick, "project_fields", return_value=("p", [], ("s","needs-you"))),
+              patch.object(tick, "supervisor", return_value=([], "run")),
+              redirect_stdout(io.StringIO()), check.assertRaisesRegex(tick.OrcaError, "account selection failed")):
+            tick.launch(db, repo, test_ticket, account, args, repo / "holds.json")
+        check.assertEqual(checkout.exists(), interrupted != "clean")
+        check.assertEqual(bool(git_at(repo, "branch", "--list", branch)), interrupted != "clean")
+        if interrupted == "committed":
+            check.assertNotEqual(git_at(checkout, "rev-parse", "HEAD"), base_sha)
+        if interrupted == "untracked":
+            check.assertEqual((checkout / "notes").read_text(), "keep my working copy")
 
 print("ok")

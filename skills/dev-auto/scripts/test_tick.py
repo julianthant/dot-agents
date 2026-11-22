@@ -1,4 +1,5 @@
 import io
+import os
 import subprocess
 from contextlib import redirect_stderr, redirect_stdout
 from tempfile import TemporaryDirectory
@@ -178,12 +179,22 @@ with TemporaryDirectory() as tmp:
     assert tick.leftovers(real) == ["branch scratch/x"]
     g("branch", "-q", "-D", "scratch/x")
     assert tick.leftovers(real) == []
+    # A broken ref is not absence: for-each-ref skips it, show-ref --exists fails on it.
+    os.makedirs(f"{repo}/.git/refs/heads/scratch", exist_ok=True)
+    with open(f"{repo}/.git/refs/heads/scratch/x", "w") as f:
+        f.write("garbage\n")
+    try:
+        tick.leftovers(real)
+        raise AssertionError("broken ref read as absent")
+    except tick.OrcaError as e:
+        assert "show-ref refs/heads/scratch/x exit 1" in str(e), e
+    os.remove(f"{repo}/.git/refs/heads/scratch/x")
     try:
         tick.leftovers({**real, "git": f"{tmp}/missing"})
         raise AssertionError("missing git dir passed")
     except tick.OrcaError as e:
         assert "exit 128" in str(e), e
-    with patch.object(tick, "git", side_effect=[["garbage"], []]):
+    with patch.object(tick, "git", return_value=["garbage"]):
         try:
             tick.leftovers(real)
             raise AssertionError("unreadable output passed")

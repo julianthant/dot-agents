@@ -142,15 +142,19 @@ def git(st, *args):
 def leftovers(st):
     """The scratch checkout or branch git still lists after removal; raises when git can't say."""
     trees = [line[9:] for line in git(st, "worktree", "list", "--porcelain") if line.startswith("worktree ")]
-    refs = git(st, "for-each-ref", "--format=%(refname)", "refs/heads/")
-    if not trees or not all(r.startswith("refs/heads/") for r in refs):
-        raise OrcaError(f"unreadable git output: {trees[:3]} {refs[:3]}")
+    if not trees:
+        raise OrcaError("unreadable git worktree list output")
     path = os.path.realpath(st["path"])
     left = [f"worktree {st['path']}" for t in trees if os.path.realpath(t) == path]
     if os.path.exists(st["path"]):
         left.append(f"directory {st['path']}")
-    if f"refs/heads/{st['branch']}" in refs:
+    # show-ref --exists: 0 present, 2 missing, anything else (a broken ref, no repo) is unknown.
+    ref = f"refs/heads/{st['branch']}"
+    out = subprocess.run(["git", "--git-dir", st["git"], "show-ref", "--exists", ref], capture_output=True, text=True)
+    if out.returncode == 0:
         left.append(f"branch {st['branch']}")
+    elif out.returncode != 2:
+        raise OrcaError(f"git show-ref {ref} exit {out.returncode}: {out.stderr.strip()[:200]}")
     return left
 
 

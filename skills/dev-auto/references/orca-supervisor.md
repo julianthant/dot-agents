@@ -61,11 +61,17 @@ branch only when all of these hold:
 - no follow-up `send` is still waiting on its receipt;
 - `terminal close` reported `ptyKilled` for the anchor. The anchor handle is kept until it does.
 
-After `worktree rm` reports `removed`, `git worktree list --porcelain` and
-`git for-each-ref refs/heads/` must both succeed, give readable output, and name neither the
-checkout path nor the branch exactly; a failed git (such as exit 128) fails cleanup. If any
-of these checks fails, the scratch worktree stays, the reasons go to stderr and the exit status
-is 1. A failed proof step re-raises its own error, even when cleanup crashes.
+After `worktree rm` reports `removed`, `git worktree list --porcelain` must succeed and must
+not list the checkout path. Then `git show-ref --exists refs/heads/<branch>` must exit 2, git's
+documented result for a missing ref. Exit 0 means the branch is still there. Anything else, such
+as exit 1 for a broken ref or exit 128 when there is no repo, means git couldn't tell. Note that
+`for-each-ref` skips broken refs, so it can't prove absence.
+
+These checks run after the deletion, so they can fail even when `worktree rm` really did remove
+the checkout. A failure then means git couldn't confirm the removal, not that the deletion was
+undone. If a check before the deletion fails, the scratch worktree stays. In every failure
+case the reasons go to stderr and the exit status is 1. A failed proof step re-raises its own
+error, even when cleanup crashes.
 
 A `worker_done` counts only with `outcome: succeeded`, from the Dispatch the script expects (the
 start, then each follow-up's new id), and only if `worker-show` puts that Dispatch in the same

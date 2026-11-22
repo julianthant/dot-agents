@@ -12,7 +12,11 @@ with each account's reason. Right after `worker-start`, `hold` records which acc
 the worker's terminal uses; Orca's terminal list decides which holds are still live.
 """
 
+from contextlib import contextmanager
 import argparse
+import fcntl
+import os
+import tempfile
 import json
 import subprocess
 import sys
@@ -24,26 +28,44 @@ import account_usage
 
 HERE = Path(__file__).resolve().parent
 LIMITS = HERE.parent / "limits.toml"
-HOLDS = HERE.parent / "holds.json"
+HOLDS = account_usage.ACCOUNTS.with_name("holds.json")
 
 
 def live_handles(host):
-    args = ["orca", "terminal", "list", "--json"]
+    args = ["orca", "terminal", "list", "--limit", "10000", "--json"]
     if host != "local":
         args += ["--environment", host]
     out = subprocess.run(args, check=False, capture_output=True, text=True, timeout=30)
     if out.returncode != 0:
         raise SystemExit(f"orca terminal list failed on {host}: {out.stderr.strip()}")
-    return {t["handle"] for t in json.loads(out.stdout)["result"]["terminals"]}
+    result = json.loads(out.stdout)["result"]
+    if result.get("truncated"):
+        raise SystemExit(f"incomplete Orca terminal list on {host}")
+    return {t["handle"] for t in result["terminals"]}
+
+
+@contextmanager
+def edit_holds(path):
+    with path.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        old = json.loads(path.read_text()) if path.exists() else {}
+        holds = old.copy()
+        yield holds
+        if holds != old:
+            with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as f:
+                json.dump(holds, f, indent=1)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(f.name, path)
 
 
 def live_holds(host):
-    holds = json.loads(HOLDS.read_text()) if HOLDS.exists() else {}
-    alive = live_handles(host)
-    kept = {h: r for h, r in holds.items() if r["host"] != host or h in alive}
-    if kept != holds:
-        HOLDS.write_text(json.dumps(kept, indent=1))
-    return [r for r in kept.values() if r["host"] == host]
+    with edit_holds(HOLDS) as holds:
+        alive = live_handles(host)
+        for handle in list(holds):
+            if holds[handle]["host"] == host and handle not in alive:
+                del holds[handle]
+        return [r for r in holds.values() if r["host"] == host]
 
 
 def windows(cfg, row, now):
@@ -103,8 +125,9 @@ def codex_reason(plan_name, plan, route, held, five, week):
     return None
 
 
-def pick(cfg, agent, model, effort, host, now):
-    holds = live_holds(host)
+def pick(cfg, agent, model, effort, host, now, holds=None):
+    if holds is None:
+        holds = live_holds(host)
     route = f"{model}:{effort}"
     why = []
     for row in cfg["account"]:
@@ -198,11 +221,10 @@ def hold(cfg, args):
     row = next((r for r in cfg["account"] if args.account in (r["id"], r["label"])), None)
     if row is None:
         raise SystemExit(f"no account {args.account} in accounts.toml")
-    holds = json.loads(HOLDS.read_text()) if HOLDS.exists() else {}
-    holds[args.terminal] = {"account": row["id"], "label": row["label"], "agent": args.agent,
-                            "model": args.model, "effort": args.effort, "host": args.host,
-                            "at": int(time.time())}
-    HOLDS.write_text(json.dumps(holds, indent=1))
+    with edit_holds(HOLDS) as holds:
+        holds[args.terminal] = {"account": row["id"], "label": row["label"], "agent": args.agent,
+                                "model": args.model, "effort": args.effort, "host": args.host,
+                                "at": int(time.time())}
 
 
 LIM = tomllib.loads(LIMITS.read_text())

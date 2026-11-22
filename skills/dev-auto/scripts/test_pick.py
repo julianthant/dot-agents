@@ -51,7 +51,7 @@ with TemporaryDirectory() as temp:
     def fake_orca(args, **kwargs):
         replies = {
             ("orca", "account", "list", "--json"): {"claude": account, "rateLimits": {"claude": limits}},
-            ("orca", "terminal", "list", "--json"): {"terminals": [{"handle": "worker"}]},
+            ("orca", "terminal", "list", "--limit", "10000", "--json"): {"terminals": [{"handle": "worker"}]},
         }
         return pick.subprocess.CompletedProcess(args, 0, json.dumps({"result": replies[tuple(args)]}))
 
@@ -74,7 +74,6 @@ with TemporaryDirectory() as temp:
         assert pick.main(["due"]) == 0
         assert output.getvalue().splitlines()[-1] == "Fixture worker 5-hour 96%"
 
-print("pick: all checks pass")
 
 # Coordinator: keep the selected Codex account while under its handoff point, else switch.
 row = {"id": "a", "label": "a", "agent": "codex", "plan": "plus"}
@@ -94,3 +93,51 @@ data = {"issues": [mk(n=1), mk(n=2, blockers=[1]), mk(n=3, agent="Coding"), mk(n
 assert [i["n"] for i in pick.ready_tickets(data)] == [1]
 with patch.object(pick, "pick", return_value=(None, [])):
     assert pick.fill({}, "local", 0, data)[1] is False
+
+# A partial terminal inventory must never prune another fleet worker's hold.
+with TemporaryDirectory() as temp, patch.object(pick, "HOLDS", Path(temp) / "holds.json"):
+    original = '{"worker": {"host": "local"}}'
+    pick.HOLDS.write_text(original)
+    with patch.object(pick.subprocess, "run", return_value=pick.subprocess.CompletedProcess(
+            [], 0, '{"result":{"terminals":[],"truncated":true}}')):
+        try:
+            pick.live_holds("local")
+        except SystemExit:
+            pass
+    assert pick.HOLDS.read_text() == original
+
+# A prune and a hold on the same ledger use the same lock, including fill's writer.
+import fcntl
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+import tick
+
+with TemporaryDirectory() as temp, patch.object(pick, "HOLDS", Path(temp) / "holds.json"):
+    pick.HOLDS.write_text('{"dead":{"host":"local"},"remote":{"host":"other"}}')
+    pruning, resume = threading.Event(), threading.Event()
+    def inventory(host):
+        pruning.set()
+        assert resume.wait(5)
+        return set()
+    with patch.object(pick, "live_handles", inventory), ThreadPoolExecutor(3) as pool:
+        prune = pool.submit(pick.live_holds, "local")
+        assert pruning.wait(5)
+        try:
+            with pick.HOLDS.with_suffix(".lock").open("a") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    raise AssertionError("pruning must hold the ledger lock during inventory")
+                except BlockingIOError:
+                    pass
+            fleet = pool.submit(pick.hold, {"account": [row]}, SimpleNamespace(
+                terminal="fleet", account="a", agent="codex", model=M, effort="medium", host="local"))
+            fill = pool.submit(tick.record_hold, dict(terminal="fill", account="a", label="a",
+                               route=("codex", M, "medium", None), time=0, holds=str(pick.HOLDS)))
+        finally:
+            resume.set()
+        for job in (prune, fleet, fill):
+            job.result()
+    assert set(json.loads(pick.HOLDS.read_text())) == {"fleet", "fill", "remote"}
+
+print("pick: all checks pass")

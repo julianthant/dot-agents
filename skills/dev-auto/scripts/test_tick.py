@@ -32,7 +32,13 @@ with patch.dict(tick.os.environ, {"ORCA_TERMINAL_HANDLE": "term_x", "ORCA_CLI_CO
     assert "ORCA_TERMINAL_HANDLE" not in env and env["ORCA_CLI_COMMAND"] == "orca"
     assert run.call_args.args[0] == ["orca", "status", "--json"]
 
-
+with patch.object(tick, "command", return_value='{"ok": true, "result": {}}') as cli:
+    tick.runtime("account", "select", "--agent", "codex", "--account", "seat")
+    cli.assert_called_once_with(tick.ORCA, "account", "select", "--agent", "codex", "--account", "seat", "--json")
+    tick.runtime("account", "list")
+    cli.assert_called_with(tick.ORCA, "account", "list", "--json")
+    tick.runtime("terminal", "list")
+    cli.assert_called_with(tick.ORCA, "terminal", "list", "--environment", "local", "--json")
 
 # orca(): a nonzero exit, invalid JSON or a timeout is a failed receipt, raised unless ok=False.
 with patch.object(tick.subprocess, "run") as run:
@@ -205,5 +211,413 @@ with TemporaryDirectory() as tmp:
     with patch.object(tick, "orca", run), redirect_stdout(io.StringIO()):
         errs = tick.cleanup({**st, **real, "git": f"{tmp}/missing"})
     assert errs[0].startswith("absence not verified: git worktree list exit 128"), errs
+
+
+# The dry-run plan reserves both paths and account capacity in priority order.
+from unittest import TestCase
+check = TestCase()
+base = dict(status="Todo", kind="Task", later=False, assigned=False, blocked=False, busy=False,
+            repo="hr-relay", branch="task/a/lane", paths=["src/a"], route=("codex", "gpt-6.2-sol", "medium", None),
+            score=0, item="card", title="a / lane")
+tickets = [dict(base, number=1, score=3), dict(base, number=2, paths=["src/a/file.ts"]),
+           dict(base, number=3, paths=["src/b"]), dict(base, number=4, blocked=True, score=9),
+           dict(base, number=5, status="In Progress", paths=["src/c"]),
+           dict(base, number=6, paths=["src/c/sub"]), dict(base, number=7, later=True),
+           dict(base, number=8, assigned=True, paths=["src/d"]), dict(base, number=9, kind="Feature")]
+for t in tickets:
+    t["branch"] += str(t["number"])
+
+account = dict(id="seat", label="example")
+def seat(route, held):
+    return (account, []) if len(held) < 1 else (None, ["capacity"])
+with redirect_stdout(io.StringIO()) as output:
+    plan = list(tick.fill_plan(tickets, seat))
+check.assertEqual([t["number"] for t, a in plan], [1])
+check.assertIn("capacity", output.getvalue())
+body = """## Owned paths
+
+src/backend/logs/ (writers), tests/backend/logs*.ts
+
+## Route
+
+- Coder: claude (claude-sonnet-5-5, effort high) with Opus advisor · Reviewer: codex (gpt-6.2-sol, effort medium)
+"""
+check.assertEqual(tick.coder_route(body), ("claude", "claude-sonnet-5-5", "high", "opus"))
+check.assertEqual(tick.owned_paths(body), ["src/backend/logs/", "tests/backend/logs*.ts"])
+check.assertEqual(tick.owned_paths("Owned paths: selected service code and fixtures."), ["*"])
+
+# A response lost after dispatch prevents a second launch, even after reopening the state.
+import sqlite3
+from pathlib import Path
+with TemporaryDirectory() as tmp:
+    dbpath = Path(tmp) / "state"
+    with sqlite3.connect(dbpath) as db:
+        tick.reserve(db, 17, {"task": "fixture"})
+    with sqlite3.connect(dbpath) as db:
+        with check.assertRaisesRegex(tick.OrcaError, "17"):
+            tick.reserve(db, 17, {"task": "fixture"})
+
+# Exercise launch through the real advisor file, journal, hold and Project-edit boundary.
+from types import SimpleNamespace
+import json
+with TemporaryDirectory() as tmp, sqlite3.connect(":memory:") as db:
+    root = Path(tmp)
+    card = []
+    starts = []
+    ticket = dict(base, number=51, sha="sha", base="origin/main", route=("claude", "claude-sonnet-5-5", "medium", "opus"))
+    args = SimpleNamespace(anchor=None, run=None)
+    def cli(*args):
+        if args[0] == "git":
+            return "sha" if "rev-parse" in args else ticket["branch"]
+        check.assertEqual(args[:3], ("gh", "project", "item-edit"))
+        card.append(args[-1])
+        return ""
+    def local(*args):
+        verb = args[:2]
+        if verb == ("orchestration", "task-create"):
+            check.assertTrue(args[args.index("--spec") + 1].startswith("/goal Implement julianthant/hr-relay#51"))
+            return {"task": {"id": "fixture-task"}}
+        if verb == ("orchestration", "dispatch-show"):
+            return {"dispatch": {"id": "fixture-dispatch"}}
+        if verb == ("orchestration", "run-current"):
+            return {"runId": "fixture"}
+        if verb == ("worktree", "create"):
+            return {"worktree": {"path": str(root), "branch": "refs/heads/" + ticket["branch"], "head": "sha", "id": "wt"}}
+        if verb == ("account", "select"):
+            return {}
+        if verb == ("account", "list"):
+            return {"claude": {"activeAccountId": "seat"}}
+        if verb == ("orchestration", "worker-start"):
+            starts.append(args)
+            check.assertIn("--task", args)
+            check.assertEqual(json.loads((root / ".claude/settings.local.json").read_text()), {"advisorModel": "opus"})
+            check.assertNotIn("--from", args)
+            return {"dispatchId": "fixture-dispatch", "state": "ready"}
+        check.assertEqual(verb, ("orchestration", "worker-show"))
+        return {"dispatch": {"id": "fixture-dispatch", "assigneeHandle": "fixture-terminal", "runId": "fixture",
+                             "taskId": "fixture-task"}, "worker": {"state": "ready", "worktreeId": "wt"}}
+
+    with patch.object(tick, "project_fields", return_value=("project", [("s","progress"),("c","coding"),("a",None)], ("c","needs-you"))), \
+         patch.object(tick, "runtime", local), patch.object(tick, "command", cli), \
+         patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE":"fixture"}), redirect_stdout(io.StringIO()):
+        tick.launch(db, root, ticket, account, args, root / "holds.json")
+        with check.assertRaisesRegex(tick.OrcaError, "51"):
+            tick.launch(db, root, ticket, account, args, root / "holds.json")
+    check.assertEqual(len(starts), 1)
+    check.assertEqual(json.loads((root / "holds.json").read_text())["fixture-terminal"]["account"], "seat")
+    check.assertEqual(card, ["progress", "coding", "coder claude-sonnet-5-5 medium+advisor @example"])
+
+# Preparation can fail without reserving an issue. A lost start response is recovered by
+# its durable Task, including after reopening SQLite with a parked Codex menu.
+with TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    ledger = root / "starts"
+    holds = root / "holds.json"
+    args = SimpleNamespace(anchor=None, run=None, dry_run=False, repo_path=root, holds=holds, issue=None)
+    codex_ticket = dict(ticket, route=base["route"])
+    screen = ["Switch model?"]
+    operations = []
+    preparation_failed = True
+    visible = False
+    refused = False
+    def recovery_runtime(*argv):
+        verb = argv[:2]
+        operations.append(verb)
+        if verb == ("account", "list"):
+            return {"codex": {"activeAccountId": "other" if preparation_failed else "seat"}}
+        if verb == ("orchestration", "worker-start"):
+            import tomllib
+            with (root / ".codex/config.toml").open("rb") as cfg:
+                check.assertEqual(tomllib.load(cfg), {"notice": {"hide_rate_limit_model_nudge": True}})
+            if refused:
+                reply = {"ok": False, "error": {"message": "refused", "data": {"effectsApplied": False}}}
+                with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(argv, 1, json.dumps(reply), "")):
+                    return real_command("orca", *argv)
+            raise subprocess.TimeoutExpired("worker-start", 1)
+        if verb == ("orchestration", "dispatch-show") and not visible:
+            return {"dispatch": None}
+        if verb == ("orchestration", "worker-show"):
+            return dict(local(*argv), observation=None, terminal={"handle": "fixture-terminal"})
+        if verb == ("orchestration", "send"):
+            check.assertEqual(argv[argv.index("--to")+1], "run:fixture")
+            check.assertIn(screen[0], argv[argv.index("--body")+1])
+            return {"messageId": "notice"}
+        if verb == ("terminal", "read"):
+            return {"terminal": {"tail": screen}}
+        return local(*argv)
+
+    recovery_edits = []
+    real_command = tick.command
+    def recovery_command(*argv):
+        if argv[:3] == ("gh", "project", "item-edit"):
+            recovery_edits.append(argv)
+            return ""
+        if "get-url" in argv:
+            return "git@github.com:julianthant/hr-relay.git"
+        if "for-each-ref" in argv or "ls-remote" in argv:
+            return ""
+        return cli(*argv)
+
+    import pick
+    with (patch.object(tick, "project_fields", return_value=("project", [("field", "coding")], ("field","needs-you"))),
+          patch.object(tick, "runtime", recovery_runtime), patch.object(tick, "command", recovery_command),
+          patch.object(tick, "tickets", return_value=[]), patch.object(tick, "inventory", return_value=set()),
+          patch.object(pick.account_usage, "load_config", return_value={}),
+          patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE": "fixture"}), redirect_stdout(io.StringIO()) as output):
+        with sqlite3.connect(ledger) as db:
+            with check.assertRaisesRegex(tick.OrcaError, "selected account changed"):
+                tick.launch(db, root, codex_ticket, account, args, holds)
+            preparation_failed = False
+            refused = True
+            with check.assertRaisesRegex(tick.OrcaError, "no start effects"):
+                tick.launch(db, root, codex_ticket, account, args, holds)
+            check.assertEqual(db.execute("SELECT count(*) FROM starts").fetchone(), (0,))
+            operations.clear()
+            refused = False
+            with check.assertRaisesRegex(tick.OrcaError, "fixture-task"):
+                tick.launch(db, root, codex_ticket, account, args, holds)
+        with sqlite3.connect(ledger) as db:
+            tick.fill_tick(args, db)
+            check.assertIn("no Dispatch", output.getvalue())
+            visible = True
+            tick.fill_tick(args, db)
+            check.assertIn("waiting for operator input", output.getvalue())
+            check.assertIn('"prompt": "Switch model?"', output.getvalue())
+            check.assertEqual(json.loads(holds.read_text())["fixture-terminal"]["account"], "seat")
+            tick.fill_tick(args, db)
+            check.assertEqual(operations.count(("orchestration", "send")), 1)
+            screen[:] = ["Hooks need review before continuing"]
+            tick.fill_tick(args, db)
+            check.assertIn('"prompt": "Hooks need review before continuing"', output.getvalue())
+            check.assertEqual([edit[-1] for edit in recovery_edits], ["needs-you", "needs-you"])
+            screen.clear()
+            tick.fill_tick(args, db)
+            check.assertEqual(db.execute("SELECT receipt FROM starts").fetchone(), ("done",))
+            check.assertEqual([edit[-1] for edit in recovery_edits], ["needs-you", "needs-you", "coding"])
+    check.assertEqual(operations.count(("orchestration", "worker-start")), 1)
+    check.assertNotIn(("terminal", "send"), operations)
+    check.assertNotIn(("orchestration", "approve"), operations)
+
+# The fleet's actual model menu has no question mark. Quoted prose is not a prompt.
+menu = ["Approaching rate limits", "› 1. Switch to gpt-6-luna", "  2. Keep current model"]
+check.assertEqual(tick.codex_prompt(["unrelated transcript", *menu, "unrelated footer"]), "\n".join(menu))
+check.assertIsNone(tick.codex_prompt(['I did not see the "Hooks need review" screen.']))
+
+# An in-pane worker cannot select somebody else's anchor even with a valid-looking Run.
+with sqlite3.connect(":memory:") as db, patch.object(tick, "project_fields", return_value=(None, [], ("c","needs-you"))), \
+     patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE":"fixture"}), patch.object(tick, "runtime") as call:
+    with check.assertRaisesRegex(tick.OrcaError, "pane-less"):
+        tick.launch(db, None, ticket, account, SimpleNamespace(anchor="external", run="run"), None)
+    call.assert_not_called()
+
+
+# Dry-run reads the existing account ledger without pruning it or starting work.
+import pick
+from contextlib import ExitStack
+with TemporaryDirectory() as tmp, ExitStack() as stack:
+    root = Path(tmp)
+    holds = root / "holds.json"
+    holds.write_text('{"dead": {"host": "local"}}')
+    args = SimpleNamespace(repo_path=root, dry_run=True, issue=None, holds=holds)
+    stack.enter_context(patch.object(tick, "tickets", return_value=[dict(ticket)]))
+    stack.enter_context(patch.object(tick, "inventory", return_value=set()))
+    stack.enter_context(patch.object(tick, "command", side_effect=["git@github.com:julianthant/hr-relay.git", "origin/main",
+                                                              "abcdef refs/heads/main"]))
+    stack.enter_context(patch.object(pick.account_usage, "load_config", return_value={}))
+    stack.enter_context(patch.object(pick, "pick", return_value=(account, [])))
+    launch = stack.enter_context(patch.object(tick, "launch"))
+    with redirect_stdout(io.StringIO()) as output:
+        with patch.object(Path, "home", return_value=root):
+            tick.fill(args)
+    check.assertFalse((root / ".local").exists())
+    check.assertIn('would start', output.getvalue())
+    check.assertIn('"issue": 51', output.getvalue())
+    check.assertEqual(holds.read_text(), '{"dead": {"host": "local"}}')
+    launch.assert_not_called()
+
+
+# Only the chosen upstream base is fetched. A concurrent remote branch blocks the start.
+with TemporaryDirectory() as temp, ExitStack() as stack:
+    root = Path(temp)
+    args = SimpleNamespace(repo_path=root, dry_run=False, issue=51, holds=root / "holds.json")
+    calls = []
+    raced = False
+    def git(*argv):
+        calls.append(argv)
+        if "get-url" in argv:
+            return "git@github.com:julianthant/hr-relay.git"
+        if "for-each-ref" in argv:
+            return ""
+        if "ls-remote" in argv:
+            return "abc refs/heads/main" + ("\ndef refs/heads/task/a/lane" if raced and argv[-1] != "origin" else "")
+        if "fetch" in argv:
+            check.assertEqual(argv[3:], ("fetch", "--no-tags", "origin", "refs/heads/main:refs/remotes/origin/main"))
+            return ""
+        check.assertEqual(argv[3:], ("rev-parse", "--verify", "origin/main"))
+        return "abc"
+
+    stack.enter_context(patch.object(tick, "command", git))
+    stack.enter_context(patch.object(tick, "tickets", side_effect=lambda: [dict(ticket)]))
+    stack.enter_context(patch.object(tick, "inventory", return_value=set()))
+    stack.enter_context(patch.object(pick.account_usage, "load_config", return_value={}))
+    stack.enter_context(patch.object(pick, "pick", return_value=(account, [])))
+    start = stack.enter_context(patch.object(tick, "launch"))
+    stack.enter_context(redirect_stdout(io.StringIO()))
+    tick.fill_tick(args, None)
+    check.assertEqual(start.call_args.args[2]["sha"], "abc")
+    check.assertEqual([c[3] for c in calls][-3:], ["fetch", "ls-remote", "rev-parse"])
+    raced = True
+    with check.assertRaisesRegex(tick.OrcaError, "base changed or task branch"):
+        tick.fill_tick(args, None)
+    start.assert_called_once()
+
+
+# An unresolved attempt still owns its paths and seat; an unrelated ticket can start.
+with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory:") as db:
+    root = Path(tmp)
+    stuck = dict(ticket, number=40, branch="task/a/stuck", paths=["src/occupied"])
+    overlap_ticket = dict(ticket, number=41, branch="task/a/overlap", paths=["src/occupied/file"])
+    tick.reserve(db, 40, dict(task="stuck", run="different", route=base["route"], account="held"))
+    args = SimpleNamespace(repo_path=root, dry_run=False, issue=None, holds=root / "holds.json")
+    stack.enter_context(patch.object(tick, "command", git))
+    raced = False
+    stack.enter_context(patch.object(tick, "tickets", side_effect=lambda: [dict(t) for t in (stuck, overlap_ticket, ticket)]))
+    stack.enter_context(patch.object(tick, "supervisor", return_value=([], "own")))
+    stack.enter_context(patch.object(tick, "inventory", return_value=set()))
+    stack.enter_context(patch.object(pick.account_usage, "load_config", return_value={}))
+    picker = stack.enter_context(patch.object(pick, "pick", return_value=(account, [])))
+    start = stack.enter_context(patch.object(tick, "launch"))
+    output = stack.enter_context(redirect_stdout(io.StringIO()))
+    tick.fill_tick(args, db)
+    check.assertIn("reconcile from its owning Run", output.getvalue())
+    check.assertIn("overlaps #40", output.getvalue())
+    check.assertEqual(start.call_args.args[2]["number"], ticket["number"])
+    start.assert_called_once()
+    check.assertEqual(picker.call_args.kwargs["holds"][0]["account"], "held")
+    check.assertEqual(db.execute("SELECT issue FROM starts").fetchall(), [(40,)])
+
+# Release is its own operation and only clears the inspected pending issue.
+with TemporaryDirectory() as tmp, patch.object(Path, "home", return_value=Path(tmp)), patch.object(tick, "fill_tick") as fill:
+    state = Path(tmp) / ".local/state/dev-auto"
+    state.mkdir(parents=True)
+    with sqlite3.connect(state / "starts.sqlite") as db:
+        tick.reserve(db, 40, {"task": "inspected"})
+        tick.reserve(db, 41, {"task": "other"})
+        db.execute("INSERT INTO starts VALUES(42,'done')")
+    with redirect_stdout(io.StringIO()):
+        tick.main(["fill", "--release", "40"])
+        tick.main(["fill", "--release", "42"])
+    fill.assert_not_called()
+    with sqlite3.connect(state / "starts.sqlite") as db:
+        check.assertEqual(db.execute("SELECT issue FROM starts ORDER BY issue").fetchall(), [(41,), (42,)])
+
+check.assertEqual(tick.owned_paths("Owned paths: Edit `scripts/dev.py` and `docs/how.md`, plus config/app.json."),
+                  ["scripts/dev.py", "docs/how.md", "config/app.json"])
+check.assertEqual(tick.owned_paths("Owned paths: src, docs, scripts/setup.py."), ["src", "docs", "scripts/setup.py"])
+check.assertIn(".github/workflows", tick.owned_paths("Owned paths: Development/checks workflows, CI plan and focused tests."))
+
+with TemporaryDirectory() as tmp:
+    import tomllib
+    cfg = Path(tmp) / ".codex/config.toml"
+    cfg.parent.mkdir()
+    cfg.write_text('[profile]\nname="unchanged"\n[notice] # existing notices\nhide_rate_limit_model_nudge = false\n')
+    tick.configure_codex_notice(Path(tmp))
+    check.assertEqual(tomllib.loads(cfg.read_text()), {"profile": {"name": "unchanged"},
+                                                       "notice": {"hide_rate_limit_model_nudge": True}})
+
+    cfg.write_text('notice = { hide_other_banner = true }\n')
+    tick.configure_codex_notice(Path(tmp))
+    check.assertEqual(tomllib.loads(cfg.read_text())["notice"], {"hide_other_banner": True,
+                                                                 "hide_rate_limit_model_nudge": True})
+
+with patch.object(tick, "command", side_effect=[json.dumps({"id": "project"}), json.dumps({"fields": [
+        {"name": "Status", "id": "status", "options": [{"name": "In Progress", "id": "progress"}]},
+        {"name": "Agent state", "id": "stage", "options": [{"name": "Coding", "id": "coding"},
+                                                           {"name": "Needs you", "id": "waiting"}]},
+        {"name": "Agent", "id": "agent"}]})]):
+    check.assertEqual(tick.project_fields()[2], ("stage", "waiting"))
+
+# Git owns the fixture worktree and refs; only the Orca transport is simulated.
+for interrupted in ("clean", "committed", "untracked", "preexisting"):
+    with TemporaryDirectory() as tmp, sqlite3.connect(":memory:") as db:
+        repo = Path(tmp) / "repo"
+        checkout = Path(tmp) / "worker"
+        def git_at(path, *argv):
+            return subprocess.run(["git", "-C", str(path), *argv], check=True, capture_output=True, text=True).stdout.strip()
+        repo.mkdir()
+        git_at(repo, "init", "-b", "main")
+        git_at(repo, "config", "user.name", "Fixture")
+        git_at(repo, "config", "user.email", "fixture@example.invalid")
+        git_at(repo, "commit", "--allow-empty", "-m", "base")
+        base_sha = git_at(repo, "rev-parse", "HEAD")
+        test_ticket = dict(ticket, base="main", sha=base_sha, route=base["route"])
+        branch = test_ticket["branch"]
+        if interrupted == "preexisting":
+            git_at(repo, "branch", branch, base_sha)
+        def worktree_runtime(*argv):
+            verb = argv[:2]
+            if verb == ("worktree", "create"):
+                if interrupted == "preexisting":
+                    git_at(repo, "worktree", "add", str(checkout), branch)
+                else:
+                    git_at(repo, "worktree", "add", "-b", branch, str(checkout), base_sha)
+                return {"worktree": {"id": "fixture-tree", "head": base_sha, "path": str(checkout),
+                                     "branch": "refs/heads/" + branch}}
+            if verb == ("worktree", "rm"):
+                check.assertNotIn("--force", argv)
+                git_at(repo, "worktree", "remove", str(checkout))
+                return {"removed": True}
+            if verb == ("account", "select"):
+                if interrupted == "committed":
+                    git_at(checkout, "commit", "--allow-empty", "-m", "someone's new commit")
+                if interrupted == "untracked":
+                    (checkout / "notes").write_text("keep my working copy")
+                raise tick.OrcaError("account selection failed")
+            raise AssertionError(argv)
+
+        with (patch.object(tick, "runtime", worktree_runtime),
+              patch.object(tick, "project_fields", return_value=("p", [], ("s","needs-you"))),
+              patch.object(tick, "supervisor", return_value=([], "run")),
+              redirect_stdout(io.StringIO()), check.assertRaisesRegex(tick.OrcaError, "account selection failed")):
+            tick.launch(db, repo, test_ticket, account, args, repo / "holds.json")
+        check.assertEqual(checkout.exists(), interrupted != "clean")
+        check.assertEqual(bool(git_at(repo, "branch", "--list", branch)), interrupted != "clean")
+        if interrupted == "committed":
+            check.assertNotEqual(git_at(checkout, "rev-parse", "HEAD"), base_sha)
+        if interrupted == "untracked":
+            check.assertEqual((checkout / "notes").read_text(), "keep my working copy")
+
+# Legacy titles provide a branch when the body omits it; explicit branches win.
+empty = {"nodes": [], "totalCount": 0}
+def issue_row(number, title, body=""):
+    return dict(number=number, title=title, body=body, issueType={"name": "Task"}, milestone=None,
+                projectItems=empty, assignees=empty, subIssues=empty, closedByPullRequestsReferences=empty,
+                labels=empty, blockedBy=empty, blocking=empty)
+
+rows = [issue_row(473, "dashboard-frontend-speed / clock-tick-in-leaves: render labels"),
+        issue_row(497, "driver-reads / CRM SSO route recovery: recover sign-in"),
+        issue_row(506, "tests-reliability / timing-guesses: condition waits", "Branch: task/tests/explicit")]
+with patch.object(tick, "command", return_value=json.dumps([{"data": {"repository": {"issues": {"nodes": rows}}}}])):
+    parsed = tick.tickets()
+check.assertEqual([row["branch"] for row in parsed], ["task/dashboard-frontend-speed/clock-tick-in-leaves",
+                  "task/driver-reads/crm-sso-route-recovery", "task/tests/explicit"])
+
+# Orca identifies agent terminals separately from plain shells and links recovery worktrees to issues.
+items = [dict(base, number=row["number"], branch=row["branch"], paths=[str(row["number"])]) for row in parsed]
+items.append(dict(base, number=484, branch="task/speed/read", paths=["disjoint"]))
+trees = [{"id": "agent", "branch": "refs/heads/" + items[0]["branch"]},
+         {"id": "recovery", "branch": "refs/heads/task/driver-reads/crm-sso-recovery", "linkedIssue": 497},
+         {"id": "shell", "branch": "refs/heads/" + items[2]["branch"]},
+         {"id": "other", "branch": "refs/heads/task/closed/lane"}]
+terms = [{"worktreeId": t["id"], "handle": t["id"], **({"agentIdentity": "codex"} if t["id"] != "shell" else {})}
+         for t in trees]
+with patch.object(tick, "runtime", side_effect=[{"worktrees": trees, "truncated": False},
+                                               {"terminals": terms, "truncated": False}]), redirect_stdout(io.StringIO()) as out:
+    tick.inventory(Path("/fixture"), items, "hr-relay")
+    plan = list(tick.fill_plan(items, lambda *_: (account, []), 484))
+check.assertEqual([(t.get("occupied", False), t["busy"]) for t in items],
+                  [(True, True), (True, True), (True, False), (False, False)])
+check.assertIn("task/closed/lane", out.getvalue())
+check.assertEqual([t["number"] for t, _ in plan], [484])
 
 print("ok")

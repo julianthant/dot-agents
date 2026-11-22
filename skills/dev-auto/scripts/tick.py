@@ -1,5 +1,6 @@
 """Headless Orca coordinator stub for dev-auto: no terminal of its own, run by launchd.
 
+  tick.py fill --repo-path <checkout> [--issue N] [--dry-run]
   tick.py start --repo id:<repo-id> --state <file>   process 1: scratch worker started, its ask answered
   tick.py resume --state <file>                      process 2: rebinds the stored Run, finishes, cleans up
 
@@ -9,7 +10,11 @@ Coordinator verbs refuse a sender with no stable Orca pane, so the script opens 
 (its anchor) and passes it as --from; the Run's mailbox is run:<id>, so mail outlives that pane.
 """
 
+from pathlib import Path
 import argparse
+import sqlite3
+import tempfile
+import tomllib
 import json
 import os
 import re
@@ -305,6 +310,655 @@ def resume(path):
     finish(st)
 
 
+PROJECT = 5
+OWNER = "julianthant"
+HERE = Path(__file__).resolve().parent
+
+# Nested connections must be complete before their absence can establish readiness.
+QUERY = """
+query($endCursor:String) {
+  repository(owner:"julianthant",name:"hr-relay") {
+    issues(first:50,states:OPEN,after:$endCursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes { number title body issueType {name} milestone {title}
+        assignees {totalCount} subIssues {totalCount} closedByPullRequestsReferences {totalCount}
+        labels(first:100){totalCount nodes{name}}
+        blockedBy(first:100){totalCount nodes{state}}
+        blocking(first:100){totalCount nodes{state}}
+        projectItems(first:20){totalCount nodes{id project{number owner{... on User{login} ... on Organization{login}}}
+          status:fieldValueByName(name:"Status"){... on ProjectV2ItemFieldSingleSelectValue{name}}
+          agent:fieldValueByName(name:"Agent"){... on ProjectV2ItemFieldTextValue{text}}
+          stage:fieldValueByName(name:"Agent state"){... on ProjectV2ItemFieldSingleSelectValue{name}}
+        }}
+      }
+    }
+  }
+}
+"""
+
+
+class StartNotApplied(OrcaError):
+    pass
+
+
+def command(*args):
+    result = subprocess.run(args, capture_output=True, text=True, timeout=900 if "worker-start" in args else 90)
+    if result.returncode:
+        if args[1:3] == ("orchestration", "worker-start"):
+            try:
+                reply = json.loads(result.stdout)
+            except ValueError:
+                reply = {}
+            error = reply.get("error") if isinstance(reply, dict) and reply.get("ok") is False else None
+            data = error.get("data") if isinstance(error, dict) else None
+            if isinstance(data, dict):
+                recovery = data.get("recovery") or {}
+                if data.get("effectsApplied") is False or recovery.get("disposition") == "not_sent":
+                    raise StartNotApplied(str(error.get("message")))
+                if recovery.get("orchestrationRequestId"):
+                    raise OrcaError(f"inspect Orca request {recovery['orchestrationRequestId']}")
+        raise OrcaError(f"{args[0]} {args[1]} failed: {(result.stderr or result.stdout).strip()[:500]}")
+    return result.stdout
+
+
+def nodes(connection):
+    if len(connection["nodes"]) != connection["totalCount"]:
+        raise ValueError("incomplete GitHub connection")
+    return connection["nodes"]
+
+
+def section(body, name):
+    found = re.search(r"(?im)^(?:- )?" + name + r":[ \t]*(.*)$", body)
+    if found:
+        return found[1].strip()
+    found = re.search(r"(?ims)^## " + name + r"\s*\n(.*?)(?:\n## |\Z)", body)
+    return found[1].strip() if found else ""
+
+
+def owned_paths(body):
+    value = section(body, "Owned paths")
+    value = re.split(r"(?i)\b(?:do not touch|keep [^.]* out of|exclude)\b", value, maxsplit=1)[0]
+    paths = []
+    token = r"[\w.*?/-]+"
+    for part in re.split(r"[,;\n]", value):
+        whole = re.sub(r"\([^()]*\)", "", part).strip().rstrip(".").strip()
+        for match in re.finditer(r"`([^`]+)`|(?<![\w/.-])(" + token + r")", part):
+            path = (match[1] or match[2]).rstrip(".")
+            if (match[1] or whole == path or "/" in path or "." in path) and re.fullmatch(token, path):
+                if not path.startswith("/") and ".." not in path and path:
+                    paths.append(path)
+    # These ownership descriptions in hr-relay use directory names and named config files.
+    if "dot-agents" in section(body, "Branch"):
+        return list(dict.fromkeys(paths)) or ["*"]
+    for phrase, path in ((r"backend storage", "src/backend/storage"), (r"tests?", "tests"),
+                         (r"documentation", "docs"), (r"workflows", ".github/workflows"),
+                         (r"CI plan", "scripts/test/ci-plan.ts"), (r"smoke config", "playwright.smoke.config.ts")):
+        if re.search(r"(?<![\w/.-])" + phrase + r"(?![\w/.-])", value, re.I):
+            paths.append(path)
+    return list(dict.fromkeys(paths)) or ["*"]
+
+
+def coder_route(body):
+    route = re.split(r"\s*(?:·|[.]?\s*Reviewer:|[.]?\s*Tier:)", section(body, "Coder"), maxsplit=1,
+                     flags=re.I)[0].lower().strip(" .")
+    route = re.sub(r"[(),/]", " ", route).replace("effort ", "")
+    route = re.sub(r"\b(sonnet|opus|haiku|fable) (\d+)\.(\d+)\b", r"claude-\1-\2-\3", route)
+    route = " ".join(route.split())
+    m = re.fullmatch(r"(claude|codex) ([a-z0-9.-]+) (low|medium|high|xhigh|max|ultra)(?: (?:with |\+ ?)?(opus) advisor)?", route)
+    if m and m[2].startswith("claude-" if m[1] == "claude" else "gpt-") and (not m[4] or m[1] == "claude"):
+        return m.groups()
+
+
+def tickets():
+    pages = json.loads(command("gh", "api", "graphql", "--paginate", "--slurp", "-f", "query=" + QUERY))
+    result = []
+    for page in pages:
+        for i in page["data"]["repository"]["issues"]["nodes"]:
+            card = next((c for c in nodes(i["projectItems"]) if c["project"]["number"] == PROJECT
+                         and c["project"]["owner"]["login"] == OWNER), None)
+            body = i["body"]
+            branch_section = section(body, "Branch")
+            m = re.search(r"\btask/([\w-]+)/([\w-]+)", branch_section)
+            branch = m[0] if m else None
+            if not branch:
+                slug = re.fullmatch(r"([\w-]+)\s*/\s*([\w-]+(?:[ \t]+[\w-]+)*)(?:\s*:.*)?", i["title"].strip())
+                if slug:
+                    lane = "-".join(slug[2].lower().split())
+                    branch = f"task/{slug[1].lower()}/{lane}"
+            dot = "dot-agents" in branch_section
+            card = card or {}
+            stage = (card.get("stage") or {}).get("name")
+            if dot:
+                base = "origin/main"
+            elif "development" in branch_section and "feature/" not in branch_section:
+                base = "origin/development"
+            else:
+                base = "origin/feature/" + branch.split("/")[1] if branch else None
+            result.append({
+                "number": i["number"], "title": i["title"], "item": card.get("id"),
+                "status": (card.get("status") or {}).get("name"), "kind": (i["issueType"] or {}).get("name"),
+                "assigned": bool(i["assignees"]["totalCount"] or (card.get("agent") or {}).get("text")),
+                "busy": bool(i["closedByPullRequestsReferences"]["totalCount"] or stage not in (None, "Queued")),
+                "later": (i["milestone"] or {}).get("title", "").lower() == "later"
+                         or any(label["name"].lower() == "later" for label in nodes(i["labels"])),
+                "blocked": bool(i["subIssues"]["totalCount"] or any(b["state"] == "OPEN" for b in nodes(i["blockedBy"]))),
+                "score": sum(b["state"] == "OPEN" for b in nodes(i["blocking"])),
+                "route": coder_route(body), "paths": owned_paths(body), "branch": branch, "base": base,
+                "repo": "dot-agents" if dot else "hr-relay",
+            })
+    return result
+
+
+def overlap(left, right):
+    # A glob's fixed directory owns the whole subtree for scheduling purposes.
+    def root(path):
+        prefix = re.split(r"[*?\[{]", path, maxsplit=1)[0]
+        if prefix != path:
+            prefix = prefix.rpartition("/")[0]
+        return os.path.normpath(prefix).strip("/").casefold() if prefix not in ("", ".", "./") else ""
+
+    return any(not a or not b or a == b or a.startswith(b + "/") or b.startswith(a + "/")
+               or ("/" not in a and a in b.split("/")) or ("/" not in b and b in a.split("/"))
+               for a in map(root, left) for b in map(root, right))
+
+
+def fill_plan(tickets, seat, issue=None):
+    busy = [t for t in tickets if t["busy"] or t["assigned"] or t["status"] == "In Progress"]
+    held = []
+    for t in sorted(tickets, key=lambda t: (-t["score"], t["number"])):
+        if issue and t["number"] != issue:
+            continue
+        reasons = list(t.get("skip", []))
+        for condition, reason in ((t["status"] != "Todo", "status is not Todo"), (t["kind"] != "Task", "not a Task"),
+                                  (t["later"], "later"), (t["blocked"], "open blocker or subtasks"),
+                                  (t["assigned"], "assigned"), (t["busy"], "active work"),
+                                  (not t["route"], "missing coder route"), (not t["branch"], "missing task branch")):
+            if condition:
+                reasons.append(reason)
+        for b in busy:
+            if b["number"] != t["number"] and b["repo"] == t["repo"] and (
+                    b["branch"] == t["branch"] or overlap(b["paths"], t["paths"])):
+                reasons.append(f"overlaps #{b['number']} ({', '.join(b['paths'])})")
+        if reasons:
+            log("skip", {"issue": t["number"], "reason": reasons})
+            continue
+        account, why = seat(t["route"], held)
+        if not account:
+            log("no seat", {"issue": t["number"], "reason": why or ["no eligible account"]})
+            continue
+        held.append(dict(account=account["id"], agent=t["route"][0], model=t["route"][1], effort=t["route"][2]))
+        busy.append(t)
+        yield t, account
+
+
+def runtime(*args):
+    # Production calls inherit the caller's Orca identity, including its worker restrictions.
+    # Orca account commands always operate on this host.
+    target = () if args[0] == "account" else ("--environment", "local")
+    response = json.loads(command(ORCA, *args, *target, "--json"))
+    if response.get("ok") is not True:
+        raise OrcaError(str(response.get("error")))
+    return response["result"]
+
+
+def reserve(db, number, receipt):
+    db.execute("CREATE TABLE IF NOT EXISTS starts (issue INTEGER PRIMARY KEY, receipt TEXT)")
+    try:
+        with db:
+            db.execute("INSERT INTO starts VALUES (?, ?)", (number, json.dumps(receipt)))
+    except sqlite3.IntegrityError as e:
+        raise OrcaError(f"issue #{number} already reserved") from e
+
+
+def project_fields():
+    args = (str(PROJECT), "--owner", OWNER, "--format", "json")
+    project = json.loads(command("gh", "project", "view", *args))["id"]
+    rows = json.loads(command("gh", "project", "field-list", *args))["fields"]
+    fields = {f["name"]: f for f in rows}
+    edits = []
+    for key, option in (("Status", "In Progress"), ("Agent state", "Coding"), ("Agent", None)):
+        f = fields[key]
+        value = next(o["id"] for o in f["options"] if o["name"] == option) if option else None
+        edits.append([f["id"], value])
+    stage = fields["Agent state"]
+    needs_you = next(o["id"] for o in stage["options"] if o["name"] == "Needs you")
+    return project, edits, (stage["id"], needs_you)
+
+
+def record_hold(rec):
+    tier = rec["route"]
+    import pick
+    with pick.edit_holds(Path(rec["holds"])) as holds:
+        holds[rec["terminal"]] = dict(account=rec["account"], label=rec["label"], agent=tier[0],
+                                      model=tier[1], effort=tier[2], host="local", at=rec["time"])
+
+
+def record_start(db, number, rec):
+    record_hold(rec)
+    tier = rec["route"]
+    agent = f"coder {tier[1]} {tier[2]}" + ("+advisor" if tier[3] else "") + " @" + rec["label"]
+    for field, value in rec["fields"]:
+        command("gh", "project", "item-edit", "--project-id", rec["project"], "--id", rec["item"],
+                "--field-id", field, *(("--single-select-option-id", value) if value else ("--text", agent)))
+    with db:
+        db.execute("UPDATE starts SET receipt='done' WHERE issue=?", (number,))
+
+
+def inventory(repo_path, issues, repo):
+    trees = runtime("worktree", "list", "--repo", "path:" + str(repo_path), "--limit", "10000")
+    terms = runtime("terminal", "list", "--limit", "10000")
+    if trees["truncated"] or terms["truncated"]:
+        raise OrcaError("incomplete Orca inventory")
+    agents = {term["worktreeId"] for term in terms["terminals"] if term.get("agentIdentity")}
+    repo_issues = [t for t in issues if t["repo"] == repo]
+    for tree in trees["worktrees"]:
+        branch = (tree["branch"] or "").removeprefix("refs/heads/")
+        if not branch.startswith("task/"):
+            continue
+        # Only hr-relay worktrees link directly to the scheduling repository's issue numbers.
+        linked = tree.get("linkedIssue") if repo == "hr-relay" else None
+        matches = [t for t in repo_issues if t["branch"] == branch or t["number"] == linked]
+        for t in matches:
+            t["occupied"] = True
+            if tree["id"] in agents:
+                t["busy"] = True
+        if not matches and tree["id"] in agents:
+            log("skip", {"branch": branch, "reason": "live worktree has no matching open issue with owned paths"})
+    return {t["handle"] for t in terms["terminals"]}
+
+
+def fill_tick(args, db):
+    import pick
+    repo_path = args.repo_path.resolve()
+    remote = command("git", "-C", str(repo_path), "remote", "get-url", "origin").strip()
+    m = re.fullmatch(r"(?:https://github\.com/|git@github\.com:)julianthant/(hr-relay|dot-agents)(?:\.git)?", remote)
+    if not m:
+        raise OrcaError("target checkout must belong to julianthant/hr-relay or julianthant/dot-agents")
+    repo = m[1]
+    previous = {}
+    if db and db.execute("SELECT name FROM sqlite_master WHERE name='starts'").fetchone():
+        previous = dict(db.execute("SELECT issue,receipt FROM starts"))
+        for n, receipt in previous.items():
+            if receipt == "done":
+                continue
+            try:
+                if receipt is None:
+                    raise OrcaError("legacy reservation without a receipt")
+                if args.dry_run:
+                    raise OrcaError("pending reservation (dry-run)")
+                rec = json.loads(receipt)
+                if not isinstance(rec, dict):
+                    raise ValueError("invalid reservation receipt")
+                if "task" in rec:
+                    actor, run = supervisor(args)
+                    if rec["run"] != run:
+                        raise OrcaError(f"reconcile from its owning Run {rec['run']}")
+                    reconcile_start(db, n, rec, actor)
+                else:
+                    record_start(db, n, rec)
+            except (OrcaError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as e:
+                log("pending", {"issue": n, "reason": str(e)})
+        previous = dict(db.execute("SELECT issue,receipt FROM starts"))
+
+    pending = {}
+    for number, receipt in previous.items():
+        if receipt != "done":
+            try:
+                rec = json.loads(receipt or "{}")
+                pending[number] = rec if isinstance(rec, dict) else {}
+            except ValueError:
+                pending[number] = {}
+
+    def mark_pending(issues):
+        for t in issues:
+            if t["number"] in pending:
+                t["busy"] = True
+        return issues
+
+    issues = mark_pending([t for t in tickets() if t["repo"] == repo])
+    live = inventory(repo_path, issues, repo)
+    refs = set(command("git", "-C", str(repo_path), "for-each-ref", "--format=%(refname:short)",
+                       "refs/heads", "refs/remotes/origin").splitlines())
+    remote_refs = command("git", "-C", str(repo_path), "ls-remote", "--heads", "origin")
+    heads = {line.split()[1] for line in remote_refs.splitlines()}
+    for t in issues:
+        t["skip"] = []
+        if t.get("occupied"):
+            t["skip"].append("existing worktree")
+        if t["number"] in previous:
+            t["skip"].append("reserved or completed")
+        if t["branch"] in refs or "origin/" + (t["branch"] or "") in refs or "refs/heads/" + (t["branch"] or "") in heads:
+            t["skip"].append("task branch exists")
+        if not t["base"] or "refs/heads/" + t["base"].removeprefix("origin/") not in heads:
+            t["skip"].append("base missing on origin")
+    cfg = pick.account_usage.load_config()
+    holds_path = (args.holds or pick.HOLDS).resolve()
+
+    def seat(route, extra, handles=live, reservations=pending.copy()):
+        holds = json.loads(holds_path.read_text()) if holds_path.exists() else {}
+        held = [h for handle, h in holds.items() if handle in handles and h["host"] == "local"]
+        for rec in reservations.values():
+            if rec.get("route") and rec.get("account") and not (rec.get("terminal") in handles and rec["terminal"] in holds):
+                agent, model, effort = rec["route"][:3]
+                held.append(dict(account=rec["account"], agent=agent, model=model, effort=effort))
+        # pick.live_holds prunes the real file; use the read-only snapshot for planning.
+        return pick.pick(cfg, *route[:3], "local", time.time(), holds=held + extra)
+
+    count = 0
+    for ticket, acct in fill_plan(issues, seat, args.issue):
+        route, n = ticket["route"], ticket["number"]
+        log("would start" if args.dry_run else "start", dict(issue=n, repo=repo, branch=ticket["branch"],
+            base=ticket["base"], agent=route[0], model=route[1], effort=route[2], advisor=route[3], account=acct["label"]))
+        if not args.dry_run:
+            # Refresh GitHub, ownership and the picker immediately before committing to side effects.
+            current = mark_pending([t for t in tickets() if t["repo"] == repo])
+            latest = inventory(repo_path, current, repo)
+            candidate = next(fill_plan(current, lambda r, extra: seat(r, extra, latest, pending), n), None)
+            if not candidate or candidate[0].get("occupied") or candidate[1]["id"] != acct["id"] or any(
+                candidate[0][k] != ticket[k] for k in ("branch", "base", "route", "paths", "item")):
+                raise OrcaError(f"#{n} readiness or seat changed")
+            ref = "refs/heads/" + ticket["base"].removeprefix("origin/")
+            wanted = "refs/heads/" + ticket["branch"]
+            command("git", "-C", str(repo_path), "fetch", "--no-tags", "origin",
+                    ref + ":refs/remotes/" + ticket["base"])
+            latest_refs = command("git", "-C", str(repo_path), "ls-remote", "--heads", "origin", ref, wanted)
+            sha = command("git", "-C", str(repo_path), "rev-parse", "--verify", ticket["base"]).strip()
+            if latest_refs.split() != [sha, ref]:
+                raise OrcaError(f"#{n} base changed or task branch already exists on origin")
+            try:
+                launch(db, repo_path, dict(ticket, sha=sha), acct, args, holds_path)
+            except (OrcaError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as e:
+                if not db or not db.execute("SELECT name FROM sqlite_master WHERE name='starts'").fetchone():
+                    raise
+                row = db.execute("SELECT receipt FROM starts WHERE issue=?", (n,)).fetchone()
+                if not row or row[0] == "done":
+                    raise
+                pending[n] = json.loads(row[0])
+                log("pending", {"issue": n, "reason": str(e)})
+                continue
+        count += 1
+    if not count:
+        log("fill", "no eligible start")
+
+
+def supervisor(args):
+    actor = []
+    if args.anchor or args.run:
+        pane = any(k.startswith(("ORCA_AGENT_", "ORCA_TERMINAL_", "ORCA_PANE_", "ORCA_WORKTREE_",
+                                 "ORCA_WORKSPACE_", "ORCA_TAB_", "ORCA_RUNTIME_SOURCE_")) for k in os.environ)
+        if not args.anchor or not args.run or pane:
+            raise OrcaError("an explicit supervisor anchor and Run are for a pane-less invocation only")
+        current = runtime("orchestration", "run-current", "--from", args.anchor)
+        if current["runId"] != args.run:
+            raise OrcaError("supervisor anchor is not bound to the configured Run")
+        actor = ["--from", args.anchor, "--run", args.run]
+    else:
+        if not os.environ.get("ORCA_TERMINAL_HANDLE"):
+            raise OrcaError("launch from the coordinating Run, or configure its launchd anchor and Run")
+        current = runtime("orchestration", "run-current")
+        if not current.get("runId"):
+            raise OrcaError("launch requires a coordinating Run")
+    return actor, current["runId"]
+
+
+def configure_codex_notice(path):
+    config = path / ".codex/config.toml"
+    if config.parent.is_symlink() or config.is_symlink():
+        raise OrcaError("Codex config points outside its worktree")
+    old = config.read_text() if config.exists() else ""
+    expected = tomllib.loads(old)
+    key = "hide_rate_limit_model_nudge"
+    notice = expected.setdefault("notice", {})
+    if notice.get(key) is True:
+        return
+    notice[key] = True
+    # Accept an edit only if it changes exactly one parsed setting.
+    dotted = "notice." + key + " = true"
+    candidates = [
+        re.sub(r"(?m)^(\s*(?:notice\.)?hide_rate_limit_model_nudge\s*=\s*)false\b", r"\g<1>true", old),
+        re.sub(r"(?m)^(\s*\[notice\][^\n]*)$", r"\1\n" + key + " = true", old),
+        re.sub(r"(\bhide_rate_limit_model_nudge\s*=\s*)false\b", r"\g<1>true", old),
+        re.sub(r"(?m)^(\s*notice\s*=\s*\{)([^}]*)(\})",
+               lambda m: m[1] + key + " = true" + (", " if m[2].strip() else "") + m[2] + m[3], old),
+        dotted + "\n" + old,
+    ]
+    for content in candidates:
+        try:
+            if tomllib.loads(content) != expected:
+                continue
+        except tomllib.TOMLDecodeError:
+            continue
+        config.parent.mkdir(exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", dir=config.parent, delete=False) as f:
+            f.write(content)
+            if config.exists():
+                os.fchmod(f.fileno(), config.stat().st_mode & 0o777)
+        os.replace(f.name, config)
+        return content
+    log("Codex notice", "preserved existing config layout; forward any model-switch prompt")
+
+
+def worker_settings(path, route):
+    if route[0] == "codex":
+        settings = path / ".codex/config.toml"
+    elif route[3]:
+        settings = path / ".claude/settings.local.json"
+    else:
+        return None
+    if settings.parent.is_symlink() or settings.is_symlink():
+        raise OrcaError("worker setting points outside the worktree")
+    before = settings.read_bytes() if settings.exists() else None
+    if route[0] == "codex":
+        written = configure_codex_notice(path)
+        if written is None:
+            return None
+    else:
+        config = json.loads(before) if before is not None else {}
+        config["advisorModel"] = route[3]
+        written = json.dumps(config) + "\n"
+        settings.parent.mkdir(exist_ok=True)
+        settings.write_text(written)
+    return settings, before, written.encode()
+
+
+def remove_prelaunch_tree(repo, wt, existing_refs, settings_change):
+    path = Path(wt["path"]).resolve()
+    ref = "refs/heads/" + wt["branch"].removeprefix("refs/heads/")
+    sha = wt.get("head")
+    if not sha or ref in existing_refs or wt.get("isMainWorktree") or path == repo.resolve():
+        raise OrcaError("unverified worktree ownership")
+    trees = command("git", "-C", str(repo), "worktree", "list", "--porcelain", "-z").split("\0\0")
+    expected = ["worktree " + str(path), "HEAD " + sha, "branch " + ref]
+    if not any(tree.split("\0")[:3] == expected for tree in trees[1:]):
+        raise OrcaError("checkout moved or has a different commit")
+    if settings_change:
+        settings, before, written = settings_change
+        if settings.parent.is_symlink() or settings.is_symlink() or settings.read_bytes() != written:
+            raise OrcaError("worker settings changed since preparation")
+        if before is None:
+            settings.unlink()
+        else:
+            settings.write_bytes(before)
+    if command("git", "-C", str(path), "status", "--porcelain", "--untracked-files=all", "--ignored"):
+        raise OrcaError("worktree contains local changes")
+    removed = runtime("worktree", "rm", "--worktree", "id:" + wt["id"])
+    if not removed.get("removed") or path.exists():
+        raise OrcaError("worktree removal not confirmed")
+    left = command("git", "-C", str(repo), "for-each-ref", "--format=%(objectname) %(worktreepath)", ref)
+    if left:
+        if left.rstrip("\n") != sha + " ":
+            raise OrcaError("branch moved or is checked out elsewhere")
+        command("git", "-C", str(repo), "update-ref", "-d", ref, sha)
+
+
+def launch(db, repo_path, t, acct, args, holds_path):
+    project, fields, waiting_field = project_fields()
+    number, route = t["number"], t["route"]
+    spec = (HERE.parent / "references/coder-spec.md").read_text().format(**t)
+    actor, run = supervisor(args)
+    if db.execute("SELECT name FROM sqlite_master WHERE name='starts'").fetchone() and db.execute(
+            "SELECT 1 FROM starts WHERE issue=?", (number,)).fetchone():
+        raise OrcaError(f"issue #{number} already reserved")
+    branch = t["branch"]
+    existing_refs = set(command("git", "-C", str(repo_path), "for-each-ref", "--format=%(refname)", "refs/heads").splitlines())
+    wt = runtime("worktree", "create", "--repo", "path:" + str(repo_path), "--name", branch[5:].replace("/", "."),
+                 "--branch", branch, "--base-branch", t["base"], "--no-parent", "--setup", "skip")["worktree"]
+    path = Path(wt["path"])
+    settings_change = None
+    try:
+        actual_branch = command("git", "-C", str(path), "branch", "--show-current").strip()
+        if wt["branch"].removeprefix("refs/heads/") != branch or actual_branch != branch:
+            raise OrcaError("created worktree does not own the requested branch")
+        if command("git", "-C", str(path), "rev-parse", "HEAD").strip() != t["sha"]:
+            raise OrcaError("created worktree has a different base commit")
+        settings_change = worker_settings(path, route)
+        runtime("account", "select", "--agent", route[0], "--account", acct["id"])
+        task = runtime("orchestration", "task-create", *actor, "--task-title", f"#{number} coder",
+                       "--spec", spec, "--full")["task"]["id"]
+        selected = runtime("account", "list")[route[0]]["activeAccountId"]
+        if selected != acct["id"]:
+            raise OrcaError(f"selected account changed before worker start; inspect prepared Task {task}")
+        rec = dict(task=task, run=run, worktree=wt["id"], account=acct["id"], label=acct["label"],
+                   route=route, project=project, item=t["item"], fields=fields, time=int(time.time()),
+                   holds=str(holds_path), waiting_field=waiting_field)
+        # The fill lock covers preparation. A durable Task identity precedes the only start call.
+        reserve(db, number, rec)
+    except Exception:
+        try:
+            remove_prelaunch_tree(repo_path, wt, existing_refs, settings_change)
+        except (OSError, OrcaError, subprocess.TimeoutExpired) as cleanup_error:
+            log("prelaunch cleanup", {"issue": number, "worktree": wt["path"], "reason": str(cleanup_error)})
+        raise
+    try:
+        started = runtime("orchestration", "worker-start", *actor, "--task", task, "--worktree", "path:" + str(path),
+                          "--agent", route[0], "--model", route[1], "--effort", route[2], "--keep-open", "--full")
+        if started.get("dispatchId"):
+            rec["dispatch"] = started["dispatchId"]
+            terminal = started.get("terminal") or started.get("agentTerminalHandle")
+            rec["terminal"] = terminal.get("handle") if isinstance(terminal, dict) else terminal
+            with db:
+                db.execute("UPDATE starts SET receipt=? WHERE issue=?", (json.dumps(rec), number))
+    except StartNotApplied as e:
+        with db:
+            db.execute("DELETE FROM starts WHERE issue=?", (number,))
+        raise OrcaError(f"#{number}: Orca confirmed no start effects; inspect prepared worktree {path}: {e}") from e
+    except (OrcaError, OSError, ValueError, subprocess.TimeoutExpired) as e:
+        log("start receipt unavailable", {"issue": number, "task": task, "reason": str(e)})
+    reconcile_start(db, number, rec, actor)
+
+
+def codex_prompt(tail):
+    for index in reversed(range(len(tail))):
+        if re.match(r"^\s*(?:hooks need review\b|switch model\?|approaching rate limits\s*$)", tail[index], re.I):
+            choices = []
+            for line in tail[index + 1:]:
+                if re.match(r"^\s*[›❯>]?\s*\d+[.)] ", line):
+                    choices.append(line)
+                elif line.strip():
+                    break
+            if tail[index].strip().lower() != "approaching rate limits" or choices:
+                return "\n".join([tail[index], *choices])
+    return None
+
+
+def reconcile_start(db, number, rec, actor):
+    task = rec["task"]
+    try:
+        lookup = runtime("orchestration", "dispatch-show", "--task", task, "--full")
+        dispatch_id = (lookup.get("dispatch") or {}).get("id")
+        if not dispatch_id:
+            raise OrcaError("no Dispatch is visible")
+        show = runtime("orchestration", "worker-show", "--dispatch", dispatch_id, "--full")
+    except (OrcaError, OSError, ValueError, subprocess.TimeoutExpired) as e:
+        raise OrcaError(f"#{number} reserved: inspect Task {task} in Run {rec['run']}: {e}") from e
+    dispatch = show["dispatch"]
+    worker = show.get("worker") or {}
+    if (dispatch["id"] != dispatch_id or dispatch["taskId"] != task or dispatch["runId"] != rec["run"]
+            or worker.get("worktreeId") != rec["worktree"]):
+        raise OrcaError(f"#{number} reserved: unverified worker for Task {task}")
+    terminal = dispatch.get("assigneeHandle")
+    if dispatch.get("retryOfDispatchId") or (rec.get("dispatch") and rec["dispatch"] != dispatch_id):
+        raise OrcaError(f"#{number} reserved: Task {task} has a different attempt; inspect {dispatch_id}")
+    if rec.get("terminal") and rec["terminal"] != terminal:
+        raise OrcaError(f"#{number} reserved: assignee changed for Dispatch {dispatch_id}")
+    resource = (show.get("projection") or {}).get("resource") or {}
+    released_failure = worker["state"] == "failed" and resource.get("terminalState") == "released"
+    if released_failure or dispatch.get("status") == "completed":
+        if terminal and (show.get("terminal") or {}).get("handle") == terminal and not released_failure:
+            record_hold(dict(rec, terminal=terminal))
+        log("already settled", {"issue": number, "task": task, "dispatch": dispatch_id, "state": worker["state"]})
+        with db:
+            db.execute("UPDATE starts SET receipt='done' WHERE issue=?", (number,))
+        return
+    if not terminal:
+        raise OrcaError(f"#{number} reserved: inspect {dispatch_id}, worker state {worker['state']}")
+    rec = dict(rec, terminal=terminal, dispatch=dispatch_id)
+    if rec["route"][0] == "codex":
+        observed_terminal = show.get("terminal") or {}
+        observation = show.get("observation") or {}
+        wait = observation.get("agentWait") or observed_terminal.get("agentWait")
+        prompt = None
+        if observed_terminal:
+            if observed_terminal.get("handle") != terminal:
+                raise OrcaError(f"#{number} reserved: worker terminal identity changed")
+            tail = runtime("terminal", "read", "--terminal", terminal, "--screen")["terminal"]["tail"]
+            prompt = codex_prompt(tail)
+        if not observed_terminal and "agentWait" not in observation:
+            raise OrcaError(f"#{number} reserved: no Codex startup observation for {dispatch_id}")
+        if prompt or wait:
+            record_hold(rec)
+            notice = {"issue": number, "task": task, "dispatch": dispatch_id, "prompt": prompt or wait}
+            if rec.get("notice") != notice:
+                runtime("orchestration", "send", *actor, "--to", "run:" + rec["run"], "--type", "status",
+                        "--subject", f"#{number} waiting for operator input", "--body", json.dumps(notice, ensure_ascii=False))
+                rec.update(notice=notice, waiting_card=False)
+                with db:
+                    db.execute("UPDATE starts SET receipt=? WHERE issue=?", (json.dumps(rec), number))
+            if not rec.get("waiting_card"):
+                field, option = rec.get("waiting_field") or project_fields()[2]
+                command("gh", "project", "item-edit", "--project-id", rec["project"], "--id", rec["item"],
+                        "--field-id", field, "--single-select-option-id", option)
+                with db:
+                    db.execute("UPDATE starts SET receipt=? WHERE issue=?",
+                               (json.dumps(dict(rec, waiting_card=True)), number))
+            log("waiting for operator input", notice)
+            return
+    if worker["state"] != "ready":
+        raise OrcaError(f"#{number} reserved: inspect {dispatch_id}, worker state {worker['state']}")
+    record_start(db, number, rec)
+    log("started", {"issue": number, "dispatch": dispatch_id})
+
+
+def fill(args):
+    import fcntl
+    state = Path.home() / ".local/state/dev-auto"
+    path = state / "starts.sqlite"
+    if args.dry_run:
+        if path.exists():
+            with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as db:
+                return fill_tick(args, db)
+        return fill_tick(args, None)
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (state / "fill.lock").open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if getattr(args, "release", None) is not None:
+                raise OrcaError("another tick is active; retry release after it finishes")
+            log("fill", "another tick is active")
+            return
+        with sqlite3.connect(path) as db:
+            if getattr(args, "release", None) is not None:
+                deleted = 0
+                if db.execute("SELECT name FROM sqlite_master WHERE name='starts'").fetchone():
+                    with db:
+                        deleted = db.execute("DELETE FROM starts WHERE issue=? AND receipt IS NOT 'done'",
+                                             (args.release,)).rowcount
+                log("released" if deleted else "no pending reservation", {"issue": args.release})
+                return
+            fill_tick(args, db)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -312,7 +966,24 @@ def main(argv=None):
     s.add_argument("--repo", required=True)
     s.add_argument("--state", required=True)
     sub.add_parser("resume").add_argument("--state", required=True)
+    f = sub.add_parser("fill")
+    f.add_argument("--dry-run", action="store_true")
+    f.add_argument("--repo-path", type=Path, help="registered target repository checkout")
+    f.add_argument("--release", type=int, help="release one pending reservation after inspecting its Task, then exit")
+    f.add_argument("--issue", type=int, help="restrict the tick to one issue")
+    f.add_argument("--holds", type=Path, help="existing fleet picker's holds.json when testing from a worktree")
+    f.add_argument("--anchor", help="pane-less supervisor anchor from #549")
+    f.add_argument("--run", help="Run already bound to that anchor")
     args = ap.parse_args(argv)
+    if args.cmd == "fill":
+        if args.release is None and not args.repo_path:
+            f.error("fill requires --repo-path unless releasing a reservation")
+        if args.release is not None and (args.release <= 0 or args.dry_run or args.issue is not None):
+            f.error("--release requires a positive issue number and cannot combine with --issue or --dry-run")
+        try:
+            return fill(args)
+        except (OSError, OrcaError, ValueError, subprocess.TimeoutExpired) as e:
+            ap.exit(1, f"fill: {e}\n")
     start(args.repo, args.state) if args.cmd == "start" else resume(args.state)
 
 

@@ -790,6 +790,33 @@ with TemporaryDirectory() as tmp, patch.object(pick, "HOLDS", Path(tmp) / "holds
     tick.review_step(sqlite3.connect(":memory:"), "run", [], ticket, state, [recorded])
     assert card.call_args.args[1:] == ("Fixing", "coder gpt-6.2-sol medium @fresh")
 
+# A manual retry on a new pane, with review state already saved, is recognized by its retry lineage and
+# refreshes the card from its own hold; another Task's report on a third pane is ignored.
+ticket, state = review_fixture()
+state.update(coder_terminal="pane-old")
+retried = dict(report("retry", "red at the old head", msg_id="retry-report"), from_handle="pane-new", sequence=3)
+stranger = dict(report("other", "unrelated", msg_id="other-report"), from_handle="pane-x", sequence=2,
+                payload=json.dumps({"taskId": "other-task", "dispatchId": "other", "outcome": "succeeded"}))
+def lineage(*args):
+    if args[:2] == ("orchestration", "worker-show"):
+        return {"dispatch": {"id": args[3], "runId": "run", "taskId": "task",
+                             "retryOfDispatchId": {"retry": "coder"}.get(args[3]), "followUpOf": None}}
+    assert args[:2] == ("orchestration", "send") and "dispatch:retry" in args, args
+    return {"delivery": "follow_up", "followUpOf": "retry", "dispatchId": "fix"}
+db = sqlite3.connect(":memory:")
+db.execute("CREATE TABLE review_mail (run TEXT, id TEXT, PRIMARY KEY(run,id))")
+db.execute("INSERT INTO review_mail VALUES ('run','report')")
+with TemporaryDirectory() as tmp, patch.object(pick, "HOLDS", Path(tmp) / "holds.json"), \
+        patch.object(tick, "green_report", return_value=None), patch.object(tick, "review_card") as card, \
+        patch.object(tick, "runtime", side_effect=lineage) as cli:
+    pick.HOLDS.write_text(json.dumps({"pane-old": {"label": "old", "host": "local"},
+                                      "pane-new": {"label": "fresh", "host": "local"}}))
+    tick.review_step(db, "run", [], ticket, state, [recorded, stranger, retried])
+    assert card.call_args.args[1:] == ("Fixing", "coder gpt-6.2-sol medium @fresh")
+    saved = tick.review_state(db, "run", 41)
+    assert (saved["coder"], saved["coder_terminal"]) == ("fix", "pane-new")
+    assert not any("other" in call.args for call in cli.call_args_list)
+
 # A reviewer's failed worker_done needs the operator, unless watch is restarting it from a handoff.
 for handoff in (False, True):
     ticket, state = review_fixture()

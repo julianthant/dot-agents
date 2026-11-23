@@ -282,7 +282,7 @@ def in_coder_chain(dispatch, previous, run):
         attempt = runtime("orchestration", "worker-show", "--dispatch", dispatch, "--full")["dispatch"]
         if attempt["id"] != dispatch or attempt["runId"] != run:
             break
-        dispatch = attempt.get("followUpOf")
+        dispatch = attempt.get("retryOfDispatchId") or attempt.get("followUpOf")
     return False
 
 
@@ -1062,21 +1062,27 @@ def failed_reviews(db, run, state, messages):
             and mail_payload(m).get("dispatchId") == state["expected"]]
 
 
-def latest_coder_report(state, run, messages):
+def latest_coder_report(state, run, messages, handled=()):
     reports = review_mail(messages, state["coder"])
     latest = reports[-1] if reports else {}
     terminal = latest.get("from_handle") or state.get("coder_terminal")
-    if terminal:
-        for message in sorted(messages, key=lambda m: m["sequence"], reverse=True):
-            if latest and message["sequence"] <= latest["sequence"]:
-                break
-            if message["type"] != "worker_done" or message.get("from_handle") != terminal:
+    task = None
+    for message in sorted(messages, key=lambda m: m["sequence"], reverse=True):
+        if latest and message["sequence"] <= latest["sequence"]:
+            break
+        payload = mail_payload(message) if message["type"] == "worker_done" else {}
+        dispatch = payload.get("dispatchId")
+        if payload.get("outcome") != "succeeded" or dispatch == state["coder"] or message["id"] in handled:
+            continue
+        if not terminal or message.get("from_handle") != terminal:
+            # A manual retry on a new pane keeps the coder's Task.
+            task = task or runtime("orchestration", "worker-show", "--dispatch", state["coder"], "--full")["dispatch"]["taskId"]
+            if payload.get("taskId") != task:
                 continue
-            payload = mail_payload(message)
-            dispatch = payload.get("dispatchId")
-            if payload.get("outcome") == "succeeded" and in_coder_chain(dispatch, state["coder"], run):
-                state["coder"] = state["expected"] = dispatch
-                return [message]
+        if in_coder_chain(dispatch, state["coder"], run):
+            state["coder"] = state["expected"] = dispatch
+            state["coder_terminal"] = message.get("from_handle") or terminal
+            return [message]
     return [latest] if latest else []
 
 
@@ -1303,7 +1309,8 @@ def review_step(db, run, actor, ticket, initial, messages):
     db.execute("CREATE TABLE IF NOT EXISTS review_mail (run TEXT, id TEXT, PRIMARY KEY(run,id))")
     reports = (sorted(review_mail(messages, state["expected"]) + failed_reviews(db, run, state, messages),
                       key=lambda m: m["sequence"]) if state["stage"] == "Reviewing"
-               else latest_coder_report(state, run, messages))
+               else latest_coder_report(state, run, messages,
+                                        {i for (i,) in db.execute("SELECT id FROM review_mail WHERE run=?", (run,))}))
     for message in reports:
         if not db.execute("SELECT 1 FROM review_mail WHERE run=? AND id=?", (run, message["id"])).fetchone():
             break

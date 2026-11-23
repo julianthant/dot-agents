@@ -337,9 +337,13 @@ with TemporaryDirectory() as tmp:
     cancel_fails = False
     active, selects = ["coord"], []  # the coordinator bot's Codex account
     restore_fails = [False]
+    task_fails = [False]
     def recovery_runtime(*argv):
         verb = argv[:2]
         operations.append(verb)
+        if verb == ("orchestration", "task-create") and task_fails[0]:
+            task_fails[0] = False
+            raise tick.OrcaError("task store down")
         if verb == ("account", "select"):
             if restore_fails[0] and argv[-1] == "coord":
                 restore_fails[0] = False
@@ -427,6 +431,17 @@ with TemporaryDirectory() as tmp:
             check.assertEqual(db.execute("SELECT count(*) FROM starts").fetchone(), (0,))
             check.assertEqual((selects[-1], active), ("coord", ["coord"]))
             check.assertNotIn(("orchestration", "dispatch-show"), operations)
+            # Task creation and the restore both fail: the restore was owed before the selection, so the next fill
+            # gives the coordinator its account back without a Task or Dispatch.
+            task_fails[0] = restore_fails[0] = True
+            with check.assertRaisesRegex(tick.OrcaError, "task store down; restore the coordinator's Codex account coord"):
+                tick.launch(db, root, codex_ticket, account, args, holds)
+            check.assertEqual(active, ["seat"])
+            check.assertEqual(json.loads(db.execute("SELECT receipt FROM starts").fetchone()[0]),
+                              {"not_applied": True, "coordinator": "coord"})
+            tick.fill_tick(args, db)
+            check.assertEqual(db.execute("SELECT count(*) FROM starts").fetchone(), (0,))
+            check.assertEqual((selects[-1], active), ("coord", ["coord"]))
             operations.clear()
             refused = False
             with check.assertRaisesRegex(tick.OrcaError, "fixture-task"):
@@ -563,6 +578,39 @@ with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory
     start.assert_called_once()
     check.assertEqual(picker.call_args.kwargs["holds"][0]["account"], "held")
     check.assertEqual(db.execute("SELECT issue FROM starts").fetchall(), [(40,)])
+
+# A Codex start whose reply was lost still owes the coordinator's account: no other Codex selection in the
+# same pass can record the worker's seat as the coordinator's. A Claude start does not touch that account.
+with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory:") as db:
+    root = Path(tmp)
+    first = dict(ticket, number=60, branch="task/a/first", paths=["src/first"], route=base["route"])
+    second = dict(ticket, number=61, branch="task/a/second", paths=["src/second"], route=base["route"])
+    claude = dict(ticket, number=62, branch="task/a/claude", paths=["src/claude"])
+    args = SimpleNamespace(repo_path=root, dry_run=False, issue=None, holds=root / "holds.json")
+    def lost(db, repo, t, acct, args, holds):
+        if t["number"] == 60:
+            tick.reserve(db, 60, {"task": "t60", "run": "own", "coordinator": "coord"})
+            raise tick.OrcaError("timed out")
+    stack.enter_context(patch.object(tick, "command", git))
+    stack.enter_context(patch.object(tick, "tickets", side_effect=lambda: [dict(t) for t in (first, second, claude)]))
+    stack.enter_context(patch.object(tick, "inventory", return_value=set()))
+    stack.enter_context(patch.object(pick.account_usage, "load_config", return_value={}))
+    stack.enter_context(patch.object(pick, "pick", return_value=(account, [])))
+    start = stack.enter_context(patch.object(tick, "launch", side_effect=lost))
+    output = stack.enter_context(redirect_stdout(io.StringIO()))
+    tick.fill_tick(args, db)
+    check.assertEqual([c.args[2]["number"] for c in start.call_args_list], [60, 62])
+    check.assertIn("coordinator restore still owed by ['starts:60']", output.getvalue())
+
+# A full start receipt confirms the launch: the coordinator is restored even when dispatch-show is unavailable.
+with sqlite3.connect(":memory:") as db, patch.object(tick, "restore_coordinator") as restore, \
+        patch.object(tick, "runtime", side_effect=tick.OrcaError("Orca busy")):
+    rec = {"task": "t", "run": "run", "dispatch": "d", "terminal": "term", "coordinator": "coord"}
+    tick.reserve(db, 63, rec)
+    with check.assertRaisesRegex(tick.OrcaError, "Orca busy"):
+        tick.reconcile_start(db, 63, dict(rec), [])
+    restore.assert_called_once_with("coord")
+    check.assertNotIn("coordinator", json.loads(db.execute("SELECT receipt FROM starts").fetchone()[0]))
 
 # Release is its own operation and only clears the inspected pending issue, giving the coordinator its account back.
 with TemporaryDirectory() as tmp, patch.object(Path, "home", return_value=Path(tmp)), patch.object(tick, "fill_tick") as fill, \
@@ -804,6 +852,25 @@ with patch.object(tick, "green_report", return_value=sha), patch.object(tick, "w
                        full_start("reader", "pane"), {}, {"codex": {"activeAccountId": "coord"}}]
     tick.review_step(sqlite3.connect(":memory:"), "run", [], ticket, state, [recorded])
     assert [c.args[-1] for c in cli.call_args_list if c.args[:2] == ("account", "select")] == ["seat", "coord"]
+
+# A watch restart, or a reviewer of the same issue in another Run, still owes the coordinator's account:
+# the Codex reviewer waits, and the report is read again later.
+for table, owner, key in (("watch", "pane", "watch:run:pane"), ("reviews", 41, "reviews:other:41")):
+    ticket, state = review_fixture()
+    ticket["body"] = "Reviewer: codex / gpt-6.2-astra / medium"
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE watch (run TEXT, terminal TEXT, state TEXT, PRIMARY KEY(run,terminal))")
+    tick.review_state(db, "run", 41)
+    db.execute(f"INSERT INTO {table} VALUES (?,?,?)",
+               ("run" if table == "watch" else "other", owner, json.dumps({"coordinator": "coord"})))
+    with patch.object(tick, "green_report", return_value=sha), patch.object(tick, "review_account") as seat_pick, \
+            patch.object(tick, "review_card") as card, patch.object(tick, "runtime") as cli, redirect_stdout(io.StringIO()) as out:
+        tick.review_step(db, "run", [], ticket, state, [recorded])
+        cli.assert_not_called()
+        seat_pick.assert_not_called()
+        card.assert_not_called()
+        assert f"coordinator restore still owed by ['{key}']" in out.getvalue(), out.getvalue()
+        assert not db.execute("SELECT * FROM review_mail").fetchall()
 
 # The coordinator gets its account back even when the reviewer's card write fails, or when a lost start is adopted.
 for lose_start in (False, True):
@@ -1205,7 +1272,8 @@ with patch.object(tick, "runtime", side_effect=ancestry), patch.object(tick, "gr
     assert sha in verify.call_args.args[1]
 
 def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncertain=False, remote_race=False,
-                  release_unknown=False, ticks=1, card_fails=False, send_lost=False):
+                  release_unknown=False, ticks=1, card_fails=False, send_lost=False, rewritten=False, pre_upgrade=None,
+                  rollback=False):
     root = Path(tmp)
     path = str(root / "task-tree")
     branch = "task/dev-auto/example"
@@ -1232,8 +1300,10 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
     tree = dict(id=worktree, path=path, branch=ref, isMainWorktree=False)
     present = True
     mailbox = []
+    applied = {}  # Orca's recorded send results by request id
     local_ref = sha
     remote_present = remote_race
+    pending = "held\nOriginal body:\nkept" if pre_upgrade == "original" else None  # a reason with the wrapper's line
 
     def cli(*args):
         nonlocal local_ref, remote_present
@@ -1267,6 +1337,12 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
             return ""
         raise AssertionError(args)
 
+    def rejected(subject, body):
+        # The shape recorded from a rejected escalation on 2026-11-23.
+        return {"type": "status", "subject": "Rejected escalation: " + subject,
+                "body": "Orca rejected this escalation: No active Dispatch belongs to this message sender.\n\n"
+                        "Original body:\n" + body}
+
     def orca(*args):
         nonlocal present
         events.append(args)
@@ -1282,7 +1358,7 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
                         {"kind": "terminal", "role": "agent", "action": "reused", "id": "term_coder"}]}}
         if args[:2] == ("orchestration", "worker-release"):
             if release_uncertain and args[3] == "ctx_review":
-                return {"state": "release_pending"}
+                return {"state": "release_pending", "reason": pending}
             if release_unknown and args[3] == "ctx_review":
                 # After a restart the recorded handle no longer resolves; the CLI exits 1 for release_unknown.
                 raise tick.OrcaError('orca orchestration failed: {"ok": true, "result": {"state": "release_unknown"}}')
@@ -1298,11 +1374,20 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
             present = False
             return {"removed": True}
         if args[:2] == ("orchestration", "send"):
-            if send_lost and not mailbox:
-                mailbox.append({"subject": args[args.index("--subject") + 1], "body": args[args.index("--body") + 1]})
+            request = args[args.index("--retry-request") + 1] if "--retry-request" in args else None
+            if request in applied:
+                return applied[request]  # Orca replays an applied request
+            subject, body = args[args.index("--subject") + 1], args[args.index("--body") + 1]
+            mailbox.append(rejected(subject, body) if rewritten else
+                           {"type": args[args.index("--type") + 1], "subject": subject, "body": body})
+            if request:
+                applied[request] = {}
+            if send_lost and len(applied) == 1:
                 raise tick.OrcaError("timed out")  # Orca accepted it; the reply is lost
             return {}
         if args[:2] == ("orchestration", "inbox"):
+            if pre_upgrade == "unlisted":
+                return {"messages": [], "truncated": True}  # the notice is past the listing's end
             return {"messages": mailbox}
         raise AssertionError(args)
 
@@ -1312,12 +1397,44 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
                          ("stage", "coding"), ("agent", None)], ("stage", "needs"))), \
             patch.object(tick, "runtime", side_effect=orca), patch.object(tick, "command", side_effect=cli), \
             redirect_stdout(io.StringIO()) as output:
+        if pre_upgrade:
+            # A notice recorded before requests were saved, in the table's pre-upgrade shape.
+            reason = f"ctx_review: release unconfirmed (release_pending, {pending})"
+            db.execute("CREATE TABLE close_notice (run TEXT, issue INTEGER, reason TEXT, sent INTEGER, carded INTEGER,"
+                       " PRIMARY KEY(run,issue))")
+            db.execute("INSERT INTO close_notice VALUES ('run', 41, ?, 0, 0)", (reason,))
+            db.commit()
+            # Another issue's notice, or a status whose subject only ends in this one's, may carry this reason.
+            legacy = {"foreign": "#141", "foreign_wrapped": "#141", "prefixed": "Fwd: #41"}.get(pre_upgrade, "#41")
+            legacy += ": Needs you after close"
+            if pre_upgrade in ("rewritten", "foreign_wrapped"):
+                mailbox.append(rejected(legacy, reason))
+            elif pre_upgrade != "unsent":
+                # An older blocked state's notice carries that state's error.
+                mailbox.append({"type": "status", "subject": legacy,
+                                "body": "worktree contains local changes or untracked files" if pre_upgrade == "other"
+                                else reason})
+        unconfirmed = 0
         for _ in range(ticks):
             try:
                 tick.close_tick(args, db)
-            except tick.OrcaError:
-                assert card_fails or send_lost  # a later tick retries only the unconfirmed step
-    assert [event[3] for event in events if event[:2] == REL] == ["ctx_merge", "ctx_review", "ctx_initial"] * ticks
+            except tick.OrcaError as e:
+                unconfirmed += "incomplete Run mailbox" in str(e)
+                # A later tick retries only the unconfirmed step.
+                assert card_fails or send_lost or pre_upgrade == "unlisted"
+        if rollback:
+            # A tick from before request ids records a later state, then stops after its send.
+            old = "worktree contains local changes or untracked files"
+            db.execute("INSERT OR REPLACE INTO close_notice VALUES (?,?,?,0,0)", ("run", 41, old))
+            assert db.execute("SELECT reason,sent,carded FROM close_notice WHERE run=? AND issue=?",
+                              ("run", 41)).fetchone() == (old, 0, 0)
+            mailbox.append({"type": "status", "subject": "#41: Needs you after close", "body": old})
+            release_uncertain = False  # the next tick blocks on that state
+            tick.close_tick(args, db)
+        notice = db.execute("SELECT sent,carded,request FROM close_notice LEFT JOIN close_request USING (run,issue,reason)"
+                            " WHERE run='run' AND issue=41").fetchone()
+    assert [event[3] for event in events if event[:2] == REL] == ["ctx_merge", "ctx_review", "ctx_initial"] * (
+        ticks + rollback)
     expected_holds = {"term_other", "term_reviewer"} if release_uncertain else {"term_other"}
     assert set(json.loads(holds.read_text())) == expected_holds
     edits = [event[-3:] for event in events if event[:3] == ("gh", "project", "item-edit")]
@@ -1327,18 +1444,39 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
         assert any(event[0] == "git" and event[3] == "push" for event in events) == remote_race
     else:
         assert present and local_ref == sha
-        assert edits == [("stage", "--single-select-option-id", "needs")] * (2 if card_fails else 1)
+        assert edits == [("stage", "--single-select-option-id", "needs")] * (2 if card_fails or rollback else 1)
         assert "Needs you" in output.getvalue()
+        # One notice in the Run's mailbox, pre-upgrade or new, besides an older state's notice.
+        assert len(mailbox) == (2 if rollback or pre_upgrade in ("other", "foreign", "foreign_wrapped", "prefixed")
+                                else 1), mailbox
         sends = [event for event in events if event[:2] == ("orchestration", "send")]
-        assert len(sends) == 1 and all("--type" in e and e[e.index("--type") + 1] == "status"
-                             and e[e.index("--to") + 1] == "run:run" for e in sends), sends
+        assert all("--type" in e and e[e.index("--type") + 1] == "status"
+                   and e[e.index("--to") + 1] == "run:run" for e in sends), sends
+        assert all("--retry-request" in e for e in sends), sends
+        assert len({e[e.index("--retry-request") + 1] for e in sends}) <= 1, sends
+        if rollback:
+            assert len(sends) == 1 and notice == (1, 1, None), notice  # the old tick's notice was found, not resent
+        elif pre_upgrade == "unlisted":
+            assert not sends and notice == (0, 1, None) and unconfirmed == ticks, notice  # pending kept
+        elif pre_upgrade in ("exact", "rewritten", "original"):
+            assert not sends and notice[0] == 1, notice
+        elif pre_upgrade in ("unsent", "other", "foreign", "foreign_wrapped", "prefixed"):
+            assert len(sends) == 1 and notice[0] == 1 and notice[2], notice
+        else:
+            assert len(sends) == (2 if send_lost else 1), sends  # a lost reply's retry replays the same request
+            assert notice[0] == 1 and notice[2], notice
         assert any(event[:2] == RM for event in events) == refused
 
 
 for scenario in ({}, {"merged": False}, {"dirty": True}, {"refused": True},
                  {"release_uncertain": True}, {"remote_race": True}, {"release_unknown": True},
                  {"release_uncertain": True, "ticks": 2}, {"release_uncertain": True, "ticks": 3, "card_fails": True},
-                 {"release_uncertain": True, "ticks": 3, "send_lost": True}):
+                 {"release_uncertain": True, "ticks": 3, "send_lost": True},
+                 {"release_uncertain": True, "ticks": 3, "send_lost": True, "rewritten": True},
+                 {"release_uncertain": True, "dirty": True, "ticks": 2, "rollback": True},
+                 *({"release_uncertain": True, "ticks": 3, "pre_upgrade": pre_upgrade}
+                   for pre_upgrade in ("exact", "rewritten", "unsent", "unlisted", "other", "foreign", "foreign_wrapped",
+                                       "prefixed", "original"))):
     with TemporaryDirectory() as tmp:
         close_fixture(tmp, **scenario)
 
@@ -1407,7 +1545,12 @@ class Fleet:
         self.ticket = dict(number=553, item="card", agent=f"coder {model} medium @jzaw", stage="Coding")
         self.title = "#553 coder"
         self.notes = []
+        self.followups = []  # Tasks Orca created for mail to a settled Dispatch
+        self.note_lost = False  # the send to the replacement applies, but its reply is lost
+        self.follow_retried = False  # Orca retried the follow-up Task; its newest attempt has no followUpOf
+        self.follow_terminal = "term_follow"  # the fresh pane Orca starts a follow-up in; None before its worker record
         self.tickets_error = None
+        self.receipts = {}  # Orca's recorded receipts by request id
         self.db = sqlite3.connect(":memory:")
 
     def orca(self, *args):
@@ -1415,7 +1558,8 @@ class Fleet:
         verb = args[:2]
         if verb == ("orchestration", "task-list"):
             return {"tasks": [{"id": "task_coder", "run_id": "run", "task_title": self.title,
-                               "spec": "/goal Implement julianthant/hr-relay#553 and report a green SHA."}]}
+                               "spec": "/goal Implement julianthant/hr-relay#553 and report a green SHA."},
+                              *self.followups]}
         if verb == ("orchestration", "worker-list"):
             row = dict(dispatchId=self.dispatch, taskId="task_coder", runId="run", workerState=self.state,
                        dispatchStatus=self.status, agentTerminalHandle=self.terminal,
@@ -1433,6 +1577,16 @@ class Fleet:
                              agentTerminalHandle="term_coder", resource={"ownerDispatchId": "ctx_coder"})
                         ] if self.dispatch == "ctx_restart" else []
             return {"workers": [*before, row, old, retried, *replaced], "page": {"hasMore": False, "nextCursor": None}}
+        if verb == ("orchestration", "dispatch-show") and args[3] == "task_follow":
+            current = "ctx_follow_retry" if self.follow_retried else "ctx_follow"
+            return {"dispatch": {"id": current, "status": "dispatched", "taskId": None, "assigneeHandle": None}}
+        if verb == ("orchestration", "worker-show") and args[3] == "ctx_follow_retry":
+            return {"dispatch": {"id": "ctx_follow_retry", "runId": "run", "taskId": "task_follow",
+                                 "retryOfDispatchId": "ctx_follow", "followUpOf": None},
+                    **self.follow_worker("ctx_follow_retry")}
+        if verb == ("orchestration", "worker-show") and args[3] == "ctx_follow":
+            return {"dispatch": {"id": "ctx_follow", "runId": "run", "taskId": "task_follow", "followUpOf": "ctx_restart"},
+                    **self.follow_worker("ctx_follow")}
         if verb == ("orchestration", "dispatch-show"):
             # Recorded shape: only the newest Dispatch's id and status.
             return {"dispatch": {"id": self.dispatch, "status": self.status, "taskId": None, "assigneeHandle": None}}
@@ -1480,9 +1634,29 @@ class Fleet:
             if args[args.index("--to") + 1] == "dispatch:ctx_restart":
                 if self.note_error:
                     raise self.note_error
+                request = args[args.index("--retry-request") + 1] if "--retry-request" in args else None
+                if request in self.receipts:
+                    return self.receipts[request]  # Orca replays an applied request
                 self.notes.append(args[args.index("--body") + 1])
+                receipt = {"delivery": "queued"}
+                if self.status != "dispatched":
+                    # Mail to a settled Dispatch starts a follow-up Task and Dispatch.
+                    self.followups.append({"id": "task_follow", "run_id": "run", "spec": args[args.index("--body") + 1],
+                                           "task_title": args[args.index("--subject") + 1]})
+                    receipt = {"delivery": "follow_up", "followUpOf": "ctx_restart", "dispatchId": "ctx_follow"}
+                if request:
+                    self.receipts[request] = receipt
+                if self.note_lost:
+                    self.note_lost = False
+                    raise tick.OrcaError("timed out")
+                return receipt
             return {"delivery": "queued"}
         raise AssertionError(args)
+
+    def follow_worker(self, dispatch):
+        """Orca's worker record for a follow-up, omitted while it has none."""
+        return {"worker": {"dispatchId": dispatch, "effects": [
+            {"kind": "terminal", "role": "agent", "action": "created", "id": self.follow_terminal}]}} if self.follow_terminal else {}
 
     def tick(self, minutes=0):
         self.now += minutes * 60
@@ -1613,8 +1787,12 @@ with TemporaryDirectory() as tmp:
 
 
 # The replacement settles while its resume note cannot be sent: the note and card target outlive the worker scan.
+# The note then starts a follow-up Dispatch, which review expects from the same transaction that clears the note.
 with TemporaryDirectory() as tmp:
     f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    tick.review_state(f.db, "run", 553)
+    tick.save_review(f.db, "run", 553, {"coder": "ctx_coder", "expected": "ctx_coder", "coder_terminal": "term_coder",
+                                        "agent": "coder gpt-6.2-astra medium @x1"})
     f.note_error = tick.OrcaError("mailbox busy")
     with check.assertRaises(tick.OrcaError):
         f.tick()
@@ -1624,11 +1802,120 @@ with TemporaryDirectory() as tmp:
         f.tick(1)
     row = json.loads(dict(f.db.execute("SELECT terminal,state FROM watch"))["term_restart"])
     assert row["note"]["to"] == "ctx_restart" and row["card"]["stage"] == "Coding"
+    assert tick.resume_pending(f.db, "run", 553, {"ctx_restart"})  # review waits on the note
     f.note_error = None
     f.tick(1)
     assert len(f.notes) == 1 and f.cards[-1] == ("Coding", "coder gpt-6.2-astra medium @x2")
+    review = tick.review_state(f.db, "run", 553)
+    assert (review["coder"], review["expected"]) == ("ctx_follow", "ctx_follow") and "followed up" in f.lines[0]
+    assert review["coder_terminal"] == "term_follow"
     f.tick(1)
     assert not f.db.execute("SELECT * FROM watch").fetchall() and len(f.notes) == 1
+
+# A reviewer's settled replacement gets its note as a follow-up in a fresh pane. Review takes the pane with the
+# Dispatch, so a handoff there is not read as a review failure.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    f.title = "#553 review"
+    tick.review_state(f.db, "run", 553)
+    tick.save_review(f.db, "run", 553, {"coder": "ctx_c", "expected": "ctx_coder", "coder_terminal": "term_c",
+                                        "reviewer": {"dispatch": "ctx_coder", "terminal": "term_coder",
+                                                     "holds": str(f.holds)}})
+    f.note_error = tick.OrcaError("mailbox busy")
+    with check.assertRaises(tick.OrcaError):
+        f.tick()
+    f.status, f.state, f.liveness = "completed", "succeeded", "exited"
+    f.note_error, f.follow_terminal = None, None
+    with check.assertRaisesRegex(tick.OrcaError, "watch error"):
+        f.tick(1)
+    assert json.loads(dict(f.db.execute("SELECT terminal,state FROM watch"))["term_restart"])["note"]
+    review = tick.review_state(f.db, "run", 553)
+    assert review["expected"] == "ctx_restart" and review["reviewer"]["terminal"] == "term_restart"
+    f.follow_terminal = "term_follow"
+    f.tick(1)
+    assert len(f.notes) == 1 and len(f.followups) == 1
+    review = tick.review_state(f.db, "run", 553)
+    assert review["expected"] == "ctx_follow" and review["reviewer"]["dispatch"] == "ctx_follow"
+    assert review["reviewer"]["terminal"] == "term_follow"
+    f.db.execute("INSERT OR REPLACE INTO watch VALUES ('run','term_follow',?)", (json.dumps({"handoff": 1}),))
+    done = {"type": "worker_done", "id": "m1", "sequence": 9,
+            "payload": json.dumps({"dispatchId": "ctx_follow", "outcome": "failed"})}
+    assert tick.failed_reviews(f.db, "run", tick.review_state(f.db, "run", 553), [done]) == []
+
+# The settled-worker send applies but its reply is lost: the next tick adopts the follow-up Orca started instead of
+# sending again, even after Orca retried that Task. With no review state yet, the follow-up is recorded for review's
+# first discovery.
+for retried, current in ((False, "ctx_follow"), (True, "ctx_follow_retry")):
+    with TemporaryDirectory() as tmp:
+        f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+        f.follow_retried = retried
+        f.note_error = tick.OrcaError("mailbox busy")
+        with check.assertRaises(tick.OrcaError):
+            f.tick()
+        f.status, f.state, f.liveness = "completed", "succeeded", "exited"
+        f.note_error, f.note_lost = None, True
+        with check.assertRaisesRegex(tick.OrcaError, "watch error"):
+            f.tick(1)
+        assert len(f.followups) == 1 and json.loads(dict(f.db.execute("SELECT terminal,state FROM watch"))["term_restart"])["note"]["sending"]
+        f.tick(1)
+        assert len(f.followups) == 1 and len(f.notes) == 1 and "followed up" in f.lines[0]
+        assert f.db.execute("SELECT run,issue,dispatch FROM followups").fetchall() == [("run", 553, current)]
+        assert f.cards[-1] == ("Coding", "coder gpt-6.2-astra medium @x2")
+
+# Orca queues the note for the live replacement, the reply is lost, and the replacement settles before the next
+# tick: the retry replays the first send under its saved request instead of starting a follow-up.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    tick.review_state(f.db, "run", 553)
+    tick.save_review(f.db, "run", 553, {"coder": "ctx_coder", "expected": "ctx_coder", "coder_terminal": "term_coder"})
+    f.note_lost = True
+    with check.assertRaisesRegex(tick.OrcaError, "watch error"):
+        f.tick()
+    assert len(f.notes) == 1 and f.dispatch == "ctx_restart" and f.cards[-1][0] == "Handed off"
+    assert tick.resume_pending(f.db, "run", 553, {"ctx_restart"})
+    request = json.loads(dict(f.db.execute("SELECT terminal,state FROM watch"))["term_restart"])["note"].get("request")
+    f.status, f.state, f.liveness = "completed", "succeeded", "exited"
+    f.tick(1)
+    assert len(f.notes) == 1 and not f.followups
+    assert "followed up" not in f.lines[0]
+    review = tick.review_state(f.db, "run", 553)
+    assert (review["coder"], review["expected"]) == ("ctx_restart", "ctx_restart")
+    assert f.cards[-1] == ("Coding", "coder gpt-6.2-astra medium @x2")
+    sends = [e for e in f.events if e[:2] == ("orchestration", "send") and "dispatch:ctx_restart" in e]
+    assert [e[e.index("--retry-request") + 1] for e in sends] == [request]
+    f.tick(1)
+    assert len(f.notes) == 1 and not f.db.execute("SELECT * FROM watch").fetchall()
+
+# Review's first discovery reads the recorded follow-up's report, not the predecessor's, and follows a retry of
+# the follow-up Task to its current attempt.
+for current in ("follow", "follow_retry"):
+    args = SimpleNamespace(issue=41, coder=None, run=None, anchor=None)
+    ticket, state = review_fixture()
+    ticket.update(agent=state["agent"], stage="Coding")
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE followups (run TEXT, issue INTEGER, dispatch TEXT, PRIMARY KEY(run,issue))")
+    db.execute("INSERT INTO followups VALUES ('run', 41, 'follow')")
+    followed_report = report(current, f"I pushed {sha}.", msg_id="follow-report")
+    attempts = {"coder": {"id": "coder", "runId": "run", "taskId": "task"},
+                "follow": {"id": "follow", "runId": "run", "taskId": "task_follow", "followUpOf": "coder"},
+                "follow_retry": {"id": "follow_retry", "runId": "run", "taskId": "task_follow", "retryOfDispatchId": "follow"}}
+    def discovery(*argv, current=current, attempts=attempts, followed_report=followed_report):
+        if argv[:2] == ("orchestration", "inbox"):
+            return {"messages": [followed_report]}
+        if argv[:2] == ("orchestration", "task-list"):
+            return {"tasks": [{"title": "#41 coder", "id": "task"}]}
+        if argv[:2] == ("orchestration", "dispatch-show"):
+            return {"dispatch": {"id": {"task": "coder", "task_follow": current}[argv[3]]}}
+        if argv[:2] == ("orchestration", "worker-show"):
+            return {"dispatch": attempts[argv[3]],
+                    "worker": {"worktreeId": "tree", "startOptions": {"launch": {"effective": {"model": "gpt-6.2-sol"}}}}}
+        assert argv[:2] == ("worktree", "show"), argv
+        return {"worktree": {"id": "tree", "path": "/fixture", "branch": "refs/heads/task/ui/header"}}
+    with patch.object(tick, "tickets", return_value=[ticket]), patch.object(tick, "supervisor", return_value=([], "run")), \
+            patch.object(tick, "command", return_value="https://github.com/julianthant/hr-relay.git\n"), \
+            patch.object(tick, "review_step") as step, patch.object(tick, "runtime", discovery):
+        tick.review_tick(args, db)
+        assert step.call_args.args[-2]["expected"] == current and step.call_args.args[-1] == [followed_report]
 
 # A replacement that reports while its resume note is undelivered waits; review acts once delivery is confirmed.
 ticket, state = review_fixture()
@@ -1696,6 +1983,17 @@ with TemporaryDirectory() as tmp:
     selects = [e[-1] for e in f.events if e[:2] == ("account", "select")]
     assert selects == ["coord", "x2", "coord"] and f.active == "coord", selects
     assert ("orchestration", "worker-start") in calls and len(f.notes) == 1
+
+# A fill start still owes the coordinator's account: the restart waits on its seat instead of recording that seat.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    tick.reserve(f.db, 70, {"not_applied": True, "coordinator": "coord"})
+    calls = f.tick()
+    assert ("account", "select") not in calls and ("orchestration", "worker-start") not in calls
+    assert "waiting for coordinator restore" in f.lines[0] and "starts:70" in f.lines[0]
+    f.db.execute("DELETE FROM starts")
+    calls = f.tick(1)
+    assert ("orchestration", "worker-start") in calls and f.active == "coord"
 
 # A replacement crashes before its resume note and account restore land: its successor inherits both.
 with TemporaryDirectory() as tmp:

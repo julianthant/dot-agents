@@ -1,5 +1,6 @@
-"""Headless Orca coordinator stub for dev-auto: no terminal of its own, run by launchd.
+"""Headless Orca coordinator for dev-auto, run by launchd.
 
+  tick.py scheduled --anchor <pane> --run <run> --repo-path <checkout> [--repo-path <checkout>]
   tick.py review [--issue N]                         advance reports from the owning Run mailbox
   tick.py close --repo-path <checkout> [--issue N]   release workers and clean up closed tickets
   tick.py watch                                      hand off, relaunch, nudge or report live workers
@@ -16,6 +17,7 @@ Coordinator verbs refuse a sender with no stable Orca pane, so the script opens 
 from pathlib import Path
 import argparse
 from contextlib import closing
+import datetime
 import hashlib
 import sqlite3
 import tempfile
@@ -2657,9 +2659,61 @@ def watch_workers(args):
         watch_tick(args, db)
 
 
+def scheduled_tick(args):
+    import fcntl
+
+    state = SNAPSHOT.parent
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (state / "fill.lock").open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            log("scheduled", "another tick is active")
+            return 0
+
+        started = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        status = {"lastRun": started, "errors": []}
+        log("tick start", started)
+
+        def step(phase, action, *params):
+            try:
+                action(*params)
+            except Exception as e:
+                # CLI diagnostics can name accounts, panes and local paths. Keep them in the local log.
+                status["errors"].append({"phase": phase, "error": type(e).__name__})
+                log("tick error", {"phase": phase, "reason": str(e)})
+                return False
+            return True
+
+        opts = argparse.Namespace(anchor=args.anchor, run=args.run, issue=None, holds=None, coder=None,
+                                  dry_run=False, repo_path=None)
+        # The existing Run and state contain the dispatches, holds and card reservations to adopt.
+        if step("adopt", supervisor, opts):
+            def advance():
+                with sqlite3.connect(state / "starts.sqlite") as db:
+                    step("watch", watch_tick, opts, db)
+                    step("review", review_tick, opts, db)
+                    for phase, action in (("close", close_tick), ("fill", fill_tick)):
+                        for repo in args.repo_paths:
+                            opts.repo_path = repo
+                            step(phase, action, opts, db)
+            step("state", advance)
+
+        path = state / "tick.json"
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(status))
+        tmp.replace(path)
+        log("tick end", {**status, "finishedAt": datetime.datetime.now(datetime.timezone.utc).isoformat()})
+        return int(bool(status["errors"]))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
+    scheduled = sub.add_parser("scheduled", help="adopt and advance the existing fleet from launchd")
+    scheduled.add_argument("--anchor", required=True)
+    scheduled.add_argument("--run", required=True)
+    scheduled.add_argument("--repo-path", dest="repo_paths", type=Path, action="append", required=True)
     s = sub.add_parser("start")
     s.add_argument("--repo", required=True)
     s.add_argument("--state", required=True)
@@ -2691,6 +2745,8 @@ def main(argv=None):
     w.add_argument("--anchor", help="pane-less supervisor anchor")
     w.add_argument("--run", help="Run already bound to the anchor")
     args = ap.parse_args(argv)
+    if args.cmd == "scheduled":
+        return scheduled_tick(args)
     if args.cmd == "watch":
         try:
             return watch_workers(args)
@@ -2718,11 +2774,12 @@ def main(argv=None):
         if args.release is not None and (args.release <= 0 or args.dry_run or args.issue is not None):
             f.error("--release requires a positive issue number and cannot combine with --issue or --dry-run")
         try:
-            return fill(args)
+            fill(args)
+            return 0
         except (OSError, OrcaError, ValueError, subprocess.TimeoutExpired) as e:
             ap.exit(1, f"fill: {e}\n")
     start(args.repo, args.state) if args.cmd == "start" else resume(args.state)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

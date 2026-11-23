@@ -151,3 +151,44 @@ reviewer's failed `worker_done` (unless watch is restarting it from a
 handoff). A PUSH whose branch head moved or whose task CI is not green goes
 back to the coder with that reason. Close-tick and third-FIX mail goes to the
 Run as `status`.
+
+## launchd cutover
+
+Pause manual fleet ticks and starts. Keep the coordinating Run and its live
+workers in place. Use a plain shell outside the worker sessions to create a
+shell anchor in a long-lived worktree, then bind it to the existing Run.
+
+```sh
+orca terminal create --worktree path:<main-checkout> --title "dev-auto supervisor" --json
+orca orchestration run-use --id <existing-run> --from <anchor> --json
+python3 scripts/install_tick.py --run <existing-run> --anchor <anchor> \
+  --repo-path <hr-relay-root> --repo-path <dot-agents-root>
+```
+
+Run the installer from a checkout that will stay on disk. When trialing from
+a worktree, set `DEV_AUTO_ACCOUNTS` to the fleet's existing `accounts.toml`
+so launchd uses the holds beside it. The installer validates the anchor and
+installs `com.relay.dev-auto` in the current user's GUI domain.
+launchd starts the job at load and every minute. Each invocation holds the
+same lock as the standalone commands and runs watch, review, close and fill
+against the existing Run and local state. Existing dispatches keep their hold
+records and Project cards. A detached anchor fails the tick before any fleet
+action. Rebind the Run from a plain shell and reinstall with the new anchor.
+
+Disable automatic starts with one command. This persists across logins and
+unloads the running job.
+
+```sh
+launchctl disable "gui/$(id -u)/com.relay.dev-auto" && launchctl bootout "gui/$(id -u)/com.relay.dev-auto"
+```
+
+Use `~/.local/state/dev-auto/tick.log` to capture the two-hour run. Its UTC
+start and end records show the observed cadence. Record the issue number
+from the automatic start, its merged PR, and the original dispatches that
+finished during the run. Keep local paths, terminal handles, account data
+and raw CLI diagnostics out of the PR log excerpt.
+
+Each roadmap render reads `tick.lastRun` and `tick.errors` from the latest
+finished invocation. `tick` is `null` before the first run. An error lists
+its phase and exception type. The matching local `tick.log` entry has the
+CLI diagnostic.

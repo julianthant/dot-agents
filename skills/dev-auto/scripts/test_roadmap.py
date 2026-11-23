@@ -144,6 +144,17 @@ class Roadmap(unittest.TestCase):
         self.assertEqual(self.reads, [])
         self.assertGreater(json.loads(tick.SNAPSHOT.read_text())["fetched"], 0)  # still fresh: no refetch owed
 
+    def test_each_render_reads_the_latest_tick_even_when_github_is_unchanged(self):
+        self.warm()
+        self.assertIsNone(roadmap.render()["tick"])
+        status = {"lastRun": SINCE, "errors": [{"phase": "watch", "error": "OrcaError"}]}
+        tick.SNAPSHOT.with_name("tick.json").write_text(json.dumps(status))
+        self.assertEqual(roadmap.render()["tick"], status)
+        status["errors"] = []
+        tick.SNAPSHOT.with_name("tick.json").write_text(json.dumps(status))
+        self.assertEqual(roadmap.render()["tick"], status)
+        self.assertEqual(self.reads, [])
+
     def test_a_close_time_edit_reaches_the_cached_closed_card(self):
         snap = json.loads(tick.SNAPSHOT.read_text())
         done = dict(issue(3, "Reviewing"), state="CLOSED", stateReason="COMPLETED")

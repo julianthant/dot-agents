@@ -2271,7 +2271,8 @@ def watch_pass(args, db, actions, errors):
         if row.get("note"):
             note = row["note"]
             # A send whose reply was lost may have started a follow-up already; adopt it rather than start another.
-            receipt = note.get("sending") and sent_followup(note)
+            # A row saved before request ids has neither mark, so look it up whenever no request id is saved.
+            receipt = (note.get("sending") or not note.get("request")) and sent_followup(note)
             if not receipt:
                 # Saved before the call, so a retry replays Orca's receipt whatever the first delivery was.
                 note.setdefault("request", str(uuid.uuid4()))

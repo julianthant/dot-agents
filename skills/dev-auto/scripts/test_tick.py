@@ -2012,6 +2012,28 @@ for retried, current in ((False, "ctx_follow"), (True, "ctx_follow_retry")):
         assert f.db.execute("SELECT run,issue,dispatch FROM followups").fetchall() == [("run", 553, current)]
         assert f.cards[-1] == ("Coding", "coder gpt-6.2-astra medium @x2")
 
+# #588 item B: a pre-upgrade row (no sending mark, no request id) whose follow-up-starting send was applied is
+# reconciled against that follow-up instead of starting a second one.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    tick.review_state(f.db, "run", 553)
+    tick.save_review(f.db, "run", 553, {"coder": "ctx_coder", "expected": "ctx_coder", "coder_terminal": "term_coder"})
+    f.note_error = tick.OrcaError("mailbox busy")
+    with check.assertRaises(tick.OrcaError):
+        f.tick()
+    f.status, f.state, f.liveness = "completed", "succeeded", "exited"
+    f.note_error, f.note_lost = None, True
+    with check.assertRaisesRegex(tick.OrcaError, "watch error"):
+        f.tick(1)
+    row = json.loads(dict(f.db.execute("SELECT terminal,state FROM watch"))["term_restart"])
+    for key in ("sending", "request"):
+        row["note"].pop(key, None)
+    with f.db:
+        f.db.execute("UPDATE watch SET state=? WHERE terminal='term_restart'", (json.dumps(row),))
+    f.tick(1)
+    assert len(f.followups) == 1 and len(f.notes) == 1, (f.followups, f.lines)
+    assert tick.review_state(f.db, "run", 553)["expected"] == "ctx_follow"
+
 # Orca queues the note for the live replacement, the reply is lost, and the replacement settles before the next
 # tick: the retry replays the first send under its saved request instead of starting a follow-up.
 with TemporaryDirectory() as tmp:

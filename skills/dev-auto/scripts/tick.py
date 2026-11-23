@@ -2138,14 +2138,17 @@ def watch_pass(args, db, actions, errors):
             # --retry-of takes a settled attempt, so fence the old one first.
             stop = runtime("orchestration", "worker-stop", "--dispatch", dispatch, "--full")
             actions.append({"issue": number, "stopped": dispatch, "process": stop.get("processAction")})
+        # --retry-of names a failed Task's last attempt; after an Orca restart the Task can be ready again.
+        retry = show["dispatch"]["status"] == "dispatched" or task.get("status") != "ready"
         # Everything adoption needs if the start response is lost.
         state["pending"].update(starting=True, dispatch=dispatch, task=task_id, number=number, title=title,
                                 worktree=show["worker"]["worktreeId"], route=route, account=account["id"],
-                                label=account["label"], note=note, coordinator=prior)
+                                label=account["label"], note=note, coordinator=prior, retry=retry)
         save(terminal, state)
         # The same Task keeps its title, dependencies and retry lineage for the review tick.
         try:
-            started = runtime("orchestration", "worker-start", *actor, "--task", task_id, "--retry-of", dispatch,
+            started = runtime("orchestration", "worker-start", *actor, "--task", task_id,
+                              *(("--retry-of", dispatch) if retry else ()),
                               "--worktree", "id:" + show["worker"]["worktreeId"], "--agent", route[0],
                               "--model", route[1], "--effort", route[2], "--full")
         except StartNotApplied as e:
@@ -2164,7 +2167,8 @@ def watch_pass(args, db, actions, errors):
             if new and new != p["dispatch"]:
                 show = runtime("orchestration", "worker-show", "--dispatch", new, "--full")
                 d, worker = show["dispatch"], show.get("worker") or {}
-                if (d["id"] == new and d.get("retryOfDispatchId") == p["dispatch"] and d["runId"] == run
+                lineage = p["dispatch"] if p.get("retry", True) else None
+                if (d["id"] == new and d.get("retryOfDispatchId") == lineage and d["runId"] == run
                         and d["taskId"] == p["task"] and worker.get("worktreeId") == p["worktree"]
                         and start_identity(worker)[0] == new):
                     adopt(terminal, state, *start_identity(worker))

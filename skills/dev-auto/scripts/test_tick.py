@@ -1652,6 +1652,8 @@ class Fleet:
         self.liveness, self.failure, self.wait = "live", None, None
         self.seats = ["jzaw", "x2"]  # the limited account is first in accounts.toml order
         self.superseded = False
+        self.task_status = "dispatched"
+        self.started_retry = None  # whether the restart passed --retry-of
         self.start_error = None
         self.lose_start = False  # Orca starts the retry, but the response is lost
         self.note_error = None
@@ -1674,7 +1676,7 @@ class Fleet:
         self.events.append(args)
         verb = args[:2]
         if verb == ("orchestration", "task-list"):
-            return {"tasks": [{"id": "task_coder", "run_id": "run", "task_title": self.title,
+            return {"tasks": [{"id": "task_coder", "run_id": "run", "task_title": self.title, "status": self.task_status,
                                "spec": "/goal Implement julianthant/hr-relay#553 and report a green SHA."},
                               *self.followups]}
         if verb == ("orchestration", "worker-list"):
@@ -1709,7 +1711,7 @@ class Fleet:
             return {"dispatch": {"id": self.dispatch, "status": self.status, "taskId": None, "assigneeHandle": None}}
         if verb == ("orchestration", "worker-show"):
             assert args[3] == self.dispatch, args
-            retry = "ctx_coder" if self.dispatch == "ctx_restart" else None
+            retry = "ctx_coder" if self.dispatch == "ctx_restart" and self.started_retry is not False else None
             return {"dispatch": {"id": self.dispatch, "runId": "run", "taskId": "task_coder", "status": self.status,
                                  "assigneeHandle": self.terminal, "lastFailure": self.failure,
                                  "retryOfDispatchId": retry, "followUpOf": None},
@@ -1738,7 +1740,10 @@ class Fleet:
             if self.start_error:
                 raise self.start_error
             # The same Task retries: no second same-titled Task for review discovery to refuse.
-            assert args[args.index("--task") + 1] == "task_coder" and args[args.index("--retry-of") + 1] == self.dispatch
+            assert args[args.index("--task") + 1] == "task_coder"
+            # Orca refuses --retry-of for a ready Task (task_not_startable).
+            assert ("--retry-of" not in args) if self.task_status == "ready" else args[args.index("--retry-of") + 1] == self.dispatch
+            self.started_retry = "--retry-of" in args
             assert "--spec" not in args and "--task-title" not in args and self.status == "failed", args
             assert args[args.index("--worktree") + 1] == "id:repo::/wt"
             self.dispatch, self.terminal = "ctx_restart", "term_restart"
@@ -2188,6 +2193,24 @@ with TemporaryDirectory() as tmp:
     assert f.cards[-1][0] == "Needs you"
     f.tick(1)
     assert f.sent() == []
+
+# Bug 1: after an Orca restart the crashed worker's Task is ready again; it starts without --retry-of and is adopted.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.task_status, f.status, f.state, f.liveness, f.failure = "ready", "failed", "failed", "exited", "agent process exited"
+    assert ("orchestration", "worker-start") in f.tick() and f.started_retry is False
+    assert json.loads(f.holds.read_text())["term_restart"]["account"] == "jzaw"
+    row = json.loads(f.db.execute("SELECT state FROM watch WHERE terminal='term_restart'").fetchone()[0])
+    assert row["relaunched"] and "pending" not in row, row
+# A lost start response: the next tick adopts the Task's new attempt, which has no retry lineage.
+with TemporaryDirectory() as tmp:
+    g = Fleet(tmp, screen=CLAUDE_WORKING)
+    g.task_status, g.status, g.state, g.liveness, g.failure = "ready", "failed", "failed", "exited", "agent process exited"
+    g.lose_start = True
+    with check.assertRaises(tick.OrcaError):
+        g.tick()
+    calls = g.tick(1)
+    assert ("orchestration", "worker-start") not in calls and "term_restart" in json.loads(g.holds.read_text()), (calls, g.lines)
 
 # A reviewer Orca already settled as failed, before any watch row: relaunched once, card kept at Reviewing.
 with TemporaryDirectory() as tmp:

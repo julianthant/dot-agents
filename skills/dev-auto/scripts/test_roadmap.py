@@ -1,6 +1,6 @@
 import json
 import sqlite3
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from io import StringIO
 import subprocess
 import time
@@ -165,13 +165,14 @@ class Roadmap(unittest.TestCase):
         self.assertEqual(roadmap.render()["tick"], status)
         self.assertEqual(self.reads, [])
 
-    def local_worker(self, worker, *, stage="Coding", sha=None):
+    def local_worker(self, worker, *, stage="Coding", sha=None, task_status="dispatched", tracked=True):
         self.warm()
-        with sqlite3.connect(tick.SNAPSHOT.with_name("starts.sqlite")) as db:
+        with closing(sqlite3.connect(tick.SNAPSHOT.with_name("starts.sqlite"))) as db, db:
             db.execute("CREATE TABLE reviews (run TEXT, issue INTEGER, state TEXT)")
-            db.execute("INSERT INTO reviews VALUES (?, ?, ?)", ("run_c95eee175345", 1, json.dumps(
-                {"coder": "ctx_coder", "expected": "ctx_coder", "stage": stage,
-                 "sha": sha, "model": "gpt-6.2-sol"})))
+            if tracked:
+                db.execute("INSERT INTO reviews VALUES (?, ?, ?)", ("run_c95eee175345", 1, json.dumps(
+                    {"coder": "ctx_coder", "expected": "ctx_coder", "stage": stage,
+                     "sha": sha, "model": "gpt-6.2-sol"})))
         worker = {"dispatchId": "ctx_coder", "taskId": "task_coder",
                   "dispatchStatus": "dispatched", "workerState": "ready",
                   "projection": {"stage": {"activity": "working"}, "liveness": {"verdict": "live"}},
@@ -179,15 +180,18 @@ class Roadmap(unittest.TestCase):
 
         def orca(*args):
             if args[:2] == ("orchestration", "worker-list"):
+                if "--on" in args:
+                    self.assertEqual(args[args.index("--on") + 1], "Juzzark-WSL")
+                    return {"workers": [{**worker, "projection": {"stage": {"activity": "working"}}}]}
                 return {"workers": [worker], "page": {"hasMore": False}}
             if args[:2] == ("orchestration", "task-list"):
-                return {"tasks": [{"id": "task_coder", "task_title": "#1 coder", "dispatch_id": "ctx_coder"}]}
+                return {"tasks": [{"id": "task_coder", "task_title": "#1 coder", "status": task_status}]}
             raise AssertionError(args)
 
         return patch.object(tick, "runtime", side_effect=orca)
 
-    def live_rows(self, worker):
-        with self.local_worker(worker):
+    def live_rows(self, worker, **options):
+        with self.local_worker(worker, **options):
             return [r["now"] for r in roadmap.render()["issues"]]
 
     def test_a_stopped_worker_overrides_a_coding_card(self):
@@ -196,14 +200,18 @@ class Roadmap(unittest.TestCase):
         self.assertIsNone(other)
 
     def test_a_working_wsl_worker_names_its_host(self):
-        live, _ = self.live_rows({"server": {"name": "Juzzark-WSL"}})
+        live, _ = self.live_rows({"server": {"name": "Juzzark-WSL"}, "projection": None})
         self.assertEqual(live["status"], "working")
         self.assertEqual(live["who"], [{"role": "coder", "model": "gpt-6.2-sol", "host": "WSL"}])
 
     def test_prompt_and_operator_question_need_you_without_changing_stage(self):
-        for reason in ("approval", "input"):
+        for reason, worker, options in (
+            ("approval", {"projection": {"attention": {"categories": ["approval"]}}}, {}),
+            ("input", {"projection": {"attention": {"categories": ["input"]}}}, {}),
+            ("manual question", {}, {"task_status": "waiting_for_input", "tracked": False}),
+        ):
             with self.subTest(reason=reason):
-                live, _ = self.live_rows({"projection": {"attention": {"categories": [reason], "requiresAction": True}}})
+                live, _ = self.live_rows(worker, **options)
                 self.assertEqual((live["stage"], live["status"]), (0, "needs you"))
                 tick.SNAPSHOT.with_name("starts.sqlite").unlink()
 

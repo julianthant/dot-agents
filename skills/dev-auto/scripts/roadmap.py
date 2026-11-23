@@ -240,16 +240,21 @@ def live_workers(numbers):
 
     current = {}
     try:
-        tasks = tick.runtime("orchestration", "task-list", "--run", RUN, "--full")["tasks"]
-        for t in tasks:
-            w = workers.get(t.get("dispatch_id"))
-            if not w or w.get("dispatchStatus") != "dispatched":
+        tasks = {t["id"]: t for t in tick.runtime("orchestration", "task-list", "--run", RUN, "--full")["tasks"]}
+        for w in workers.values():
+            t = tasks.get(w.get("taskId"))
+            if not t:
+                continue
+            w["taskStatus"] = t.get("status")
+            if w.get("dispatchStatus") != "dispatched" and worker_status(w) != "stopped":
                 continue
             title = t.get("task_title") or ""
             match = re.search(r"#(\d+)", title) or re.search(r"hr-relay ?#(\d+)", t.get("spec") or "")
             if match and (n := int(match[1])) in numbers:
                 role = "reviewer" if re.match(r"^#\d+ reviewer\b", title) else "coder"
-                current.setdefault((n, role), w)
+                old = current.get((n, role))
+                if old is None or (old.get("dispatchStatus") != "dispatched" and w.get("dispatchStatus") == "dispatched"):
+                    current[n, role] = w
     except REFUSED as e:
         print(f"roadmap tasks: {e}", file=sys.stderr)
 
@@ -267,11 +272,11 @@ def worker_status(worker):
         return "stopped"
     if worker.get("dispatchStatus") == "completed":
         return "finished"
-    if projection.get("liveness", {}).get("verdict") == "exited":
+    if (projection.get("liveness") or {}).get("verdict") == "exited":
         return "stopped"
     attention = (projection.get("attention") or {}).get("categories", [])
     activity = (projection.get("stage") or {}).get("activity")
-    if {"input", "approval"}.intersection(attention) or activity == "waiting":
+    if {"input", "approval"}.intersection(attention) or activity == "waiting" or worker.get("taskStatus") == "waiting_for_input":
         return "needs you"
     return "working" if activity == "working" else "worker state unavailable"
 
@@ -326,7 +331,7 @@ def now_rows(snap, state):
             stage = 3
             if pr["checks"] == "failing":
                 warning = True
-                status = "PR checks failing" if status not in ("needs you", "stopped") else status + " · PR checks failing"
+                status = "PR checks failing" if status in ("finished", "no worker") else status + " · PR checks failing"
             elif status in ("finished", "no worker"):
                 status = "PR checks running" if pr["checks"] == "running" else "PR checks green"
         elif head and head == reviewed and phase == "Merging":
@@ -341,7 +346,7 @@ def now_rows(snap, state):
             stage = 1
             if run and run["head_sha"] == head and run["status"] == "completed":
                 warning = True
-                status = "CI failed" if status not in ("stopped", "needs you") else status + " · CI failed"
+                status = "CI failed" if status in ("finished", "no worker") else status + " · CI failed"
             elif status in ("finished", "no worker"):
                 status = "CI running" if run and run["head_sha"] == head else "waiting for CI"
         else:
@@ -354,7 +359,8 @@ def build(snap, github=None, decisions=None, live=None):
     issues = sorted(snap["open"], key=lambda n: n["updatedAt"], reverse=True) + snap["closed"]
     rows = [row(n) for n in issues]
     for r in rows:
-        r["now"] = (live or {}).get(r["n"])
+        if live is not None:
+            r["now"] = live.get(r["n"])
         if decisions is not None and r["open"] and r["type"] in ("Task", "Bug"):
             reason = decisions.get(r["n"], "readiness unavailable")
             r.update(ready=reason is None, holdReason=reason)
@@ -420,9 +426,13 @@ def pipeline(state=None):
                  f"q=repo:{REPO} is:pr is:merged base:development merged:>{(since or '2026-01-01')[:10]}")
     cuts = api("git/matching-refs/heads/cut/", lambda rows: [r["ref"].removeprefix("refs/heads/") for r in rows], [])
     stages = dict(devPrs=previous.get("devPrs", []), stagingPr=previous.get("stagingPr", []),
-                    agentPrs=previous.get("agentPrs", []), mergedSinceRelease=(merged or {}).get("total_count", 0),
+                    mergedSinceRelease=(merged or {}).get("total_count", 0),
                     devAheadOfStaging=compare("staging"), devAheadOfMain=compare("main"),
                     release=release, cuts=cuts, fullRun=full_run)
+    if state is not None:
+        stages["agentPrs"] = previous.get("agentPrs", [])
+    else:
+        stages["stagingPr"] = [{k: p[k] for k in ("n", "head", "checks")} for p in stages["stagingPr"]]
     milestones = api("milestones?state=open&per_page=50", lambda rows: [m["title"] for m in rows], [])
     return {"pipeline": stages, "milestones": milestones}
 

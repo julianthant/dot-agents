@@ -96,7 +96,8 @@ the current attempt of every live worker in the Run and logs one `watch` line:
 
 - A limit screen or the Codex model-switch menu (a Codex status line naming another model is not a limit):
   once `pick.py` gives a different account, `worker-stop`, then the same Task
-  restarts with `worker-start --task <task> --retry-of <dispatch>`. The
+  restarts with `worker-start --task <task> --retry-of <dispatch>` (without
+  `--retry-of` when an Orca restart left the Task ready). The
   replacement then gets mail with the predecessor's `reportPath` and report.
 - A near-limit screen or an account `pick.py due` lists: one handoff request
   to the Dispatch. Its failed `worker_done` starts the replacement.

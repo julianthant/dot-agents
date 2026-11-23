@@ -551,7 +551,8 @@ def write_through(args):
         return stale_snapshot()
 
     def change(old):
-        cards = [c for i in old.get("open", []) for c in i["projectItems"]["nodes"] if c["id"] == a["--id"]]
+        cards = [c for i in old.get("open", []) + old.get("closed", []) for c in i["projectItems"]["nodes"]
+                 if c["id"] == a["--id"]]
         for c in cards:
             c[key] = value
         return old if cards else {**old, "fetched": 0}

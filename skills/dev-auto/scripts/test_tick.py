@@ -712,6 +712,9 @@ for i in range(3):
             assert card.call_args.args[1] == "Fixing" and "dispatch:coder" in cli.call_args.args
         else:
             assert card.call_args.args[1] == "Needs you" and "run:run" in cli.call_args.args
+            # Orca refuses --type escalation from the Run's own pane (sender_not_assignee).
+            sent = cli.call_args.args
+            assert sent[:2] == ("orchestration", "send") and sent[sent.index("--type") + 1] == "status"
             assert all(text in cli.call_args.args[-1] for text in ["round one", "round two", "missing a check"])
         tick.review_step(db, "run", [], ticket, state, [verdict])
         assert cli.call_count == 1
@@ -1330,12 +1333,26 @@ with TemporaryDirectory() as tmp:
     f.tick(1)
     assert len(f.cards) == 2  # restored once
 
+# The coder answers its prompt and reports success before the next tick: the card is restored, then the row goes.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.ticket.update(branch="task/dev-auto/watch-workers", repo="dot-agents")
+    f.wait = {"kind": "permission", "approvalId": "appr_1"}
+    f.tick()
+    assert f.ticket["stage"] == "Needs you"
+    f.wait, f.status, f.state, f.liveness = None, "completed", "succeeded", "exited"
+    f.tick(1)
+    assert f.cards[-1] == ("Coding", f.ticket["agent"]) and "prompt cleared" in f.lines[0]
+    assert not f.db.execute("SELECT * FROM watch").fetchall() and discovered(f.ticket) == [553]
+
 # A permission prompt is forwarded to the Run once and the card goes to Needs you; nothing is typed or approved.
 with TemporaryDirectory() as tmp:
     f = Fleet(tmp, screen=CLAUDE_WORKING)
     f.wait = {"kind": "permission", "approvalId": "appr_1"}
     f.tick()
     assert f.sent() == [("run:run", "#553: permission prompt")] and f.cards[-1][0] == "Needs you"
+    escalation = next(e for e in f.events if e[:2] == ("orchestration", "send"))
+    assert escalation[escalation.index("--type") + 1] == "status"
     assert not any(e[1] in ("approve", "deny") for e in f.events)
     f.tick(1)
     assert f.sent() == []

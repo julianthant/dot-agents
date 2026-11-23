@@ -1327,7 +1327,8 @@ def review_step(db, run, actor, ticket, initial, messages):
         assign_reviewer(state, dispatch, terminal, state["hold"])
         state.pop("review_title")
     elif stage == "Needs you":
-        runtime("orchestration", "send", *actor, "--to", "run:" + run, "--type", "escalation",
+        # From the Run's own pane Orca accepts only status mail to run:<id> (sender_not_assignee otherwise).
+        runtime("orchestration", "send", *actor, "--to", "run:" + run, "--type", "status",
                 "--subject", f"#{number}: third FIX", "--body", instructions)
         state["card_agent"] = "coordinator"
     else:
@@ -1745,7 +1746,8 @@ def watch_pass(args, db, actions, errors):
                 db.execute("INSERT OR REPLACE INTO watch VALUES (?,?,?)", (run, terminal, json.dumps(state)))
 
     def escalate(number, subject, body):
-        runtime("orchestration", "send", *actor, "--to", "run:" + run, "--type", "escalation",
+        # From the Run's own pane Orca accepts only status mail to run:<id> (sender_not_assignee otherwise).
+        runtime("orchestration", "send", *actor, "--to", "run:" + run, "--type", "status",
                 "--subject", f"#{number}: {subject}" if number else subject, "--body", body)
 
     def stage(ticket, name, agent=None):
@@ -1837,6 +1839,16 @@ def watch_pass(args, db, actions, errors):
                           "--subject", f"#{number}: resume" if number else "resume", "--body", note)
         actions[-1]["note"] = receipt.get("delivery")
 
+    def restore_prompt(ticket, state, title):
+        """The forwarded prompt was answered: give the card back so review_tick reads the coder's report."""
+        if not state.get("prompt"):
+            return
+        if ticket and ticket["stage"] == "Needs you":
+            stage(ticket, state.get("prompt_stage") or phase(ticket, state, title))
+        for key in ("prompt", "prompt_stage"):
+            state.pop(key, None)
+        actions.append({"issue": ticket and ticket["number"], "prompt cleared": True})
+
     seen_terminals, seen_tasks = set(), set()
     for w in close_workers(run):
         terminal, dispatch, task_id = w["agentTerminalHandle"], w["dispatchId"], w["taskId"]
@@ -1881,6 +1893,7 @@ def watch_pass(args, db, actions, errors):
                     restart(w, show, state, "handed off at a usage limit", False)
                     continue
                 if w["dispatchStatus"] != "failed" or reported or stopped:
+                    restore_prompt(ticket, state, title)  # answered, then finished before this tick
                     save(terminal, None)  # finished, reported or stopped by the operator
                     continue
                 exited = True
@@ -1908,13 +1921,8 @@ def watch_pass(args, db, actions, errors):
                 save(terminal, state)
                 actions.append({"issue": number, "dispatch": dispatch, "recovered": pending["why"]})
             if not prompt and state.get("prompt"):
-                # The prompt was answered: give the card back so review_tick reads the coder's report.
-                if ticket and ticket["stage"] == "Needs you":
-                    stage(ticket, state.get("prompt_stage") or phase(ticket, state, title))
-                for key in ("prompt", "prompt_stage"):
-                    state.pop(key, None)
+                restore_prompt(ticket, state, title)
                 save(terminal, state)
-                actions.append({"issue": number, "dispatch": dispatch, "prompt cleared": True})
             if hit:
                 actions.append({"issue": number, "dispatch": dispatch, "limit": hit})
                 restart(w, show, state, f"usage limit ({hit})", False)

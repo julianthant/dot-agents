@@ -1794,10 +1794,10 @@ def close_tick(args, db):
     # Retry the same workspace if a partial close already removed the checkout.
     db.execute("CREATE TABLE IF NOT EXISTS closing (run TEXT, issue INTEGER, workspace TEXT, PRIMARY KEY(run,issue))")
     db.execute("CREATE TABLE IF NOT EXISTS close_notice (run TEXT, issue INTEGER, reason TEXT, sent INTEGER,"
-               " carded INTEGER, request TEXT, PRIMARY KEY(run,issue))")
-    # Older rows keep NULL, which marks a notice recorded before requests were saved.
-    if "request" not in [column[1] for column in db.execute("PRAGMA table_info(close_notice)")]:
-        db.execute("ALTER TABLE close_notice ADD COLUMN request TEXT")
+               " carded INTEGER, PRIMARY KEY(run,issue))")
+    # Its own table, since a tick from before request ids still reads and writes close_notice.
+    db.execute("CREATE TABLE IF NOT EXISTS close_request (run TEXT, issue INTEGER, reason TEXT, request TEXT,"
+               " PRIMARY KEY(run,issue))")
     unconfirmed = []
     for issue, card, branch in candidates:
         number = issue["number"]
@@ -1841,6 +1841,7 @@ def close_tick(args, db):
             with db:
                 db.execute("DELETE FROM closing WHERE run=? AND issue=?", (run, number))
                 db.execute("DELETE FROM close_notice WHERE run=? AND issue=?", (run, number))
+                db.execute("DELETE FROM close_request WHERE run=? AND issue=?", (run, number))
             log("closed", {"issue": number, "branch": branch, "head": sha})
         except (OrcaError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as e:
             log("Needs you", {"issue": number, "reason": str(e)})
@@ -1848,26 +1849,37 @@ def close_tick(args, db):
             # Orca may rewrite a body in transit, so the subject alone names the blocked state.
             digest = hashlib.sha256(str(e).encode()).hexdigest()[:12]
             subject = f"#{number}: Needs you after close ({digest})"
-            notice = db.execute("SELECT reason,sent,carded,request FROM close_notice WHERE run=? AND issue=?",
+            notice = db.execute("SELECT reason,sent,carded FROM close_notice WHERE run=? AND issue=?",
                                 (run, number)).fetchone()
             if not notice or notice[0] != str(e):
-                notice = (str(e), 0, 0, str(uuid.uuid4()))
+                notice, request = (str(e), 0, 0), str(uuid.uuid4())
                 with db:
-                    db.execute("INSERT OR REPLACE INTO close_notice VALUES (?,?,?,0,0,?)", (run, number, str(e), notice[3]))
+                    db.execute("INSERT OR REPLACE INTO close_notice VALUES (?,?,?,0,0)", (run, number, str(e)))
+                    db.execute("INSERT OR REPLACE INTO close_request VALUES (?,?,?,?)", (run, number, str(e), request))
+            else:
+                # A request saved for another reason belongs to another state's notice.
+                request = db.execute("SELECT request FROM close_request WHERE run=? AND issue=? AND reason=?",
+                                     (run, number, str(e))).fetchone()
+                request = request and request[0]
             if not notice[1]:
-                request, landed = notice[3], False
+                landed = False
                 if not request:
                     reply = runtime("orchestration", "inbox", "--terminal", "run:" + run, "--limit", "10000", "--full")
                     messages = reply["messages"]
-                    # This notice: the digest subject, or the legacy subject with this reason as the sender's text,
-                    # which a rejected escalation keeps after its "Original body:" line.
-                    landed = any(m.get("type") == "status" and ((m.get("subject") or "").endswith(subject) or (
-                        (m.get("subject") or "").endswith(f"#{number}: Needs you after close")
-                        and (m.get("body") or "").rpartition("\nOriginal body:\n")[2] == str(e))) for m in messages)
+                    # Sent without a saved request, so under the legacy subject: plain, or in a rejected escalation's
+                    # wrapper that keeps this reason after its first "Original body:" line.
+                    legacy = f"#{number}: Needs you after close"
+                    for m in messages:
+                        head, sep, tail = (m.get("body") or "").partition("\n\nOriginal body:\n")
+                        landed = landed or m.get("type") == "status" and (
+                            (m.get("subject") == legacy and m.get("body") == str(e))
+                            or (m.get("subject") == "Rejected escalation: " + legacy and sep
+                                and head.startswith("Orca rejected this escalation: ") and tail == str(e)))
                     if not landed and not (len(messages) >= 10000 or reply.get("truncated")):
                         request = str(uuid.uuid4())
                         with db:
-                            db.execute("UPDATE close_notice SET request=? WHERE run=? AND issue=?", (request, run, number))
+                            db.execute("INSERT OR REPLACE INTO close_request VALUES (?,?,?,?)",
+                                       (run, number, str(e), request))
                     elif not landed:
                         # It may be past the listing's end: send nothing, keep it pending and fail this tick.
                         unconfirmed.append(number)

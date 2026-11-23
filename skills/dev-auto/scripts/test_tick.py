@@ -712,6 +712,9 @@ for i in range(3):
             assert card.call_args.args[1] == "Fixing" and "dispatch:coder" in cli.call_args.args
         else:
             assert card.call_args.args[1] == "Needs you" and "run:run" in cli.call_args.args
+            # Orca refuses --type escalation from the Run's own pane (sender_not_assignee).
+            sent = cli.call_args.args
+            assert sent[:2] == ("orchestration", "send") and sent[sent.index("--type") + 1] == "status"
             assert all(text in cli.call_args.args[-1] for text in ["round one", "round two", "missing a check"])
         tick.review_step(db, "run", [], ticket, state, [verdict])
         assert cli.call_count == 1
@@ -1003,5 +1006,374 @@ for scenario in ({}, {"merged": False}, {"dirty": True}, {"refused": True},
                  {"release_uncertain": True}, {"remote_race": True}):
     with TemporaryDirectory() as tmp:
         close_fixture(tmp, **scenario)
+
+
+# Screens recorded from live workers. Codex 2026-11-22 at and near its limit; Claude from the retired dev_auto.py tests.
+CODEX_AT_LIMIT = [
+    "■ You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit",
+    "  https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 6:49 PM.",
+    "",
+    "  Approaching rate limits",
+    "› 1. Switch to gpt-6-luna   Uses fewer credits for upcoming turns",
+    "  2. Keep current model",
+    "  3. Keep current model (never show again)   Hide future rate limit reminders about switching models",
+]
+CODEX_NEAR_LIMIT = [
+    "• Ran python3 test_tick.py",
+    "⚠ Heads up, you have less than 5% of your 5h limit left.",
+    "› Ask Codex to do anything",
+    "  gpt-6.2-astra medium · ~/work/repo",
+    "  ⚠ 5h limit: only 4% left · resets at 5:57 PM",
+]
+CODEX_SWITCHED = ["• Working (12s • esc to interrupt)", "› Ask Codex to do anything",
+                  "  GPT-6-Luna medium · ~/work/repo"]
+# Claude Code 2.1.330's wording, read from its installed binary: "You've hit your session limit" (5-hour) and
+# "Usage limit reached · set to continue automatically ..."; its goal status line stays under the limit line.
+CLAUDE_CURRENT = ["⏺ Running the tests.", "  ⎿  You've hit your session limit · resets 5am (America/Los_Angeles)",
+                  "⏺ Goal paused · usage limit reached · resets 5am"]
+assert tick.limited(CLAUDE_CURRENT) == CLAUDE_CURRENT[1].strip()
+assert tick.limited(["Usage limit reached · set to continue automatically at 5am"])
+assert tick.limited([*CLAUDE_CURRENT, "⏺ Back at work."]) is None
+CLAUDE_AT_LIMIT = ["⏺ Running the tests.", "  ⎿  You've hit your 5-hour limit · resets 5am (America/Los_Angeles)",
+                   "Usage limit reached · continuing automatically at 5am · esc to cancel"]
+CLAUDE_WORKING = ["⏺ Reading tick.py", "✶ Prestidigitating… (5m 45s · ↓ 2.8k tokens)", "❯",
+                  "  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt"]
+assert tick.screen_limit(CODEX_AT_LIMIT, {"agent": "codex", "model": "gpt-6.2-astra"}).startswith("■ You've hit")
+assert tick.screen_limit(CODEX_AT_LIMIT[3:], {"agent": "codex", "model": "gpt-6.2-astra"}) == "Approaching rate limits"
+assert tick.screen_limit(CODEX_SWITCHED, {"agent": "codex", "model": "gpt-6.2-astra"}) == "model switched to GPT-6-Luna medium"
+assert tick.screen_limit(CODEX_NEAR_LIMIT, {"agent": "codex", "model": "gpt-6.2-astra"}) is None
+assert tick.screen_limit(CLAUDE_AT_LIMIT, {"agent": "claude", "model": "claude-opus-5-5"}).startswith("Usage limit reached")
+assert tick.screen_limit(CLAUDE_AT_LIMIT[:2], {"agent": "claude", "model": "claude-opus-5-5"}).startswith("⎿  You've hit")
+assert tick.screen_limit(CLAUDE_WORKING, {"agent": "claude", "model": "claude-opus-5-5"}) is None
+assert [l for l in CODEX_NEAR_LIMIT if tick.NEAR_LIMIT.match(l)] == CODEX_NEAR_LIMIT[1:2] + CODEX_NEAR_LIMIT[-1:]
+assert tick.card_agent("coder gpt-6.2-astra medium @jzaw", False, "x2") == "coder gpt-6.2-astra medium @x2"
+assert tick.card_agent("coder m e @a · reviewer m e @b", True, "c") == "coder m e @a · reviewer m e @c"
+
+
+class Fleet:
+    """One coder in the coordinating Run, shaped like the recorded #553 worker-list and worker-show receipts."""
+
+    def __init__(self, tmp, agent="codex", model="gpt-6.2-astra", screen=CODEX_NEAR_LIMIT):
+        self.tmp = Path(tmp)
+        self.holds = self.tmp / "holds.json"
+        self.holds.write_text(json.dumps({"term_coder": {"account": "jzaw", "label": "jzaw", "host": "local"}}))
+        self.agent, self.model, self.screen = agent, model, screen
+        self.dispatch, self.terminal, self.status, self.state = "ctx_coder", "term_coder", "dispatched", "ready"
+        self.liveness, self.failure, self.wait = "live", None, None
+        self.seats = ["jzaw", "x2"]  # the limited account is first in accounts.toml order
+        self.superseded = False
+        self.start_error = None
+        self.events, self.cards, self.now = [], [], 1_795_389_500
+        self.ticket = dict(number=553, item="card", agent=f"coder {model} medium @jzaw", stage="Coding")
+        self.title = "#553 coder"
+        self.notes = []
+        self.tickets_error = None
+        self.db = sqlite3.connect(":memory:")
+
+    def orca(self, *args):
+        self.events.append(args)
+        verb = args[:2]
+        if verb == ("orchestration", "task-list"):
+            return {"tasks": [{"id": "task_coder", "run_id": "run", "task_title": self.title,
+                               "spec": "/goal Implement julianthant/hr-relay#553 and report a green SHA."}]}
+        if verb == ("orchestration", "worker-list"):
+            row = dict(dispatchId=self.dispatch, taskId="task_coder", runId="run", workerState=self.state,
+                       dispatchStatus=self.status, agentTerminalHandle=self.terminal,
+                       resource={"ownerDispatchId": self.dispatch},
+                       projection={"host": {"kind": "local"}, "liveness": {"verdict": self.liveness}})
+            # An older attempt on the same pane is history.
+            old = dict(row, dispatchId="ctx_older", dispatchStatus="failed", resource={"ownerDispatchId": "ctx_older"})
+            # A follow-up's predecessor can be listed while the pane belongs to the newer Dispatch.
+            before = [dict(row, dispatchId="ctx_followed", resource={"ownerDispatchId": self.dispatch})] if self.superseded else []
+            # The Task's earlier attempt on its own, older pane is history too.
+            retried = dict(row, dispatchId="ctx_first", dispatchStatus="failed", workerState="failed",
+                           agentTerminalHandle="term_first", resource={"ownerDispatchId": "ctx_first"})
+            return {"workers": [*before, row, old, retried], "page": {"hasMore": False, "nextCursor": None}}
+        if verb == ("orchestration", "worker-show"):
+            assert args[3] == self.dispatch, args
+            return {"dispatch": {"id": self.dispatch, "runId": "run", "taskId": "task_coder", "status": self.status,
+                                 "assigneeHandle": self.terminal, "lastFailure": self.failure},
+                    "worker": {"state": self.state, "worktreeId": "repo::/wt",
+                               "startOptions": {"launch": {"effective": {"agent": self.agent, "model": self.model,
+                                                                         "effort": "medium"}}}},
+                    "projection": {"liveness": {"verdict": self.liveness}},
+                    "terminal": {"handle": self.terminal, "agentWait": self.wait}, "observation": {"agentWait": self.wait}}
+        if verb == ("terminal", "read"):
+            return {"terminal": {"handle": self.terminal, "tail": self.screen, "source": "screen"}}
+        if verb == ("orchestration", "worker-stop"):
+            self.state, self.status, self.failure = "stopped", "failed", "stopped"
+            return {"dispatchId": self.dispatch, "processAction": "closed_agent_terminal"}
+        if verb == ("account", "select"):
+            self.active = args[-1]
+            return {}
+        if verb == ("account", "list"):
+            return {self.agent: {"activeAccountId": self.active}}
+        if verb == ("orchestration", "worker-start"):
+            if self.start_error:
+                raise self.start_error
+            # The same Task retries: no second same-titled Task for review discovery to refuse.
+            assert args[args.index("--task") + 1] == "task_coder" and args[args.index("--retry-of") + 1] == self.dispatch
+            assert "--spec" not in args and "--task-title" not in args and self.status == "failed", args
+            assert args[args.index("--worktree") + 1] == "id:repo::/wt"
+            self.dispatch, self.terminal = "ctx_restart", "term_restart"
+            self.status, self.state, self.liveness, self.failure = "dispatched", "ready", "live", None
+            self.screen = CLAUDE_WORKING
+            return full_start("ctx_restart", "term_restart")
+        if verb == ("orchestration", "send"):
+            if args[args.index("--to") + 1] == "dispatch:ctx_restart":
+                self.notes.append(args[args.index("--body") + 1])
+            return {"delivery": "queued"}
+        raise AssertionError(args)
+
+    def tick(self, minutes=0):
+        self.now += minutes * 60
+        self.events.clear()
+        seat = lambda cfg, *route, now=None: (
+            (next(({"id": s, "label": s} for s in self.seats if s in [r["id"] for r in cfg["account"]]), None), ["full"]))
+        cfg = {"account": [{"id": "jzaw"}, *({"id": s} for s in self.seats)]}
+        record = lambda ticket, stage, agent: (self.cards.append((stage, agent)), ticket.update(agent=agent))
+        out = io.StringIO()
+        with patch.object(tick, "supervisor", return_value=([], "run")), patch.object(tick, "runtime", self.orca), \
+                patch.object(tick, "tickets", side_effect=self.tickets_error, return_value=[self.ticket]), patch.object(tick, "review_card", record), \
+                patch.object(pick, "main", return_value=0), patch.object(pick, "due", return_value=[]), \
+                patch.object(pick, "pick", seat), patch.object(pick.account_usage, "load_config", return_value=cfg), \
+                patch.object(tick.time, "time", return_value=self.now), redirect_stdout(out):
+            try:
+                tick.watch_tick(SimpleNamespace(holds=self.holds), self.db)
+            finally:
+                self.lines = out.getvalue().splitlines()
+        assert len(self.lines) == 1 and self.lines[0].startswith("watch"), self.lines
+        return [e[:2] for e in self.events]
+
+    def sent(self):
+        return [(e[e.index("--to") + 1], e[e.index("--subject") + 1]) for e in self.events
+                if e[:2] == ("orchestration", "send") and e[e.index("--to") + 1] != "dispatch:ctx_restart"]
+
+
+# Near its limit: one handoff request, Handed off on the card, then the same Task retries on another seat.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp)
+    tick.review_state(f.db, "run", 553)
+    tick.save_review(f.db, "run", 553, {"coder": "ctx_coder", "expected": "ctx_coder", "coder_terminal": "term_coder"})
+    f.tick()
+    assert f.sent() == [("dispatch:ctx_coder", "#553: hand off now")] and f.cards == [("Handed off", f.ticket["agent"])]
+    assert "handoff" in f.lines[0]
+    f.holds.write_text("{}")  # a pruned hold: the remembered account is still excluded
+    f.tick(1)
+    assert f.sent() == [] and len(f.cards) == 1  # asked once
+    f.status, f.state = "failed", "failed"
+    # A recorded failed worker_done receipt: the checkpoint is in reportPath, the body is generic.
+    f.failure = json.dumps({"provenance": "worker_report", "outcome": "failed", "subject": "handed off",
+                            "body": "Stopping at the usage limit.", "reportPath": "/wt/.handoff-553.md"})
+    calls = f.tick(1)
+    assert ("orchestration", "worker-start") in calls and ("orchestration", "worker-stop") not in calls
+    assert len(f.notes) == 1 and "/wt/.handoff-553.md" in f.notes[0] and "Stopping at the usage limit." in f.notes[0]
+    assert f.active == "x2" and f.cards[-1] == ("Coding", "coder gpt-6.2-astra medium @x2")
+    holds = json.loads(f.holds.read_text())
+    assert "term_coder" not in holds and holds["term_restart"]["account"] == "x2"
+    review = tick.review_state(f.db, "run", 553)
+    assert (review["coder"], review["coder_terminal"]) == ("ctx_restart", "term_restart")
+    # Review discovery still finds exactly one "#553 coder" Task, whose newest Dispatch is the retry.
+    assert [t["id"] for t in f.orca("orchestration", "task-list")["tasks"] if t["task_title"] == "#553 coder"] == ["task_coder"]
+
+# At the limit, on a model-switch menu, or after Codex switched models: stop it, then retry on another account.
+for agent, model, screen in (("codex", "gpt-6.2-astra", CODEX_AT_LIMIT), ("codex", "gpt-6.2-astra", CODEX_SWITCHED),
+                             ("claude", "claude-opus-5-5", CLAUDE_AT_LIMIT), ("claude", "claude-opus-5-5", CLAUDE_CURRENT)):
+    with TemporaryDirectory() as tmp:
+        f = Fleet(tmp, agent, model, screen)
+        calls = f.tick()
+        assert calls.index(("orchestration", "worker-stop")) < calls.index(("orchestration", "worker-start")), calls
+        assert ("account", "select", "--agent", agent, "--account", "x2") in f.events
+        assert [c[0] for c in f.cards] == ["Handed off", "Coding"]
+        assert not any(e[:2] == ("terminal", "send") for e in f.events)  # never types into the pane
+
+# No hold ever recorded: the exhausted account cannot be excluded, so nothing is stopped and the Run decides.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    f.holds.write_text("{}")
+    calls = f.tick()
+    assert ("orchestration", "worker-stop") not in calls and ("orchestration", "worker-start") not in calls
+    assert f.sent() == [("run:run", "#553: limit account unknown")] and f.cards[-1][0] == "Needs you"
+    f.tick(1)
+    assert f.sent() == []
+
+# No seat: the card stays Handed off, the worker is left as is, and each tick retries.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    f.seats = ["jzaw"]
+    assert ("orchestration", "worker-start") not in f.tick() and f.cards == [("Handed off", f.ticket["agent"])]
+    assert "waiting for seat" in f.lines[0] and ("orchestration", "worker-stop") not in [e[:2] for e in f.events]
+    f.seats = ["jzaw", "x2"]
+    calls = f.tick(5)
+    assert ("orchestration", "worker-stop") in calls and ("orchestration", "worker-start") in calls
+    assert f.cards[-1][0] == "Coding"
+
+# A lost worker-start response is never replayed: the coordinator inspects it.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    f.superseded = True
+    f.start_error = tick.OrcaError("timed out")
+    try:
+        f.tick()
+        raise AssertionError("watch should report the failed start")
+    except tick.OrcaError:
+        assert "timed out" in f.lines[0]
+    f.start_error = None
+    calls = f.tick(1)
+    assert ("orchestration", "worker-start") not in calls and f.sent() == [("run:run", "#553: restart unconfirmed")]
+
+# A crash relaunches once, on any seat, in the worker's own phase; a second crash goes to the Run as Needs you.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.seats = ["jzaw"]
+    f.liveness, f.ticket["stage"] = "exited", "Fixing"
+    assert ("orchestration", "worker-start") in f.tick() and f.cards == [("Fixing", "coder gpt-6.2-astra medium @jzaw")]
+    f.liveness = "exited"
+    calls = f.tick(1)
+    assert ("orchestration", "worker-start") not in calls and f.sent() == [("run:run", "#553: worker crashed again")]
+    assert f.cards[-1][0] == "Needs you"
+    f.tick(1)
+    assert f.sent() == []
+
+# A reviewer Orca already settled as failed, before any watch row: relaunched once, card kept at Reviewing.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.title, f.ticket["stage"], f.ticket["agent"] = "#553 reviewer", "Reviewing", "coder m e @a · reviewer m e @jzaw"
+    f.status, f.state, f.liveness, f.failure = "failed", "failed", "exited", "agent process exited"
+    assert ("orchestration", "worker-start") in f.tick()
+    assert f.cards == [("Reviewing", "coder m e @a · reviewer m e @jzaw")]
+    f.tick(1)
+    assert ("orchestration", "worker-start") not in [e[:2] for e in f.events]
+# The same failed receipt for a ticket no longer in work is history.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.ticket["stage"] = "Merging"
+    f.status, f.state, f.liveness, f.failure = "failed", "failed", "exited", "agent process exited"
+    assert f.tick() == [("orchestration", "task-list"), ("orchestration", "worker-list"),
+                        ("orchestration", "worker-show")] and f.lines == ['watch        "no action"']
+
+# An unchanged screen for 20 minutes: nudge once, then report; a changing screen is never silent.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.tick()
+    f.tick(19)
+    assert f.sent() == []
+    f.tick(1)
+    assert f.sent() == [("dispatch:ctx_coder", "#553: still working?")]
+    f.tick(19)
+    assert f.sent() == []
+    f.tick(1)
+    assert f.sent() == [("run:run", "#553: silent worker")] and f.cards == []
+    f.tick(30)
+    assert f.sent() == []
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    for minute in range(5):
+        f.screen = [*CLAUDE_WORKING[:1], f"✶ Prestidigitating… ({minute * 10}m · ↓ 2.8k tokens)"]
+        f.tick(10)
+    assert f.sent() == []
+
+# Only a limit dialog showing now counts: the same menu above newer healthy output is history.
+CODEX_HEALTHY = ["• Kept the current model; running the tests.", "› Ask Codex to do anything",
+                 "  gpt-6.2-astra medium · ~/work/repo"]
+assert tick.screen_limit([*CODEX_AT_LIMIT, *CODEX_HEALTHY], {"agent": "codex", "model": "gpt-6.2-astra"}) is None
+assert tick.screen_limit([*CODEX_AT_LIMIT[3:], ""], {"agent": "codex", "model": "gpt-6.2-astra"}) == "Approaching rate limits"
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=[*CODEX_AT_LIMIT, *CODEX_HEALTHY])
+    calls = f.tick()
+    assert ("orchestration", "worker-stop") not in calls and f.cards == [] and f.sent() == []
+
+# A limit restart parked for a seat rechecks the live screen: a recovered worker is not stopped and gets its card back.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    f.seats = ["jzaw"]
+    f.tick()
+    assert f.cards == [("Handed off", f.ticket["agent"])]
+    f.seats, f.screen = ["jzaw", "x2"], CODEX_HEALTHY
+    calls = f.tick(5)
+    assert ("orchestration", "worker-stop") not in calls and ("orchestration", "worker-start") not in calls
+    assert f.cards[-1][0] == "Coding" and "recovered" in f.lines[0]
+    f.screen = CODEX_AT_LIMIT  # a later limit is handled afresh
+    calls = f.tick(5)
+    assert calls.index(("orchestration", "worker-stop")) < calls.index(("orchestration", "worker-start"))
+
+# A cleared prompt gives the card back, so review_tick's discovery reads the coder's successful report.
+def discovered(ticket):
+    found = []
+    def orca(*args):
+        if args[1] == "inbox":
+            return {"messages": [report("ctx_coder", "green at " + sha)]}
+        if args[1] == "task-list":
+            return {"tasks": [{"id": "task_coder", "title": "#553 coder"}]}
+        if args[1] == "dispatch-show":
+            return {"dispatch": {"id": "ctx_coder"}}
+        if args[1] == "worker-show":
+            return {"dispatch": {"id": "ctx_coder", "runId": "run", "taskId": "task_coder", "assigneeHandle": "term_coder"},
+                    "worker": {"worktreeId": "repo::/wt", "startOptions": {"launch": {"effective": {"model": "gpt-6.2-astra"}}}}}
+        if args[:2] == ("worktree", "show"):
+            return {"worktree": {"id": "repo::/wt", "path": "/wt", "branch": "refs/heads/task/dev-auto/watch-workers"}}
+        raise AssertionError(args)
+    with patch.object(tick, "supervisor", return_value=([], "run")), patch.object(tick, "runtime", orca), \
+            patch.object(tick, "tickets", return_value=[ticket]), \
+            patch.object(tick, "command", return_value="https://github.com/julianthant/dot-agents.git"), \
+            patch.object(tick, "review_step", lambda *a: found.append(a[3]["number"])):
+        tick.review_tick(SimpleNamespace(issue=None, coder=None), sqlite3.connect(":memory:"))
+    return found
+
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.ticket.update(branch="task/dev-auto/watch-workers", repo="dot-agents")
+    f.wait = {"kind": "permission", "approvalId": "appr_1"}
+    f.tick()
+    assert f.ticket["stage"] == "Needs you" and discovered(f.ticket) == []
+    f.wait = None
+    f.tick(1)
+    assert f.cards[-1] == ("Coding", f.ticket["agent"]) and "prompt cleared" in f.lines[0]
+    assert discovered(f.ticket) == [553]
+    f.tick(1)
+    assert len(f.cards) == 2  # restored once
+
+# The coder answers its prompt and reports success before the next tick: the card is restored, then the row goes.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.ticket.update(branch="task/dev-auto/watch-workers", repo="dot-agents")
+    f.wait = {"kind": "permission", "approvalId": "appr_1"}
+    f.tick()
+    assert f.ticket["stage"] == "Needs you"
+    f.wait, f.status, f.state, f.liveness = None, "completed", "succeeded", "exited"
+    f.tick(1)
+    assert f.cards[-1] == ("Coding", f.ticket["agent"]) and "prompt cleared" in f.lines[0]
+    assert not f.db.execute("SELECT * FROM watch").fetchall() and discovered(f.ticket) == [553]
+
+# A permission prompt is forwarded to the Run once and the card goes to Needs you; nothing is typed or approved.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.wait = {"kind": "permission", "approvalId": "appr_1"}
+    f.tick()
+    assert f.sent() == [("run:run", "#553: permission prompt")] and f.cards[-1][0] == "Needs you"
+    escalation = next(e for e in f.events if e[:2] == ("orchestration", "send"))
+    assert escalation[escalation.index("--type") + 1] == "status"
+    assert not any(e[1] in ("approve", "deny") for e in f.events)
+    f.tick(1)
+    assert f.sent() == []
+
+# An operator stop, or a finished worker, ends the watch; neither is relaunched.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.tick()
+    f.status, f.state, f.failure, f.liveness = "failed", "stopped", "stopped", "exited"
+    assert ("orchestration", "worker-start") not in f.tick(1) and f.sent() == []
+    assert not f.db.execute("SELECT * FROM watch").fetchall()
+
+# A Project lookup failure after the coordinator check still logs one structured watch line, then fails the tick.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp)
+    f.tickets_error = tick.OrcaError("gh: project unavailable")
+    try:
+        f.tick()
+        raise AssertionError("watch should fail")
+    except tick.OrcaError:
+        pass
+    assert json.loads(f.lines[0].split(None, 1)[1]) == [{"tick": "gh: project unavailable"}]
 
 print("ok")

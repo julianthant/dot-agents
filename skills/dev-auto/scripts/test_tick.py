@@ -863,7 +863,7 @@ with patch.object(roadmap, "gh", lambda *a: rm_answer(list(a))), \
         patch.object(tick, "command", lambda *a: json.dumps(rm_answer(list(a[1:])))):
     built = roadmap.build({"open": RM_OPEN, "closed": RM_CLOSED})  # open issues in creation order, as the snapshot keeps them
 built.pop("generated")
-check.assertEqual(built, ROADMAP_BEFORE)
+check.assertEqual(built, {**ROADMAP_BEFORE, "tick": None})
 
 # Bug 8: field-list costs about 100 points, so the Project's ids are cached and refetched only on a miss or a failed edit.
 with TemporaryDirectory() as tmp:
@@ -2598,6 +2598,67 @@ with TemporaryDirectory() as tmp:
     except tick.OrcaError:
         pass
     assert json.loads(f.lines[0].split(None, 1)[1]) == [{"tick": "gh: project unavailable"}]
+
+with TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    args = SimpleNamespace(anchor="term_anchor", run="run_live", repo_paths=[root / "hr-relay", root / "dot-agents"])
+    with sqlite3.connect(root / "starts.sqlite") as db:
+        tick.reserve(db, 555, {"run": "run_live", "dispatch": "ctx_existing"})
+
+    calls = []
+
+    def phase(name):
+        def run(options, db):
+            assert (options.anchor, options.run) == ("term_anchor", "run_live")
+            assert json.loads(db.execute("SELECT receipt FROM starts WHERE issue=555").fetchone()[0]) == {
+                "run": "run_live", "dispatch": "ctx_existing"}
+            calls.append((name, options.repo_path))
+            if name == "review":
+                raise tick.OrcaError("private CLI error")
+        return run
+
+    with patch.object(tick, "SNAPSHOT", root / "issues.json"), \
+            patch.object(tick, "supervisor", return_value=(["--from", args.anchor, "--run", args.run], args.run)) as bind, \
+            patch.object(tick, "watch_tick", phase("watch")), patch.object(tick, "review_tick", phase("review")), \
+            patch.object(tick, "close_tick", phase("close")), patch.object(tick, "fill_tick", phase("fill")), \
+            redirect_stdout(io.StringIO()) as output:
+        assert tick.scheduled_tick(args) == 1
+        bind.assert_called_once()
+        status = json.loads((root / "tick.json").read_text())
+        assert status["lastRun"] and status["errors"] == [{"phase": "review", "error": "OrcaError"}], status
+        assert "private CLI error" in output.getvalue()
+        assert calls == [("watch", None), ("review", None), ("close", args.repo_paths[0]),
+                         ("close", args.repo_paths[1]), ("fill", args.repo_paths[0]), ("fill", args.repo_paths[1])]
+        calls.clear()
+        bind.side_effect = tick.OrcaError("wrong Run")
+        assert tick.scheduled_tick(args) == 1
+        assert calls == []
+        assert json.loads((root / "tick.json").read_text())["errors"] == [{"phase": "adopt", "error": "OrcaError"}]
+
+    import fcntl
+    with (root / "fill.lock").open("a+") as lock, patch.object(tick, "SNAPSHOT", root / "issues.json"), \
+            patch.object(tick, "supervisor") as bind, redirect_stdout(io.StringIO()):
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        before = (root / "tick.json").read_text()
+        assert tick.scheduled_tick(args) == 0
+        bind.assert_not_called()
+        assert (root / "tick.json").read_text() == before
+
+    import install_tick
+    for repo in args.repo_paths:
+        repo.mkdir()
+    accounts = root / "accounts.toml"
+    with patch.object(tick, "SNAPSHOT", root / "issues.json"), patch.object(tick, "ORCA", "orca"), \
+            patch.object(install_tick.account_usage, "ACCOUNTS", accounts), \
+            patch.object(install_tick.shutil, "which", side_effect=lambda tool: f"/cli/{tool}"):
+        agent = install_tick.launch_agent(args)
+    assert agent["StartInterval"] == 60 and agent["RunAtLoad"] is True
+    assert agent["ProgramArguments"] == [sys.executable, str(tick.HERE / "tick.py"), "scheduled",
+                                         "--anchor", args.anchor, "--run", args.run,
+                                         "--repo-path", str(args.repo_paths[0].resolve()),
+                                         "--repo-path", str(args.repo_paths[1].resolve())]
+    assert agent["EnvironmentVariables"]["ORCA_CLI_COMMAND"] == "/cli/orca"
+    assert agent["EnvironmentVariables"]["DEV_AUTO_ACCOUNTS"] == str(accounts)
 
 print("ok")
 

@@ -344,26 +344,33 @@ OWNER = "julianthant"
 HERE = Path(__file__).resolve().parent
 
 # Nested connections must be complete before their absence can establish readiness.
-QUERY = """
-query($endCursor:String) {
+ISSUE_FIELDS = """number title body state stateReason updatedAt issueType {name} milestone {title}
+  parent {number} subIssuesSummary {total completed}
+  assignees {totalCount} subIssues {totalCount} closedByPullRequestsReferences {totalCount}
+  labels(first:100){totalCount nodes{name}}
+  blockedBy(first:100){totalCount nodes{number state}}
+  blocking(first:100){totalCount nodes{state}}
+  projectItems(first:20){totalCount nodes{id project{number owner{... on User{login} ... on Organization{login}}}
+    status:fieldValueByName(name:"Status"){... on ProjectV2ItemFieldSingleSelectValue{name}}
+    agent:fieldValueByName(name:"Agent"){... on ProjectV2ItemFieldTextValue{text}}
+    stage:fieldValueByName(name:"Agent state"){... on ProjectV2ItemFieldSingleSelectValue{name}}
+    area:fieldValueByName(name:"Area"){... on ProjectV2ItemFieldSingleSelectValue{name}}
+  }}"""
+# Open issues keep creation order so an update mid-read cannot skip one; closed issues come newest first.
+ISSUES_QUERY = """query($endCursor:String,$states:IssueState!,$since:DateTime) {
   repository(owner:"julianthant",name:"hr-relay") {
-    issues(first:50,states:OPEN,after:$endCursor) {
+    issues(first:50,states:[$states],after:$endCursor,filterBy:{since:$since}%s) {
       pageInfo { hasNextPage endCursor }
-      nodes { number title body issueType {name} milestone {title}
-        assignees {totalCount} subIssues {totalCount} closedByPullRequestsReferences {totalCount}
-        labels(first:100){totalCount nodes{name}}
-        blockedBy(first:100){totalCount nodes{state}}
-        blocking(first:100){totalCount nodes{state}}
-        projectItems(first:20){totalCount nodes{id project{number owner{... on User{login} ... on Organization{login}}}
-          status:fieldValueByName(name:"Status"){... on ProjectV2ItemFieldSingleSelectValue{name}}
-          agent:fieldValueByName(name:"Agent"){... on ProjectV2ItemFieldTextValue{text}}
-          stage:fieldValueByName(name:"Agent state"){... on ProjectV2ItemFieldSingleSelectValue{name}}
-        }}
-      }
+      nodes { """ + ISSUE_FIELDS + """ }
     }
   }
 }
 """
+# One issue read per minute, shared by every tick verb and the roadmap rebuild (#592 bug 8).
+SNAPSHOT = Path.home() / ".local/state/dev-auto/issues.json"
+SNAPSHOT_SECONDS = 60
+CLOSED_FULL_SECONDS = 600
+CLOSED_KEPT = 400
 
 
 class StartNotApplied(OrcaError):
@@ -372,6 +379,8 @@ class StartNotApplied(OrcaError):
 
 def command(*args):
     result = subprocess.run(args, capture_output=True, text=True, timeout=900 if "worker-start" in args else 90)
+    if args[:3] == ("gh", "project", "item-edit"):
+        stale_snapshot()
     if result.returncode:
         if args[1:3] == ("orchestration", "worker-start"):
             try:
@@ -438,44 +447,100 @@ def coder_route(body):
         return m.groups()
 
 
-def tickets():
-    pages = json.loads(command("gh", "api", "graphql", "--paginate", "--slurp", "-f", "query=" + QUERY))
+def issue_nodes(state, since=None, limit=None):
+    order = ",orderBy:{field:UPDATED_AT,direction:DESC}" if state == "CLOSED" else ""
+    out, cursor = [], None
+    while limit is None or len(out) < limit:
+        args = ["gh", "api", "graphql", "-f", "query=" + ISSUES_QUERY % order, "-f", "states=" + state]
+        args += ["-f", "since=" + since] if since else []
+        args += ["-f", "endCursor=" + cursor] if cursor else []
+        page = json.loads(command(*args))["data"]["repository"]["issues"]
+        out += page["nodes"]
+        if not page["pageInfo"]["hasNextPage"]:
+            break
+        cursor = page["pageInfo"]["endCursor"]
+    return out[:limit]
+
+
+def snapshot(fresh=False):
+    """Open issues and the newest closed ones, refetched at most once a minute across processes."""
+    import fcntl
+    SNAPSHOT.parent.mkdir(parents=True, exist_ok=True)
+    with SNAPSHOT.with_suffix(".lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            old = json.loads(SNAPSHOT.read_text())
+        except (OSError, ValueError):
+            old = {}
+        now = time.time()
+        if not fresh and 0 <= now - old.get("fetched", 0) < SNAPSHOT_SECONDS:
+            return old
+        opened = issue_nodes("OPEN")
+        # Closed issues change only when updated, so read the recent ones and a full list every ten minutes.
+        full = not 0 <= now - old.get("closed_full", 0) < CLOSED_FULL_SECONDS
+        since = None if full else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(old["read"] - 120))
+        closed = {} if full else {i["number"]: i for i in old.get("closed", [])}
+        closed.update((i["number"], i) for i in issue_nodes("CLOSED", since, CLOSED_KEPT if full else None))
+        numbers = {i["number"] for i in opened}
+        closed = sorted((i for n, i in closed.items() if n not in numbers), key=lambda i: i["updatedAt"], reverse=True)
+        new = {"fetched": now, "read": now, "closed_full": now if full else old["closed_full"],
+               "open": opened, "closed": closed[:CLOSED_KEPT]}
+        tmp = SNAPSHOT.with_suffix(".tmp")
+        tmp.write_text(json.dumps(new))
+        tmp.replace(SNAPSHOT)
+        return new
+
+
+def stale_snapshot():
+    """After a Project write, the next reader refetches open issues but keeps the closed list."""
+    import fcntl
+    with SNAPSHOT.with_suffix(".lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            old = json.loads(SNAPSHOT.read_text())
+        except (OSError, ValueError):
+            return
+        tmp = SNAPSHOT.with_suffix(".tmp")
+        tmp.write_text(json.dumps({**old, "fetched": 0}))
+        tmp.replace(SNAPSHOT)
+
+
+def tickets(fresh=False):
     result = []
-    for page in pages:
-        for i in page["data"]["repository"]["issues"]["nodes"]:
-            card = next((c for c in nodes(i["projectItems"]) if c["project"]["number"] == PROJECT
-                         and c["project"]["owner"]["login"] == OWNER), None)
-            body = i["body"]
-            branch_section = section(body, "Branch")
-            m = re.search(r"\btask/([\w-]+)/([\w-]+)", branch_section)
-            branch = m[0] if m else None
-            if not branch:
-                slug = re.fullmatch(r"([\w-]+)\s*/\s*([\w-]+(?:[ \t]+[\w-]+)*)(?:\s*:.*)?", i["title"].strip())
-                if slug:
-                    lane = "-".join(slug[2].lower().split())
-                    branch = f"task/{slug[1].lower()}/{lane}"
-            dot = "dot-agents" in branch_section
-            card = card or {}
-            stage = (card.get("stage") or {}).get("name")
-            if dot:
-                base = "origin/main"
-            elif "development" in branch_section and "feature/" not in branch_section:
-                base = "origin/development"
-            else:
-                base = "origin/feature/" + branch.split("/")[1] if branch else None
-            result.append({
-                "number": i["number"], "title": i["title"], "item": card.get("id"), "body": body,
-                "agent": (card.get("agent") or {}).get("text"), "stage": stage,
-                "status": (card.get("status") or {}).get("name"), "kind": (i["issueType"] or {}).get("name"),
-                "assigned": bool(i["assignees"]["totalCount"] or (card.get("agent") or {}).get("text")),
-                "busy": bool(i["closedByPullRequestsReferences"]["totalCount"] or stage not in (None, "Queued")),
-                "later": (i["milestone"] or {}).get("title", "").lower() == "later"
-                         or any(label["name"].lower() == "later" for label in nodes(i["labels"])),
-                "blocked": bool(i["subIssues"]["totalCount"] or any(b["state"] == "OPEN" for b in nodes(i["blockedBy"]))),
-                "score": sum(b["state"] == "OPEN" for b in nodes(i["blocking"])),
-                "route": coder_route(body), "paths": owned_paths(body), "branch": branch, "base": base,
-                "repo": "dot-agents" if dot else "hr-relay",
-            })
+    for i in snapshot(fresh)["open"]:
+        card = next((c for c in nodes(i["projectItems"]) if c["project"]["number"] == PROJECT
+                     and c["project"]["owner"]["login"] == OWNER), None)
+        body = i["body"]
+        branch_section = section(body, "Branch")
+        m = re.search(r"\btask/([\w-]+)/([\w-]+)", branch_section)
+        branch = m[0] if m else None
+        if not branch:
+            slug = re.fullmatch(r"([\w-]+)\s*/\s*([\w-]+(?:[ \t]+[\w-]+)*)(?:\s*:.*)?", i["title"].strip())
+            if slug:
+                lane = "-".join(slug[2].lower().split())
+                branch = f"task/{slug[1].lower()}/{lane}"
+        dot = "dot-agents" in branch_section
+        card = card or {}
+        stage = (card.get("stage") or {}).get("name")
+        if dot:
+            base = "origin/main"
+        elif "development" in branch_section and "feature/" not in branch_section:
+            base = "origin/development"
+        else:
+            base = "origin/feature/" + branch.split("/")[1] if branch else None
+        result.append({
+            "number": i["number"], "title": i["title"], "item": card.get("id"), "body": body,
+            "agent": (card.get("agent") or {}).get("text"), "stage": stage,
+            "status": (card.get("status") or {}).get("name"), "kind": (i["issueType"] or {}).get("name"),
+            "assigned": bool(i["assignees"]["totalCount"] or (card.get("agent") or {}).get("text")),
+            "busy": bool(i["closedByPullRequestsReferences"]["totalCount"] or stage not in (None, "Queued")),
+            "later": (i["milestone"] or {}).get("title", "").lower() == "later"
+                     or any(label["name"].lower() == "later" for label in nodes(i["labels"])),
+            "blocked": bool(i["subIssues"]["totalCount"] or any(b["state"] == "OPEN" for b in nodes(i["blockedBy"]))),
+            "score": sum(b["state"] == "OPEN" for b in nodes(i["blocking"])),
+            "route": coder_route(body), "paths": owned_paths(body), "branch": branch, "base": base,
+            "repo": "dot-agents" if dot else "hr-relay",
+        })
     return result
 
 
@@ -687,7 +752,7 @@ def fill_tick(args, db):
             base=ticket["base"], agent=route[0], model=route[1], effort=route[2], advisor=route[3], account=acct["label"]))
         if not args.dry_run:
             # Refresh GitHub, ownership and the picker immediately before committing to side effects.
-            current = mark_pending([t for t in tickets() if t["repo"] == repo])
+            current = mark_pending([t for t in tickets(fresh=True) if t["repo"] == repo])
             latest = inventory(repo_path, current, repo)
             candidate = next(fill_plan(current, lambda r, extra: seat(r, extra, latest, pending), n), None)
             if not candidate or candidate[0].get("occupied") or candidate[1]["id"] != acct["id"] or any(

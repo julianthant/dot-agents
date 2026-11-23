@@ -112,7 +112,7 @@ class Roadmap(unittest.TestCase):
         tick.SNAPSHOT.write_text(json.dumps(snap))
 
         def refs(argv):
-            return {"get-url": "https://github.com/julianthant/hr-relay.git",
+            return {"remote": "https://github.com/julianthant/hr-relay.git",
                     "for-each-ref": "", "ls-remote": "abc refs/heads/feature/lane"}[argv[3]]
 
         def seat(*args, holds):

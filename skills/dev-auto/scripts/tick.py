@@ -848,8 +848,9 @@ def fill_tick(args, db, *, issues=None, emit=log):
             t["skip"].append("base missing on origin")
     cfg = pick.account_usage.load_config()
     holds_path = (args.holds or pick.HOLDS).resolve()
+    planned_at = time.time()
 
-    def seat(route, extra, handles=live, reservations=pending.copy()):
+    def seat(route, extra, handles=live, reservations=pending.copy(), now=planned_at):
         holds = json.loads(holds_path.read_text()) if holds_path.exists() else {}
         held = [h for handle, h in holds.items() if handle in handles and h["host"] == "local"]
         for rec in reservations.values():
@@ -857,7 +858,7 @@ def fill_tick(args, db, *, issues=None, emit=log):
                 agent, model, effort = rec["route"][:3]
                 held.append(dict(account=rec["account"], agent=agent, model=model, effort=effort))
         # pick.live_holds prunes the real file; use the read-only snapshot for planning.
-        return pick.pick(cfg, *route[:3], "local", time.time(), holds=held + extra)
+        return pick.pick(cfg, *route[:3], "local", now, holds=held + extra)
 
     count = 0
     decisions = {}
@@ -876,7 +877,8 @@ def fill_tick(args, db, *, issues=None, emit=log):
             # Refresh GitHub, ownership and the picker immediately before committing to side effects.
             current = mark_pending([t for t in tickets(fresh=True) if t["repo"] == repo])
             latest = inventory(repo_path, current, repo, emit)
-            candidate = next(fill_plan(current, lambda r, extra: seat(r, extra, latest, pending), n, owed), None)
+            candidate = next(fill_plan(current, lambda r, extra: seat(r, extra, latest, pending, time.time()),
+                                       n, owed), None)
             if not candidate or not candidate[1] or candidate[1]["id"] != acct["id"] or any(
                 candidate[0][k] != ticket[k] for k in ("branch", "base", "route", "paths", "item")):
                 raise OrcaError(f"#{n} readiness or seat changed")
@@ -1200,12 +1202,11 @@ def reconcile_start(db, number, rec, actor):
         raise OrcaError(f"#{number} reserved: assignee changed for Dispatch {dispatch_id}")
     # The verified attempt has consumed the worker's selection; the coordinator's comes back before anything else can fail.
     return_coordinator(db, number, rec)
-    if terminal:
-        post_overlap_note(db, number, rec)
     resource = (show.get("projection") or {}).get("resource") or {}
     released_failure = worker["state"] == "failed" and resource.get("terminalState") == "released"
     if released_failure or dispatch.get("status") == "completed":
         if terminal and (show.get("terminal") or {}).get("handle") == terminal and not released_failure:
+            post_overlap_note(db, number, rec)
             record_hold(dict(rec, terminal=terminal))
         log("already settled", {"issue": number, "task": task, "dispatch": dispatch_id, "state": worker["state"]})
         with db:
@@ -1227,6 +1228,7 @@ def reconcile_start(db, number, rec, actor):
         if not observed_terminal and "agentWait" not in observation:
             raise OrcaError(f"#{number} reserved: no Codex startup observation for {dispatch_id}")
         if prompt or wait:
+            post_overlap_note(db, number, rec)
             record_hold(rec)
             notice = {"issue": number, "task": task, "dispatch": dispatch_id, "prompt": prompt or wait}
             if rec.get("notice") != notice:
@@ -1246,6 +1248,7 @@ def reconcile_start(db, number, rec, actor):
             return
     if worker["state"] != "ready":
         raise OrcaError(f"#{number} reserved: inspect {dispatch_id}, worker state {worker['state']}")
+    post_overlap_note(db, number, rec)
     record_start(db, number, rec)
     log("started", {"issue": number, "dispatch": dispatch_id})
 

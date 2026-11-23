@@ -83,7 +83,7 @@ Run `scripts/tick.py watch` from the coordinating Run (or pass its launchd
 `--anchor` and `--run`). Each tick runs `pick.py coordinator`, then checks
 the current attempt of every live worker in the Run and logs one `watch` line:
 
-- A limit screen, the Codex model-switch menu or a switched Codex model:
+- A limit screen or the Codex model-switch menu (a Codex status line naming another model is not a limit):
   once `pick.py` gives a different account, `worker-stop`, then the same Task
   restarts with `worker-start --task <task> --retry-of <dispatch>`. The
   replacement then gets mail with the predecessor's `reportPath` and report.

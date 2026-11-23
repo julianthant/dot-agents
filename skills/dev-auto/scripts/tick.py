@@ -846,7 +846,7 @@ def launch(db, repo_path, t, acct, args, holds_path):
     wt = runtime("worktree", "create", "--repo", "path:" + str(repo_path), "--name", branch[5:].replace("/", "."),
                  "--branch", branch, "--base-branch", t["base"], "--no-parent", "--setup", "skip")["worktree"]
     path = Path(wt["path"])
-    settings_change = None
+    settings_change = task = None
     try:
         actual_branch = command("git", "-C", str(path), "branch", "--show-current").strip()
         if wt["branch"].removeprefix("refs/heads/") != branch or actual_branch != branch:
@@ -859,18 +859,24 @@ def launch(db, repo_path, t, acct, args, holds_path):
                        "--spec", spec, "--full")["task"]["id"]
         selected = runtime("account", "list")[route[0]]["activeAccountId"]
         if selected != acct["id"]:
-            raise OrcaError(f"selected account changed before worker start; inspect prepared Task {task}")
+            raise OrcaError("selected account changed before worker start")
         rec = dict(task=task, run=run, worktree=wt["id"], account=acct["id"], label=acct["label"],
                    route=route, project=project, item=t["item"], fields=fields, time=int(time.time()),
                    holds=str(holds_path), waiting_field=waiting_field)
         # The fill lock covers preparation. A durable Task identity precedes the only start call.
         reserve(db, number, rec)
-    except Exception:
+    except Exception as e:
+        left = ""
+        if task:
+            try:
+                runtime("orchestration", "task-update", *actor, "--id", task, "--status", "failed", "--result", "cancelled")
+            except (OSError, OrcaError, ValueError, subprocess.TimeoutExpired) as cancel_error:
+                left = f"; inspect uncancelled Task {task} ({cancel_error})"
         try:
             remove_prelaunch_tree(repo_path, wt, existing_refs, settings_change)
         except (OSError, OrcaError, subprocess.TimeoutExpired) as cleanup_error:
             log("prelaunch cleanup", {"issue": number, "worktree": wt["path"], "reason": str(cleanup_error)})
-        raise
+        raise OrcaError(f"#{number}: {e}{left}; prepared worktree {wt['path']}") from e
     try:
         started = runtime("orchestration", "worker-start", *actor, "--task", task, "--worktree", "path:" + str(path),
                           "--agent", route[0], "--model", route[1], "--effort", route[2], "--keep-open", "--full")

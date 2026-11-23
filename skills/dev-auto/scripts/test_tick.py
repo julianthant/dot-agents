@@ -330,11 +330,18 @@ with TemporaryDirectory() as tmp:
     preparation_failed = True
     visible = False
     refused = False
+    cancels = []
+    cancel_fails = False
     def recovery_runtime(*argv):
         verb = argv[:2]
         operations.append(verb)
         if verb == ("account", "list"):
             return {"codex": {"activeAccountId": "other" if preparation_failed else "seat"}}
+        if verb == ("orchestration", "task-update"):
+            cancels.append(argv)
+            if cancel_fails:
+                raise tick.OrcaError("cancel refused")
+            return {}
         if verb == ("orchestration", "worker-start"):
             import tomllib
             with (root / ".codex/config.toml").open("rb") as cfg:
@@ -377,8 +384,14 @@ with TemporaryDirectory() as tmp:
           patch.object(pick.account_usage, "load_config", return_value={}),
           patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE": "fixture"}), redirect_stdout(io.StringIO()) as output):
         with sqlite3.connect(ledger) as db:
-            with check.assertRaisesRegex(tick.OrcaError, "selected account changed"):
+            with check.assertRaisesRegex(tick.OrcaError, f"selected account changed.*worktree {root}"):
                 tick.launch(db, root, codex_ticket, account, args, holds)
+            check.assertEqual(cancels, [("orchestration", "task-update", "--id", "fixture-task",
+                                         "--status", "failed", "--result", "cancelled")])
+            cancel_fails = True
+            with check.assertRaisesRegex(tick.OrcaError, f"uncancelled Task fixture-task.*worktree {root}"):
+                tick.launch(db, root, codex_ticket, account, args, holds)
+            cancel_fails = False
             preparation_failed = False
             refused = True
             with check.assertRaisesRegex(tick.OrcaError, "no start effects"):

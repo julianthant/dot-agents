@@ -1798,6 +1798,7 @@ def close_tick(args, db):
     # Older rows keep NULL, which marks a notice recorded before requests were saved.
     if "request" not in [column[1] for column in db.execute("PRAGMA table_info(close_notice)")]:
         db.execute("ALTER TABLE close_notice ADD COLUMN request TEXT")
+    unconfirmed = []
     for issue, card, branch in candidates:
         number = issue["number"]
         review = review_state(db, run, number) or {}
@@ -1856,20 +1857,23 @@ def close_tick(args, db):
             if not notice[1]:
                 request, landed = notice[3], False
                 if not request:
-                    # A notice recorded before requests were saved may have landed, under either subject.
                     reply = runtime("orchestration", "inbox", "--terminal", "run:" + run, "--limit", "10000", "--full")
                     messages = reply["messages"]
-                    mail = [m for m in messages if m.get("type") == "status"
-                            and m.get("subject") in (subject, f"#{number}: Needs you after close")]
-                    landed = any(m.get("subject") == subject or m.get("body") == str(e) for m in mail)
-                    if not mail and not (len(messages) >= 10000 or reply.get("truncated")):
+                    # This notice: the digest subject, or the legacy subject with this reason as the sender's text,
+                    # which a rejected escalation keeps after its "Original body:" line.
+                    landed = any(m.get("type") == "status" and ((m.get("subject") or "").endswith(subject) or (
+                        (m.get("subject") or "").endswith(f"#{number}: Needs you after close")
+                        and (m.get("body") or "").rpartition("\nOriginal body:\n")[2] == str(e))) for m in messages)
+                    if not landed and not (len(messages) >= 10000 or reply.get("truncated")):
                         request = str(uuid.uuid4())
                         with db:
                             db.execute("UPDATE close_notice SET request=? WHERE run=? AND issue=?", (request, run, number))
+                    elif not landed:
+                        # It may be past the listing's end: send nothing, keep it pending and fail this tick.
+                        unconfirmed.append(number)
                 if request:
                     runtime("orchestration", "send", *actor, "--to", "run:" + run, "--type", "status",
                             "--subject", subject, "--body", str(e), "--retry-request", request)
-                # A legacy-subject notice with another body, or an incomplete listing, stays pending for the next tick.
                 if request or landed:
                     with db:
                         db.execute("UPDATE close_notice SET sent=1 WHERE run=? AND issue=?", (run, number))
@@ -1877,6 +1881,8 @@ def close_tick(args, db):
                 command(*edit, stage, "--single-select-option-id", needs_you)
                 with db:
                     db.execute("UPDATE close_notice SET carded=1 WHERE run=? AND issue=?", (run, number))
+    if unconfirmed:
+        raise OrcaError("incomplete Run mailbox: close notice unconfirmed for " + ", ".join(f"#{n}" for n in unconfirmed))
 
 
 def close(args):

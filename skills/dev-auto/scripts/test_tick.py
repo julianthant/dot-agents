@@ -1335,6 +1335,12 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
             return ""
         raise AssertionError(args)
 
+    def rejected(subject, body):
+        # The shape recorded from a rejected escalation on 2026-11-23.
+        return {"type": "status", "subject": "Rejected escalation: " + subject,
+                "body": "Orca rejected this escalation: No active Dispatch belongs to this message sender.\n\n"
+                        "Original body:\n" + body}
+
     def orca(*args):
         nonlocal present
         events.append(args)
@@ -1369,9 +1375,9 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
             request = args[args.index("--retry-request") + 1] if "--retry-request" in args else None
             if request in applied:
                 return applied[request]  # Orca replays an applied request
-            # Orca may rewrite the body in transit; the subject arrives as sent.
-            mailbox.append({"type": args[args.index("--type") + 1], "subject": args[args.index("--subject") + 1],
-                            "body": "[redacted]" if rewritten else args[args.index("--body") + 1]})
+            subject, body = args[args.index("--subject") + 1], args[args.index("--body") + 1]
+            mailbox.append(rejected(subject, body) if rewritten else
+                           {"type": args[args.index("--type") + 1], "subject": subject, "body": body})
             if request:
                 applied[request] = {}
             if send_lost and len(applied) == 1:
@@ -1396,14 +1402,21 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
                        " PRIMARY KEY(run,issue))")
             db.execute("INSERT INTO close_notice VALUES ('run', 41, ?, 0, 0)", (reason,))
             db.commit()
-            if pre_upgrade != "unsent":
+            if pre_upgrade == "rewritten":
+                mailbox.append(rejected("#41: Needs you after close", reason))
+            elif pre_upgrade != "unsent":
+                # An older blocked state's notice carries that state's error.
                 mailbox.append({"type": "status", "subject": "#41: Needs you after close",
-                                "body": "[redacted]" if pre_upgrade == "rewritten" else reason})
+                                "body": "worktree contains local changes or untracked files" if pre_upgrade == "other"
+                                else reason})
+        unconfirmed = 0
         for _ in range(ticks):
             try:
                 tick.close_tick(args, db)
-            except tick.OrcaError:
-                assert card_fails or send_lost  # a later tick retries only the unconfirmed step
+            except tick.OrcaError as e:
+                unconfirmed += "incomplete Run mailbox" in str(e)
+                # A later tick retries only the unconfirmed step.
+                assert card_fails or send_lost or pre_upgrade == "unlisted"
         notice = db.execute("SELECT sent,carded,request FROM close_notice WHERE run='run' AND issue=41").fetchone()
     assert [event[3] for event in events if event[:2] == REL] == ["ctx_merge", "ctx_review", "ctx_initial"] * ticks
     expected_holds = {"term_other", "term_reviewer"} if release_uncertain else {"term_other"}
@@ -1417,17 +1430,18 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
         assert present and local_ref == sha
         assert edits == [("stage", "--single-select-option-id", "needs")] * (2 if card_fails else 1)
         assert "Needs you" in output.getvalue()
-        assert len(mailbox) == 1, mailbox  # one notice in the Run's mailbox, pre-upgrade or new
+        # One notice in the Run's mailbox, pre-upgrade or new, besides an older state's notice.
+        assert len(mailbox) == (2 if pre_upgrade == "other" else 1), mailbox
         sends = [event for event in events if event[:2] == ("orchestration", "send")]
         assert all("--type" in e and e[e.index("--type") + 1] == "status"
                    and e[e.index("--to") + 1] == "run:run" for e in sends), sends
         assert all("--retry-request" in e for e in sends), sends
         assert len({e[e.index("--retry-request") + 1] for e in sends}) <= 1, sends
-        if pre_upgrade in ("rewritten", "unlisted"):
-            assert not sends and notice == (0, 1, None), notice  # pending kept
-        elif pre_upgrade == "exact":
+        if pre_upgrade == "unlisted":
+            assert not sends and notice == (0, 1, None) and unconfirmed == ticks, notice  # pending kept
+        elif pre_upgrade in ("exact", "rewritten"):
             assert not sends and notice[0] == 1, notice
-        elif pre_upgrade == "unsent":
+        elif pre_upgrade in ("unsent", "other"):
             assert len(sends) == 1 and notice[0] == 1 and notice[2], notice
         else:
             assert len(sends) == (2 if send_lost else 1), sends  # a lost reply's retry replays the same request
@@ -1441,7 +1455,7 @@ for scenario in ({}, {"merged": False}, {"dirty": True}, {"refused": True},
                  {"release_uncertain": True, "ticks": 3, "send_lost": True},
                  {"release_uncertain": True, "ticks": 3, "send_lost": True, "rewritten": True},
                  *({"release_uncertain": True, "ticks": 3, "pre_upgrade": pre_upgrade}
-                   for pre_upgrade in ("exact", "rewritten", "unsent", "unlisted"))):
+                   for pre_upgrade in ("exact", "rewritten", "unsent", "unlisted", "other"))):
     with TemporaryDirectory() as tmp:
         close_fixture(tmp, **scenario)
 

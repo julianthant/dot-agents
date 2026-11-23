@@ -8,6 +8,7 @@ reads PR check rollups in one batch and joins current workers to the tick's loca
 """
 import datetime
 from argparse import Namespace
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 import json
 from pathlib import Path
@@ -185,12 +186,15 @@ def render():
     tmp = STATE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state))
     tmp.replace(STATE)
-    try:
-        decisions = readiness(snap)
-    except REFUSED as e:
-        print(f"roadmap readiness: {e}", file=sys.stderr)
-        decisions = {}
-    return build(snap, state, decisions, now_rows(snap, state))
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        planned = executor.submit(readiness, snap)
+        live = now_rows(snap, state)
+        try:
+            decisions = planned.result()
+        except REFUSED as e:
+            print(f"roadmap readiness: {e}", file=sys.stderr)
+            decisions = {}
+    return build(snap, state, decisions, live)
 
 
 def readiness(snap):

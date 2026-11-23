@@ -243,6 +243,8 @@ src/backend/logs/ (writers), tests/backend/logs*.ts
 - Coder: claude (claude-sonnet-5-5, effort high) with Opus advisor · Reviewer: codex (gpt-6.2-sol, effort medium)
 """
 check.assertEqual(tick.coder_route(body), ("claude", "claude-sonnet-5-5", "high", "opus"))
+# The card label cannot show +advisor for Codex: rejected since 25ea75d.
+assert tick.coder_route("Coder: codex / gpt-6.2-sol / high + opus advisor") is None
 check.assertEqual(tick.owned_paths(body), ["src/backend/logs/", "tests/backend/logs*.ts"])
 check.assertEqual(tick.owned_paths("Owned paths: selected service code and fixtures."), ["*"])
 

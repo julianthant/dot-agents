@@ -1,6 +1,7 @@
 import io
 import os
 import subprocess
+import sys
 from contextlib import redirect_stderr, redirect_stdout
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -243,6 +244,8 @@ src/backend/logs/ (writers), tests/backend/logs*.ts
 - Coder: claude (claude-sonnet-5-5, effort high) with Opus advisor · Reviewer: codex (gpt-6.2-sol, effort medium)
 """
 check.assertEqual(tick.coder_route(body), ("claude", "claude-sonnet-5-5", "high", "opus"))
+# The card label cannot show +advisor for Codex: rejected since 25ea75d.
+assert tick.coder_route("Coder: codex / gpt-6.2-sol / high + opus advisor") is None
 check.assertEqual(tick.owned_paths(body), ["src/backend/logs/", "tests/backend/logs*.ts"])
 check.assertEqual(tick.owned_paths("Owned paths: selected service code and fixtures."), ["*"])
 
@@ -330,11 +333,18 @@ with TemporaryDirectory() as tmp:
     preparation_failed = True
     visible = False
     refused = False
+    cancels = []
+    cancel_fails = False
     def recovery_runtime(*argv):
         verb = argv[:2]
         operations.append(verb)
         if verb == ("account", "list"):
             return {"codex": {"activeAccountId": "other" if preparation_failed else "seat"}}
+        if verb == ("orchestration", "task-update"):
+            cancels.append(argv)
+            if cancel_fails:
+                raise tick.OrcaError("cancel refused")
+            return {}
         if verb == ("orchestration", "worker-start"):
             import tomllib
             with (root / ".codex/config.toml").open("rb") as cfg:
@@ -362,6 +372,8 @@ with TemporaryDirectory() as tmp:
         if argv[:3] == ("gh", "project", "item-edit"):
             recovery_edits.append(argv)
             return ""
+        if "--git-path" in argv:
+            return str(root / "info/exclude")
         if "get-url" in argv:
             return "git@github.com:julianthant/hr-relay.git"
         if "for-each-ref" in argv or "ls-remote" in argv:
@@ -375,8 +387,14 @@ with TemporaryDirectory() as tmp:
           patch.object(pick.account_usage, "load_config", return_value={}),
           patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE": "fixture"}), redirect_stdout(io.StringIO()) as output):
         with sqlite3.connect(ledger) as db:
-            with check.assertRaisesRegex(tick.OrcaError, "selected account changed"):
+            with check.assertRaisesRegex(tick.OrcaError, f"selected account changed.*worktree {root}"):
                 tick.launch(db, root, codex_ticket, account, args, holds)
+            check.assertEqual(cancels, [("orchestration", "task-update", "--id", "fixture-task",
+                                         "--status", "failed", "--result", "cancelled")])
+            cancel_fails = True
+            with check.assertRaisesRegex(tick.OrcaError, f"uncancelled Task fixture-task.*worktree {root}"):
+                tick.launch(db, root, codex_ticket, account, args, holds)
+            cancel_fails = False
             preparation_failed = False
             refused = True
             with check.assertRaisesRegex(tick.OrcaError, "no start effects"):
@@ -454,6 +472,8 @@ with TemporaryDirectory() as temp, ExitStack() as stack:
     raced = False
     def git(*argv):
         calls.append(argv)
+        if "--git-path" in argv:
+            return str(root / "info/exclude")
         if "get-url" in argv:
             return "git@github.com:julianthant/hr-relay.git"
         if "for-each-ref" in argv:
@@ -540,6 +560,27 @@ with TemporaryDirectory() as tmp:
     check.assertEqual(tomllib.loads(cfg.read_text())["notice"], {"hide_other_banner": True,
                                                                  "hide_rate_limit_model_nudge": True})
 
+# A Codex worktree keeps its .codex/ settings out of git status, so a coder cannot commit them.
+with TemporaryDirectory() as tmp:
+    repo, wt = Path(tmp) / "repo", Path(tmp) / "wt"
+    run = lambda *argv: subprocess.run(["git", *argv], check=True, capture_output=True, text=True).stdout
+    run("init", "-q", "-b", "main", str(repo))
+    run("-C", str(repo), "-c", "user.name=F", "-c", "user.email=f@example.invalid", "commit", "-q", "--allow-empty", "-m", "base")
+    run("-C", str(repo), "worktree", "add", "-q", "-b", "task/x", str(wt))
+    for _ in range(2):
+        tick.worker_settings(wt, ("codex", "gpt-6.2-sol", "high", None))
+    assert (wt / ".codex/config.toml").exists()
+    check.assertEqual(run("-C", str(wt), "status", "--porcelain", "--untracked-files=all"), "")
+    exclude = Path(run("-C", str(wt), "rev-parse", "--path-format=absolute", "--git-path", "info/exclude").strip())
+    check.assertEqual(exclude.read_text().splitlines().count(".codex/"), 1)
+    # The exclude is the clone's shared one: .codex/ stays out of the main checkout and every other worktree too.
+    other = Path(tmp) / "other"
+    run("-C", str(repo), "worktree", "add", "-q", "-b", "task/y", str(other))
+    for checkout in (repo, other):
+        (checkout / ".codex").mkdir(exist_ok=True)
+        (checkout / ".codex/config.toml").write_text("x = 1\n")
+        check.assertEqual(run("-C", str(checkout), "status", "--porcelain", "--untracked-files=all"), "")
+
 with patch.object(tick, "command", side_effect=[json.dumps({"id": "project"}), json.dumps({"fields": [
         {"name": "Status", "id": "status", "options": [{"name": "In Progress", "id": "progress"}]},
         {"name": "Agent state", "id": "stage", "options": [{"name": "Coding", "id": "coding"},
@@ -577,6 +618,8 @@ for interrupted in ("clean", "committed", "untracked", "preexisting"):
                 check.assertNotIn("--force", argv)
                 git_at(repo, "worktree", "remove", str(checkout))
                 return {"removed": True}
+            if verb == ("account", "list"):
+                return {"codex": {"activeAccountId": "coord"}}
             if verb == ("account", "select"):
                 if interrupted == "committed":
                     git_at(checkout, "commit", "--allow-empty", "-m", "someone's new commit")
@@ -699,6 +742,64 @@ with patch.object(tick, "green_report", side_effect=[None, sha]), patch.object(t
     assert card.call_args.args[1:] == ("Merging", state["agent"])
     assert all(call.args[1] == "send" for call in cli.call_args_list)
 
+# A Codex reviewer start gives the coordinator bot its Codex account back once the start is confirmed.
+ticket, state = review_fixture()
+ticket["body"] = "Reviewer: codex / gpt-6.2-astra / medium"
+with patch.object(tick, "green_report", return_value=sha), patch.object(tick, "worker_settings"), \
+        patch.object(tick, "review_account", return_value={"id": "seat", "label": "review"}), \
+        patch.object(tick, "record_hold"), patch.object(tick, "review_card"), \
+        patch.object(pick, "coordinator", return_value=None), patch.object(pick.account_usage, "load_config", return_value={}), \
+        patch.object(tick, "runtime") as cli:
+    cli.side_effect = [{"codex": {"activeAccountId": "coord"}}, {}, {"codex": {"activeAccountId": "seat"}},
+                       full_start("reader", "pane"), {}, {"codex": {"activeAccountId": "coord"}}]
+    tick.review_step(sqlite3.connect(":memory:"), "run", [], ticket, state, [recorded])
+    assert [c.args[-1] for c in cli.call_args_list if c.args[:2] == ("account", "select")] == ["seat", "coord"]
+
+# The coordinator moves to pick.coordinator's choice when its own account is past handoff; a race is reported.
+for fresh, listed in ((None, "coord"), ({"id": "fresh"}, "fresh"), (None, "other")):
+    with patch.object(pick, "coordinator", return_value=fresh) as choose, \
+            patch.object(pick.account_usage, "load_config", return_value={}), \
+            patch.object(tick, "runtime", side_effect=[{}, {"codex": {"activeAccountId": listed}}]) as cli:
+        if listed == "other":
+            with check.assertRaisesRegex(tick.OrcaError, "coordinator account"):
+                tick.restore_coordinator("coord")
+        else:
+            tick.restore_coordinator("coord")
+        assert choose.call_args.args[3] == "coord"
+        assert cli.call_args_list[0].args == ("account", "select", "--agent", "codex", "--account",
+                                              (fresh or {}).get("id") or "coord")
+tick.restore_coordinator(None)  # a Claude start never touches the Codex account
+
+# A coder report refreshes the card's seat from the reporting terminal's hold.
+ticket, state = review_fixture()
+state["coder_terminal"] = "pane-c"
+with TemporaryDirectory() as tmp, patch.object(pick, "HOLDS", Path(tmp) / "holds.json"), \
+        patch.object(tick, "green_report", return_value=None), patch.object(tick, "review_card") as card, \
+        patch.object(tick, "runtime", return_value={"delivery": "follow_up", "followUpOf": "coder", "dispatchId": "fix"}):
+    pick.HOLDS.write_text(json.dumps({"pane-c": {"label": "fresh", "host": "local"}}))
+    tick.review_step(sqlite3.connect(":memory:"), "run", [], ticket, state, [recorded])
+    assert card.call_args.args[1:] == ("Fixing", "coder gpt-6.2-sol medium @fresh")
+
+# A reviewer's failed worker_done needs the operator, unless watch is restarting it from a handoff.
+for handoff in (False, True):
+    ticket, state = review_fixture()
+    state.update(stage="Reviewing", expected="reader", sha=sha, reviewer={"dispatch": "reader", "terminal": "pane-r"})
+    failed = dict(report("reader", "Stopping: cannot read the diff.", msg_id="f1"),
+                  payload=json.dumps({"taskId": "task", "dispatchId": "reader", "outcome": "failed"}))
+    db = sqlite3.connect(":memory:")
+    if handoff:
+        db.execute("CREATE TABLE watch (run TEXT, terminal TEXT, state TEXT, PRIMARY KEY(run,terminal))")
+        db.execute("INSERT INTO watch VALUES ('run','pane-r',?)", (json.dumps({"handoff": 1}),))
+    with patch.object(tick, "review_card") as card, patch.object(tick, "runtime") as cli:
+        for _ in range(2):
+            tick.review_step(db, "run", [], ticket, state, [failed])
+        cli.assert_not_called()
+        if handoff:
+            card.assert_not_called()
+        else:
+            assert card.call_count == 1
+            assert card.call_args.args[1:] == ("Needs you", "coordinator · reviewer failed f1")
+
 # Third FIX sends all findings to the owning Run, once, and retires the ticket.
 ticket, state = review_fixture()
 for i in range(3):
@@ -718,6 +819,16 @@ for i in range(3):
             assert all(text in cli.call_args.args[-1] for text in ["round one", "round two", "missing a check"])
         tick.review_step(db, "run", [], ticket, state, [verdict])
         assert cli.call_count == 1
+
+# A PUSH whose head moved or whose CI is not green goes back to the coder, saying why.
+ticket, state = review_fixture()
+state.update(stage="Reviewing", expected="reader", sha=sha)
+with patch.object(tick, "green_report", return_value=None), patch.object(tick, "review_card") as card, \
+        patch.object(tick, "runtime", return_value={"delivery": "follow_up", "followUpOf": "coder", "dispatchId": "fix"}) as cli:
+    tick.review_step(sqlite3.connect(":memory:"), "run", [], ticket, state, [report("reader", "REVIEW VERDICT: PUSH " + sha)])
+    assert card.call_args.args[1] == "Fixing" and "dispatch:coder" in cli.call_args.args
+    assert (f"The reviewer's PUSH of {sha} was voided: the branch head moved or its task CI is not green.\n"
+            + tick.GREEN_INSTRUCTIONS) in cli.call_args.args[-1]
 
 ticket, state = review_fixture()
 db = sqlite3.connect(":memory:")
@@ -998,7 +1109,9 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
         assert present and local_ref == sha
         assert edits == [("stage", "--single-select-option-id", "needs")]
         assert "Needs you" in output.getvalue()
-        assert any(event[:2] == ("orchestration", "send") for event in events)
+        sends = [event for event in events if event[:2] == ("orchestration", "send")]
+        assert sends and all("--type" in e and e[e.index("--type") + 1] == "status"
+                             and e[e.index("--to") + 1] == "run:run" for e in sends), sends
         assert any(event[:2] == RM for event in events) == refused
 
 
@@ -1063,6 +1176,9 @@ class Fleet:
         self.seats = ["jzaw", "x2"]  # the limited account is first in accounts.toml order
         self.superseded = False
         self.start_error = None
+        self.lose_start = False  # Orca starts the retry, but the response is lost
+        self.note_error = None
+        self.active, self.fresh = "coord", None  # the coordinator bot's Codex account; pick.coordinator's choice
         self.events, self.cards, self.now = [], [], 1_795_389_500
         self.ticket = dict(number=553, item="card", agent=f"coder {model} medium @jzaw", stage="Coding")
         self.title = "#553 coder"
@@ -1088,12 +1204,22 @@ class Fleet:
             # The Task's earlier attempt on its own, older pane is history too.
             retried = dict(row, dispatchId="ctx_first", dispatchStatus="failed", workerState="failed",
                            agentTerminalHandle="term_first", resource={"ownerDispatchId": "ctx_first"})
-            return {"workers": [*before, row, old, retried], "page": {"hasMore": False, "nextCursor": None}}
+            # After a retry, the replaced attempt stays listed behind it.
+            replaced = [dict(row, dispatchId="ctx_coder", dispatchStatus="failed", workerState="stopped",
+                             agentTerminalHandle="term_coder", resource={"ownerDispatchId": "ctx_coder"})
+                        ] if self.dispatch == "ctx_restart" else []
+            return {"workers": [*before, row, old, retried, *replaced], "page": {"hasMore": False, "nextCursor": None}}
+        if verb == ("orchestration", "dispatch-show"):
+            # Recorded shape: only the newest Dispatch's id and status.
+            return {"dispatch": {"id": self.dispatch, "status": self.status, "taskId": None, "assigneeHandle": None}}
         if verb == ("orchestration", "worker-show"):
             assert args[3] == self.dispatch, args
+            retry = "ctx_coder" if self.dispatch == "ctx_restart" else None
             return {"dispatch": {"id": self.dispatch, "runId": "run", "taskId": "task_coder", "status": self.status,
-                                 "assigneeHandle": self.terminal, "lastFailure": self.failure},
-                    "worker": {"state": self.state, "worktreeId": "repo::/wt",
+                                 "assigneeHandle": self.terminal, "lastFailure": self.failure,
+                                 "retryOfDispatchId": retry, "followUpOf": None},
+                    "worker": {"state": self.state, "worktreeId": "repo::/wt", "dispatchId": self.dispatch,
+                               "effects": [{"kind": "terminal", "role": "agent", "action": "created", "id": self.terminal}],
                                "startOptions": {"launch": {"effective": {"agent": self.agent, "model": self.model,
                                                                          "effort": "medium"}}}},
                     "projection": {"liveness": {"verdict": self.liveness}},
@@ -1118,9 +1244,13 @@ class Fleet:
             self.dispatch, self.terminal = "ctx_restart", "term_restart"
             self.status, self.state, self.liveness, self.failure = "dispatched", "ready", "live", None
             self.screen = CLAUDE_WORKING
+            if self.lose_start:
+                raise tick.OrcaError("timed out")
             return full_start("ctx_restart", "term_restart")
         if verb == ("orchestration", "send"):
             if args[args.index("--to") + 1] == "dispatch:ctx_restart":
+                if self.note_error:
+                    raise self.note_error
                 self.notes.append(args[args.index("--body") + 1])
             return {"delivery": "queued"}
         raise AssertionError(args)
@@ -1137,6 +1267,7 @@ class Fleet:
                 patch.object(tick, "tickets", side_effect=self.tickets_error, return_value=[self.ticket]), patch.object(tick, "review_card", record), \
                 patch.object(pick, "main", return_value=0), patch.object(pick, "due", return_value=[]), \
                 patch.object(pick, "pick", seat), patch.object(pick.account_usage, "load_config", return_value=cfg), \
+                patch.object(pick, "coordinator", return_value=self.fresh and {"id": self.fresh}), \
                 patch.object(tick.time, "time", return_value=self.now), redirect_stdout(out):
             try:
                 tick.watch_tick(SimpleNamespace(holds=self.holds), self.db)
@@ -1154,7 +1285,8 @@ class Fleet:
 with TemporaryDirectory() as tmp:
     f = Fleet(tmp)
     tick.review_state(f.db, "run", 553)
-    tick.save_review(f.db, "run", 553, {"coder": "ctx_coder", "expected": "ctx_coder", "coder_terminal": "term_coder"})
+    tick.save_review(f.db, "run", 553, {"coder": "ctx_coder", "expected": "ctx_coder", "coder_terminal": "term_coder",
+                                        "agent": "coder gpt-6.2-astra medium @x1"})
     f.tick()
     assert f.sent() == [("dispatch:ctx_coder", "#553: hand off now")] and f.cards == [("Handed off", f.ticket["agent"])]
     assert "handoff" in f.lines[0]
@@ -1168,11 +1300,14 @@ with TemporaryDirectory() as tmp:
     calls = f.tick(1)
     assert ("orchestration", "worker-start") in calls and ("orchestration", "worker-stop") not in calls
     assert len(f.notes) == 1 and "/wt/.handoff-553.md" in f.notes[0] and "Stopping at the usage limit." in f.notes[0]
-    assert f.active == "x2" and f.cards[-1] == ("Coding", "coder gpt-6.2-astra medium @x2")
+    selects = [e[-1] for e in f.events if e[:2] == ("account", "select")]
+    assert selects == ["x2", "coord"] and f.active == "coord"  # the coordinator gets its account back
+    assert f.cards[-1] == ("Coding", "coder gpt-6.2-astra medium @x2")
     holds = json.loads(f.holds.read_text())
     assert "term_coder" not in holds and holds["term_restart"]["account"] == "x2"
     review = tick.review_state(f.db, "run", 553)
     assert (review["coder"], review["coder_terminal"]) == ("ctx_restart", "term_restart")
+    assert review["agent"] == "coder gpt-6.2-astra medium @x2"  # review publishes keep the new seat
     # Review discovery still finds exactly one "#553 coder" Task, whose newest Dispatch is the retry.
     assert [t["id"] for t in f.orca("orchestration", "task-list")["tasks"] if t["task_title"] == "#553 coder"] == ["task_coder"]
 
@@ -1222,6 +1357,69 @@ with TemporaryDirectory() as tmp:
     calls = f.tick(1)
     assert ("orchestration", "worker-start") not in calls and f.sent() == [("run:run", "#553: restart unconfirmed")]
 
+# A lost start response whose retry Orca did start is adopted on the next tick, never replayed.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    tick.review_state(f.db, "run", 553)
+    tick.save_review(f.db, "run", 553, {"coder": "ctx_coder", "expected": "ctx_coder", "coder_terminal": "term_coder"})
+    f.lose_start = True
+    with check.assertRaises(tick.OrcaError):
+        f.tick()
+    assert "timed out" in f.lines[0] and f.dispatch == "ctx_restart"
+    f.note_error = tick.OrcaError("mailbox busy")
+    with check.assertRaises(tick.OrcaError):
+        f.tick(1)
+    assert [e[:2] for e in f.events].count(("orchestration", "worker-start")) == 0 and f.notes == []
+    holds = json.loads(f.holds.read_text())
+    assert "term_coder" not in holds and holds["term_restart"]["account"] == "x2"
+    assert tick.review_state(f.db, "run", 553)["coder"] == "ctx_restart"
+    assert f.cards[-1][0] == "Handed off" and f.sent() == []  # pending until the note is confirmed
+    assert json.loads(dict(f.db.execute("SELECT terminal,state FROM watch"))["term_restart"])["card"]["stage"] == "Coding"
+    f.note_error = None
+    calls = f.tick(1)
+    assert ("orchestration", "worker-start") not in calls and len(f.notes) == 1 and "ctx_coder" in f.notes[0]
+    assert f.cards[-1] == ("Coding", "coder gpt-6.2-astra medium @x2")
+    f.tick(1)
+    assert len(f.notes) == 1 and f.cards[-1][0] == "Coding"
+
+
+class FailingWatchInsert:
+    """A connection that dies writing the successor's watch row once, inside adopt's transaction."""
+    def __init__(self, db):
+        self.db, self.armed = db, True
+
+    def __enter__(self):
+        return self.db.__enter__()
+
+    def __exit__(self, *exc):
+        return self.db.__exit__(*exc)
+
+    def execute(self, sql, params=()):
+        if self.armed and sql.startswith("INSERT OR REPLACE INTO watch") and params[1] == "term_restart":
+            self.armed = False
+            raise sqlite3.OperationalError("disk I/O error")
+        return self.db.execute(sql, params)
+
+
+# Interrupted inside the adoption transaction: the predecessor row and review state survive, the next tick adopts once.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    tick.review_state(f.db, "run", 553)
+    tick.save_review(f.db, "run", 553, {"coder": "ctx_coder", "expected": "ctx_coder", "coder_terminal": "term_coder"})
+    real, f.db = f.db, FailingWatchInsert(f.db)
+    with check.assertRaises(tick.OrcaError):
+        f.tick()
+    assert "disk I/O error" in f.lines[0] and f.notes == [] and f.cards[-1][0] == "Handed off"
+    rows = dict(real.execute("SELECT terminal,state FROM watch"))
+    assert list(rows) == ["term_coder"] and json.loads(rows["term_coder"])["pending"]["starting"]
+    assert tick.review_state(real, "run", 553)["coder"] == "ctx_coder"
+    f.db = real
+    calls = f.tick(1)
+    assert ("orchestration", "worker-start") not in calls and len(f.notes) == 1
+    assert list(dict(real.execute("SELECT terminal,state FROM watch"))) == ["term_restart"]
+    assert tick.review_state(real, "run", 553)["coder"] == "ctx_restart"
+    assert f.cards[-1] == ("Coding", "coder gpt-6.2-astra medium @x2")
+
 # A crash relaunches once, on any seat, in the worker's own phase; a second crash goes to the Run as Needs you.
 with TemporaryDirectory() as tmp:
     f = Fleet(tmp, screen=CLAUDE_WORKING)
@@ -1251,6 +1449,15 @@ with TemporaryDirectory() as tmp:
     f.status, f.state, f.liveness, f.failure = "failed", "failed", "exited", "agent process exited"
     assert f.tick() == [("orchestration", "task-list"), ("orchestration", "worker-list"),
                         ("orchestration", "worker-show")] and f.lines == ['watch        "no action"']
+# A Merging coder that failed is still current when the review state names it: relaunched.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.ticket["stage"] = "Merging"
+    tick.review_state(f.db, "run", 553)
+    tick.save_review(f.db, "run", 553, {"coder": "ctx_coder", "expected": "ctx_coder", "coder_terminal": "term_coder"})
+    f.status, f.state, f.liveness, f.failure = "failed", "failed", "exited", "agent process exited"
+    assert ("orchestration", "worker-start") in f.tick()
+    assert tick.review_state(f.db, "run", 553)["coder"] == "ctx_restart"
 
 # An unchanged screen for 20 minutes: nudge once, then report; a changing screen is never silent.
 with TemporaryDirectory() as tmp:
@@ -1377,3 +1584,24 @@ with TemporaryDirectory() as tmp:
     assert json.loads(f.lines[0].split(None, 1)[1]) == [{"tick": "gh: project unavailable"}]
 
 print("ok")
+
+# A concurrent tick: while another process holds fill.lock, fill skips and release refuses, through the real CLI.
+with TemporaryDirectory() as home:
+    env = dict(os.environ, HOME=home)
+    lock = Path(home) / ".local/state/dev-auto/fill.lock"
+    lock.parent.mkdir(parents=True)
+    holder = subprocess.Popen([sys.executable, "-c", "import fcntl, sys\nf = open(sys.argv[1], 'a+')\n"
+                               "fcntl.flock(f, fcntl.LOCK_EX)\nprint('locked', flush=True)\nsys.stdin.read()", str(lock)],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "locked"
+        script = str(Path(tick.__file__).resolve())
+        skipped = subprocess.run([sys.executable, script, "fill", "--repo-path", home, "--issue", "1"],
+                                 env=env, capture_output=True, text=True, timeout=60)
+        assert skipped.returncode == 0 and "another tick is active" in skipped.stdout, skipped
+        refused = subprocess.run([sys.executable, script, "fill", "--release", "1"],
+                                 env=env, capture_output=True, text=True, timeout=60)
+        assert refused.returncode == 1 and "another tick is active" in refused.stderr, refused
+    finally:
+        holder.stdin.close()
+        holder.wait(timeout=10)

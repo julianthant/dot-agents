@@ -141,3 +141,18 @@ with TemporaryDirectory() as temp, patch.object(pick, "HOLDS", Path(temp) / "hol
     assert set(json.loads(pick.HOLDS.read_text())) == {"fleet", "fill", "remote"}
 
 print("pick: all checks pass")
+
+# Codex homes share one session folder, so the file reading is never per account: Orca's wins.
+now = 1_000_000
+row = {"agent": "codex", "id": "seat", "host": "local", "home": "/h"}
+orca = {("codex", "seat"): (now - 600, [(100, now + 3600, "five_hour"), (40, now + 86400, "weekly")])}
+shared = (now - 60, [(23, now + 3600, "five_hour"), (94, now + 86400, "weekly")])
+with patch.object(pick.account_usage, "orca_usage", return_value=orca), \
+        patch.object(pick.account_usage, "orca_key", return_value=("codex", "seat")), \
+        patch.object(pick.account_usage, "file_usage", return_value=shared):
+    assert pick.windows({}, row, now) == (100.0, 40.0)
+    assert pick.windows({}, dict(row, agent="claude"), now) == (23.0, 94.0)
+with patch.object(pick.account_usage, "orca_usage", return_value={}), \
+        patch.object(pick.account_usage, "orca_key", return_value=("codex", "seat")), \
+        patch.object(pick.account_usage, "file_usage", return_value=shared):
+    assert pick.windows({}, row, now) == (23.0, 94.0)

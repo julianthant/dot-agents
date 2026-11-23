@@ -9,6 +9,8 @@ disable-model-invocation: true
 Run these commands from this skill's directory. The picker reads accounts in
 `accounts.toml` order (override the path with `DEV_AUTO_ACCOUNTS`) and applies
 `limits.toml` to the newest usage reading from Orca or the account's CLI files.
+Codex homes share one sessions folder, so a Codex account reads its CLI files
+only when Orca has no reading for it.
 Pass the same `--host` to all three commands for a remote environment. The
 default host is `local` and the default effort is `medium`.
 
@@ -53,11 +55,19 @@ reported Task with `orca orchestration dispatch-show --task <task> --full`.
 A missing Dispatch keeps that issue pending while disjoint issues can fill
 other available seats. After inspecting the Task and confirming a replacement
 would be safe, run `scripts/tick.py fill --release <issue>` to clear just its
-pending reservation. Release exits without launching anything. Preparation errors and an explicit no-effects refusal leave no issue reservation. Inspect
-any prepared worktree before reusing or removing it.
+pending reservation. Release exits without launching anything. Preparation errors and an explicit no-effects refusal leave no issue reservation. A
+preparation error after the Task exists cancels that Task, and the error names
+the worktree (and the Task, if the cancel failed). Inspect any prepared
+worktree before reusing or removing it. After a confirmed Codex start, fill
+selects the coordinator bot's prior Codex account again, or the account
+`pick.coordinator` prefers once that one is past its handoff point; the
+reviewer start and the watch restart do the same.
 
 For Codex workers, fill sets `notice.hide_rate_limit_model_nudge = true` in
-the new worktree's project config. Codex applies project settings in trusted
+the new worktree's project config and adds `.codex/` once to the clone's shared
+`info/exclude` (`git rev-parse --git-path info/exclude` resolves to the common git
+directory), so `.codex/` is ignored in the main checkout and every worktree of that
+clone, and no checkout can commit it. Codex applies project settings in trusted
 workspaces. The installed 0.171.0 TUI reads this preference before showing its
 model-switch menu. Startup hook consent depends on the hooks' trust state.
 An operator reviews new or changed hooks. [Model nudge](https://github.com/openai/codex/blob/rust-v0.171.0/codex-rs/tui/src/chatwidget/rate_limits.rs#L475-L480) · [Hook review](https://github.com/openai/codex/blob/rust-v0.171.0/codex-rs/tui/src/startup_hooks_review.rs#L283-L293)
@@ -89,5 +99,15 @@ the current attempt of every live worker in the Run and logs one `watch` line:
 - A permission prompt goes to the Run and the card goes to **Needs you**.
 
 The watch never types into a pane or answers a menu. A restart whose
-`worker-start` response was lost is escalated, not repeated: inspect the Run,
-then delete that terminal's row from the `watch` table in `starts.sqlite`.
+`worker-start` response was lost is never repeated. The next tick adopts the
+newest Dispatch of the same Task when it retries the old one in the same Run
+and worktree, and resends the resume note until Orca returns a receipt.
+Otherwise it escalates: inspect the Run, then delete that terminal's row from
+the `watch` table in `starts.sqlite`. A failed worker of a **Merging** ticket
+is still current when the review state names its Dispatch.
+
+The review tick moves a ticket to **Needs you** on an invalid verdict or a
+reviewer's failed `worker_done` (unless watch is restarting it from a
+handoff). A PUSH whose branch head moved or whose task CI is not green goes
+back to the coder with that reason. Close-tick and third-FIX mail goes to the
+Run as `status`.

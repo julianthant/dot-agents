@@ -581,7 +581,7 @@ with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory
     raced = False
     stack.enter_context(patch.object(tick, "tickets", side_effect=lambda fresh=False: [dict(t) for t in (stuck, overlap_ticket, ticket)]))
     stack.enter_context(patch.object(tick, "supervisor", return_value=([], "own")))
-    def live_inventory(path, issues, repo, emit):
+    def live_inventory(path, issues, repo, emit, host, counts):
         next(t for t in issues if t["number"] == 40)["live"] = True
         return set()
     stack.enter_context(patch.object(tick, "inventory", side_effect=live_inventory))

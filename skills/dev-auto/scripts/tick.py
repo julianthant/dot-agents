@@ -869,17 +869,29 @@ def fill_tick(args, db, *, issues=None, emit=log):
         if not t["base"] or "refs/heads/" + t["base"].removeprefix("origin/") not in heads:
             t["skip"].append("base missing on origin")
     holds_path = (args.holds or pick.HOLDS).resolve()
-    planned_at = time.time()
-
-    def seat(route, extra, handles=live, reservations=pending.copy(), now=planned_at):
-        holds = json.loads(holds_path.read_text()) if holds_path.exists() else {}
-        held = [h for handle, h in holds.items() if handle in handles and h["host"] == "local"]
-        for rec in reservations.values():
-            if rec.get("route") and rec.get("account") and not (rec.get("terminal") in handles and rec["terminal"] in holds):
+    def seat(route, extra, state=snapshot, reservations=pending.copy()):
+        all_holds = json.loads(holds_path.read_text()) if holds_path.exists() else {}
+        reasons = []
+        now = state[2]
+        for host, handles in state[0].items():
+            planned = [h for h in extra if h["host"] == host]
+            held = [h for handle, h in all_holds.items() if handle in handles and h["host"] == host]
+            reserved = [rec for rec in reservations.values() if rec.get("host", "local") == host
+                        and rec.get("route") and rec.get("account")]
+            missing = sum(rec.get("terminal") not in handles for rec in reserved)
+            if state[1].get(host, 0) + len(planned) + missing >= targets[host]:
+                reasons.append(f"{host}: ticket target reached")
+                continue
+            for rec in reserved:
+                if rec.get("terminal") in handles and rec["terminal"] in all_holds:
+                    continue
                 agent, model, effort = rec["route"][:3]
                 held.append(dict(account=rec["account"], agent=agent, model=model, effort=effort))
-        # pick.live_holds prunes the real file; use the read-only snapshot for planning.
-        return pick.pick(cfg, *route[:3], "local", now, holds=held + extra)
+            acct, why = pick.pick(cfg, *route[:3], host, now, holds=held + planned)
+            if acct:
+                return acct, reasons
+            reasons.extend(why)
+        return None, reasons
 
     count = 0
     decisions = {}
@@ -1275,12 +1287,20 @@ def reconcile_start(db, number, rec, actor):
         dispatch_id = (lookup.get("dispatch") or {}).get("id")
         if not dispatch_id:
             raise OrcaError("no Dispatch is visible")
+        host = rec.get("host", "local")
         show = runtime("orchestration", "worker-show", "--dispatch", dispatch_id, "--full")
+        home = show["dispatch"]
+        if host != "local":
+            import account_usage
+            if home["id"] != dispatch_id or home["taskId"] != task or home["runId"] != rec["run"]:
+                raise OrcaError("coordinator Dispatch identity changed")
+            # The home server can return only a mirror with null worktree and terminal.
+            show = account_usage.host_orca(host, "orchestration", "worker-show", "--dispatch", dispatch_id, "--full")
     except (OrcaError, OSError, ValueError, subprocess.TimeoutExpired) as e:
         raise OrcaError(f"#{number} reserved: inspect Task {task} in Run {rec['run']}: {e}") from e
     dispatch = show["dispatch"]
     worker = show.get("worker") or {}
-    if (dispatch["id"] != dispatch_id or dispatch["taskId"] != task or dispatch["runId"] != rec["run"]
+    if (dispatch["id"] != dispatch_id or home["taskId"] != task or home["runId"] != rec["run"]
             or worker.get("worktreeId") != rec["worktree"]):
         raise OrcaError(f"#{number} reserved: unverified worker for Task {task}")
     terminal = dispatch.get("assigneeHandle")

@@ -589,7 +589,7 @@ with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory
     args = SimpleNamespace(repo_path=root, dry_run=False, issue=None, holds=root / "holds.json")
     def lost(db, repo, t, acct, args, holds):
         if t["number"] == 60:
-            tick.reserve(db, 60, dict(task="t60", run="own", coordinator="coord"))
+            tick.reserve(db, 60, {"task": "t60", "run": "own", "coordinator": "coord"})
             raise tick.OrcaError("timed out")
     stack.enter_context(patch.object(tick, "command", git))
     stack.enter_context(patch.object(tick, "tickets", side_effect=lambda: [dict(t) for t in (first, second, claude)]))
@@ -605,7 +605,7 @@ with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory
 # A full start receipt confirms the launch: the coordinator is restored even when dispatch-show is unavailable.
 with sqlite3.connect(":memory:") as db, patch.object(tick, "restore_coordinator") as restore, \
         patch.object(tick, "runtime", side_effect=tick.OrcaError("Orca busy")):
-    rec = dict(task="t", run="run", dispatch="d", terminal="term", coordinator="coord")
+    rec = {"task": "t", "run": "run", "dispatch": "d", "terminal": "term", "coordinator": "coord"}
     tick.reserve(db, 63, rec)
     with check.assertRaisesRegex(tick.OrcaError, "Orca busy"):
         tick.reconcile_start(db, 63, dict(rec), [])

@@ -898,7 +898,7 @@ def launch(db, repo_path, t, acct, args, holds_path):
         settings_change = worker_settings(path, route)
         prior = codex_active(route)
         # Owed before the selection: if this start fails and its restore too, the next fill restores it.
-        reserve(db, number, dict(not_applied=True, coordinator=prior))
+        reserve(db, number, {"not_applied": True, "coordinator": prior})
         reserved = True
         runtime("account", "select", "--agent", route[0], "--account", acct["id"])
         task = runtime("orchestration", "task-create", *actor, "--task-title", f"#{number} coder",
@@ -935,7 +935,7 @@ def launch(db, repo_path, t, acct, args, holds_path):
             if reserved:
                 with db:
                     db.execute("UPDATE starts SET receipt=? WHERE issue=?",
-                               (json.dumps(dict(not_applied=True, coordinator=prior)), number))
+                               (json.dumps({"not_applied": True, "coordinator": prior}), number))
         raise OrcaError(f"#{number}: {e}{left}; {tree}") from e
     try:
         started = runtime("orchestration", "worker-start", *actor, "--task", task, "--worktree", "path:" + str(path),

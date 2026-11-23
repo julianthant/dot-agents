@@ -77,6 +77,15 @@ Run, sets the Project's Agent state to **Needs you**, and retains the hold
 and reservation. After the operator answers in the worker pane, the next real
 tick checks that same Dispatch before recording Coding.
 
+## Issue snapshot
+
+Every tick verb reads open issues from one snapshot,
+`~/.local/state/dev-auto/issues.json`, refetched at most once a minute. A
+Project write marks it stale, and fill's check right before a start always
+refetches. Closed issues (the newest 400) are read in full every ten minutes
+and only the recently updated ones in between. `scripts/roadmap.py > data.json`
+renders the roadmap from the same snapshot.
+
 ## Watch
 
 Run `scripts/tick.py watch` from the coordinating Run (or pass its launchd

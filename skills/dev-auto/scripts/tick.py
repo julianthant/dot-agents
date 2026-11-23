@@ -1912,7 +1912,9 @@ def watch_pass(args, db, actions, errors):
             task, number = issue_of(task_id)
             title = task.get("task_title") or ""
             ticket = cards.get(number)
-            if not live and state is None and not (ticket and ticket["stage"] in ACTIVE):
+            review = (review_state(db, run, number) or {}) if ticket else {}
+            named = {review.get("coder"), review.get("expected"), (review.get("reviewer") or {}).get("dispatch")}
+            if not live and state is None and not (ticket and (ticket["stage"] in ACTIVE or dispatch in named)):
                 continue  # history: only a ticket still in work can have a current crash
             state = state or {}
             hold = (holds.get(terminal) or {}).get("account")

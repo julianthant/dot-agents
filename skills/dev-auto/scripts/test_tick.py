@@ -1328,6 +1328,15 @@ with TemporaryDirectory() as tmp:
     f.status, f.state, f.liveness, f.failure = "failed", "failed", "exited", "agent process exited"
     assert f.tick() == [("orchestration", "task-list"), ("orchestration", "worker-list"),
                         ("orchestration", "worker-show")] and f.lines == ['watch        "no action"']
+# A Merging coder that failed is still current when the review state names it: relaunched.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.ticket["stage"] = "Merging"
+    tick.review_state(f.db, "run", 553)
+    tick.save_review(f.db, "run", 553, {"coder": "ctx_coder", "expected": "ctx_coder", "coder_terminal": "term_coder"})
+    f.status, f.state, f.liveness, f.failure = "failed", "failed", "exited", "agent process exited"
+    assert ("orchestration", "worker-start") in f.tick()
+    assert tick.review_state(f.db, "run", 553)["coder"] == "ctx_restart"
 
 # An unchanged screen for 20 minutes: nudge once, then report; a changing screen is never silent.
 with TemporaryDirectory() as tmp:

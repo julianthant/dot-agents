@@ -2,7 +2,7 @@ import io
 import os
 import subprocess
 import sys
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
@@ -334,6 +334,9 @@ with TemporaryDirectory() as tmp, sqlite3.connect(":memory:") as db:
     check.assertEqual(len(comments), 1)
     check.assertIn("Overlaps #40 on `src/a`.", comments[0])
     check.assertEqual(json.loads((root / "holds.json").read_text())["fixture-terminal"]["account"], "seat")
+    review = tick.review_state(db, "fixture", 51)
+    assert (review["coder"], review["expected"], review["coder_terminal"]) == (
+        "fixture-dispatch", "fixture-dispatch", "fixture-terminal")
     check.assertEqual(card, ["progress", "coding", "coder claude-sonnet-5-5 medium+advisor @example"])
 
 # Preparation can fail without reserving an issue. A lost start response is recovered by
@@ -1008,6 +1011,37 @@ def review_fixture():
                  "agent": "coder gpt-6.2-sol medium @seat", "history": [], "stage": "Coding"}
     return ticket, state
 
+
+@contextmanager
+def review_launch(starts, *, seat="seat", label="seat", rpc=None, holds=None):
+    """Exercise the launch and hold writes while simulating Orca accounts and start receipts."""
+    active = {}
+
+    def cli(*args):
+        match args[:2]:
+            case "account", "list":
+                return {"codex": {"activeAccountId": active.get("codex", "coord")},
+                        "claude": {"activeAccountId": active.get("claude", "claude-prior")}}
+            case "account", "select":
+                active[args[3]] = args[-1]
+                return {}
+            case "orchestration", "worker-start":
+                start = next(starts)
+                if isinstance(start, Exception):
+                    raise start
+                return full_start(start, "pane-" + start)
+        if rpc:
+            return rpc(*args)
+        raise AssertionError(args)
+
+    starts = iter(starts)
+    with TemporaryDirectory() as tmp, patch.object(pick, "HOLDS", holds or Path(tmp) / "holds.json"), \
+            patch.object(tick, "review_account", return_value={"id": seat, "label": label}), \
+            patch.object(tick, "worker_settings"), patch.object(pick, "coordinator", return_value=None), \
+            patch.object(pick.account_usage, "load_config", return_value={}), patch.object(tick, "runtime", side_effect=cli) as calls:
+        yield calls
+
+
 ticket, state = review_fixture()
 db = sqlite3.connect(":memory:")
 with patch.object(tick, "green_report", return_value=sha), \
@@ -1022,20 +1056,77 @@ with patch.object(tick, "green_report", return_value=sha), \
     assert spec.splitlines()[1] == "Role: follow ~/.agents/roles/reviewer.md."
     tick.review_step(db, "run", [], ticket, state, [recorded])
     assert cli.call_count == 3
+
     verdict = report("reader", "REVIEW VERDICT: PUSH " + sha + "\nReviewed the diff.", msg_id="v")
-    cli.side_effect = [{"delivery": "reopened", "followUpOf": "coder", "dispatchId": "landing"}]
+with patch.object(tick, "green_report", return_value=sha), patch.object(tick, "review_card") as card, \
+        review_launch(["landing"]) as cli:
     tick.review_step(db, "run", [], ticket, state, [recorded, verdict])
     assert card.call_args.args[1] == "Merging"
-    assert "auto-merge" in cli.call_args.args[-1] and "Closes #41" in cli.call_args.args[-1]
+    start = next(call.args for call in cli.call_args_list if call.args[1] == "worker-start")
+    assert "auto-merge" in start[-2] and "Closes #41" in start[-2]
+
+# A PUSH records the merger's account and terminal before publishing the Merging card, even after a lost receipt.
+for lost_receipt in (False, True):
+    with TemporaryDirectory() as tmp, sqlite3.connect(":memory:") as db:
+        ticket, state = review_fixture()
+        state.update(stage="Reviewing", sha=sha, expected="reader", coder_terminal="old-pane")
+        verdict = dict(report("reader", "REVIEW VERDICT: PUSH " + sha), created_at="2026-11-23T08:00:00Z")
+        holds = Path(tmp) / "holds.json"
+        holds.write_text(json.dumps({"old-pane": {"account": "old-seat", "label": "old"}}))
+        starts = []
+
+        def merger_rpc(*args):
+            match args[:2]:
+                case "account", "list":
+                    return {"codex": {"activeAccountId": active[0]}}
+                case "account", "select":
+                    active[0] = args[-1]
+                    return {}
+                case "orchestration", "worker-start":
+                    assert active[0] == "landing-seat"
+                    starts.append({"id": "merger-task", "run_id": "run", "created_at": "2026-11-23 08:00:01",
+                                   "task_title": args[args.index("--task-title") + 1], "spec": args[args.index("--spec") + 1]})
+                    if lost_receipt:
+                        raise tick.OrcaError("lost merger receipt")
+                    return full_start("land", "landing-pane")
+                case "orchestration", "task-list":
+                    return {"tasks": starts}
+                case "orchestration", "dispatch-show":
+                    return {"dispatch": {"id": "land"}}
+                case "orchestration", "worker-show":
+                    return {"dispatch": {"id": "land", "runId": "run", "taskId": "merger-task", "assigneeHandle": "landing-pane"},
+                            "worker": {"worktreeId": "tree", "startOptions": {"launch": {"effective": {
+                                "agent": "codex", "model": "gpt-6.2-sol", "effort": "medium"}}}}}
+                case "worktree", "show":
+                    return {"worktree": {"id": "tree", "path": state["path"]}}
+            raise AssertionError(args)
+
+        def merging_card(*args):
+            saved = tick.review_state(db, "run", 41)
+            assert (saved["coder"], saved["expected"], saved["coder_terminal"]) == ("land", "land", "landing-pane")
+            assert json.loads(holds.read_text())["landing-pane"]["account"] == "landing-seat"
+
+        active = ["coord"]
+        with patch.object(pick, "HOLDS", holds), patch.object(tick, "green_report", return_value=sha), \
+                patch.object(tick, "review_account", return_value={"id": "landing-seat", "label": "landing"}), \
+                patch.object(tick, "worker_settings"), patch.object(tick, "runtime", merger_rpc), \
+                patch.object(pick, "coordinator", return_value=None), \
+                patch.object(pick.account_usage, "load_config", return_value={}), \
+                patch.object(tick, "review_card", side_effect=merging_card):
+            if lost_receipt:
+                with check.assertRaisesRegex(tick.OrcaError, "lost merger receipt"):
+                    tick.review_step(db, "run", [], ticket, state, [verdict])
+            tick.review_step(db, "run", [], ticket, state, [verdict])
+        assert len(starts) == 1 and active == ["coord"]
 
 # Every task PR lands on the repository's trunk, whatever base the ticket recorded (feature branches are gone).
 for repo, trunk in (("hr-relay", "development"), ("dot-agents", "main")):
     ticket, state = review_fixture()
     ticket.update(base="origin/feature/dashboard-state-tests", repo=repo, body="Reviewer: none. Tier: UI, simple.")
     with patch.object(tick, "green_report", return_value=sha), patch.object(tick, "review_card"), \
-            patch.object(tick, "runtime", return_value={"delivery": "follow_up", "followUpOf": "coder", "dispatchId": "land"}) as cli:
+            review_launch(["land"]) as cli:
         tick.review_step(sqlite3.connect(":memory:"), "run", [], ticket, state, [recorded])
-    landing = cli.call_args.args[-1]
+    landing = next(call.args[-2] for call in cli.call_args_list if call.args[1] == "worker-start")
     assert f"merge origin/{trunk}," in landing and f"open or update the PR into {trunk}," in landing, landing
 
 # A no-review route can land only on green. A red report receives a new coder dispatch.
@@ -1043,13 +1134,12 @@ ticket, state = review_fixture()
 ticket["body"] = "Reviewer: none (green CI clears it). Tier: UI, simple."
 db = sqlite3.connect(":memory:")
 with patch.object(tick, "green_report", side_effect=[None, sha]), patch.object(tick, "review_card") as card, \
-        patch.object(tick, "runtime", side_effect=[{"delivery": "follow_up", "followUpOf": "coder", "dispatchId": "fix"},
-                                                 {"delivery": "follow_up", "followUpOf": "fix", "dispatchId": "land"}]) as cli:
+        review_launch(["fix", "land"]) as cli:
     tick.review_step(db, "run", [], ticket, state, [recorded])
     assert card.call_args.args[1:] == ("Fixing", state["agent"])
     tick.review_step(db, "run", [], ticket, state, [report("fix", sha, msg_id="green")])
     assert card.call_args.args[1:] == ("Merging", state["agent"])
-    assert all(call.args[1] == "send" for call in cli.call_args_list)
+    assert sum(call.args[1] == "worker-start" for call in cli.call_args_list) == 2
 
 # A Codex reviewer start gives the coordinator bot its Codex account back once the start is confirmed.
 ticket, state = review_fixture()
@@ -1209,12 +1299,11 @@ tick.restore_coordinator(None)  # a Claude start never touches the Codex account
 # A coder report refreshes the card's seat from the reporting terminal's hold.
 ticket, state = review_fixture()
 state["coder_terminal"] = "pane-c"
-with TemporaryDirectory() as tmp, patch.object(pick, "HOLDS", Path(tmp) / "holds.json"), \
-        patch.object(tick, "green_report", return_value=None), patch.object(tick, "review_card") as card, \
-        patch.object(tick, "runtime", return_value={"delivery": "follow_up", "followUpOf": "coder", "dispatchId": "fix"}):
+with TemporaryDirectory() as tmp, review_launch(["reader"], holds=Path(tmp) / "holds.json"), \
+        patch.object(tick, "green_report", return_value=sha), patch.object(tick, "review_card") as card:
     pick.HOLDS.write_text(json.dumps({"pane-c": {"label": "fresh", "host": "local"}}))
     tick.review_step(sqlite3.connect(":memory:"), "run", [], ticket, state, [recorded])
-    assert card.call_args.args[1:] == ("Fixing", "coder gpt-6.2-sol medium @fresh")
+    assert card.call_args.args[1:] == ("Reviewing", "coder gpt-6.2-sol medium @fresh · reviewer claude-sonnet-5-5 medium @seat")
 
 # A manual retry on a new pane, with review state already saved, is recognized by its retry lineage and
 # refreshes the card from its own hold; another Task's report on a third pane is ignored.
@@ -1227,20 +1316,20 @@ def lineage(*args):
     if args[:2] == ("orchestration", "worker-show"):
         return {"dispatch": {"id": args[3], "runId": "run", "taskId": "task",
                              "retryOfDispatchId": {"retry": "coder"}.get(args[3]), "followUpOf": None}}
-    assert args[:2] == ("orchestration", "send") and "dispatch:retry" in args, args
-    return {"delivery": "follow_up", "followUpOf": "retry", "dispatchId": "fix"}
+    raise AssertionError(args)
 db = sqlite3.connect(":memory:")
 db.execute("CREATE TABLE review_mail (run TEXT, id TEXT, PRIMARY KEY(run,id))")
 db.execute("INSERT INTO review_mail VALUES ('run','report')")
-with TemporaryDirectory() as tmp, patch.object(pick, "HOLDS", Path(tmp) / "holds.json"), \
+with TemporaryDirectory() as tmp, review_launch(["reader"], rpc=lineage, holds=Path(tmp) / "holds.json") as cli, \
         patch.object(tick, "green_report", return_value=None), patch.object(tick, "review_card") as card, \
-        patch.object(tick, "runtime", side_effect=lineage) as cli:
+        patch.object(tick, "held_label", wraps=tick.held_label) as label:
     pick.HOLDS.write_text(json.dumps({"pane-old": {"label": "old", "host": "local"},
                                       "pane-new": {"label": "fresh", "host": "local"}}))
     tick.review_step(db, "run", [], ticket, state, [recorded, stranger, retried])
-    assert card.call_args.args[1:] == ("Fixing", "coder gpt-6.2-sol medium @fresh")
+    assert card.call_args.args[1:] == ("Fixing", "coder gpt-6.2-sol medium @seat")
     saved = tick.review_state(db, "run", 41)
-    assert (saved["coder"], saved["coder_terminal"]) == ("fix", "pane-new")
+    assert (saved["coder"], saved["coder_terminal"]) == ("reader", "pane-reader")
+    label.assert_called_once_with(state["agent"], "pane-new")
     assert not any("other" in call.args for call in cli.call_args_list)
 
 # A reviewer's failed worker_done needs the operator, unless watch is restarting it from a handoff.
@@ -1268,12 +1357,11 @@ ticket, state = review_fixture()
 for i in range(3):
     db = sqlite3.connect(":memory:")
     state.update(stage="Reviewing", expected="reader", sha=sha, history=["round one", "round two"][:i])
-    with patch.object(tick, "review_card") as card, patch.object(tick, "runtime",
-            return_value={"delivery": "follow_up", "followUpOf": "coder", "dispatchId": "fix"}) as cli:
+    with patch.object(tick, "review_card") as card, review_launch(["fix"], rpc=lambda *args: {}) as cli:
         verdict = report("reader", "REVIEW VERDICT: FIX " + sha + "\nmissing a check")
         tick.review_step(db, "run", [], ticket, state, [verdict])
         if i < 2:
-            assert card.call_args.args[1] == "Fixing" and "dispatch:coder" in cli.call_args.args
+            assert card.call_args.args[1] == "Fixing"
         else:
             assert card.call_args.args[1] == "Needs you" and "run:run" in cli.call_args.args
             # Orca refuses --type escalation from the Run's own pane (sender_not_assignee).
@@ -1281,27 +1369,27 @@ for i in range(3):
             assert sent[:2] == ("orchestration", "send") and sent[sent.index("--type") + 1] == "status"
             assert all(text in cli.call_args.args[-1] for text in ["round one", "round two", "missing a check"])
         tick.review_step(db, "run", [], ticket, state, [verdict])
-        assert cli.call_count == 1
+        assert sum(call.args[1] == ("worker-start" if i < 2 else "send") for call in cli.call_args_list) == 1
 
 # A PUSH whose head moved or whose CI is not green goes back to the coder, saying why.
 ticket, state = review_fixture()
 state.update(stage="Reviewing", expected="reader", sha=sha)
 with patch.object(tick, "green_report", return_value=None), patch.object(tick, "review_card") as card, \
-        patch.object(tick, "runtime", return_value={"delivery": "follow_up", "followUpOf": "coder", "dispatchId": "fix"}) as cli:
+        review_launch(["fix"]) as cli:
     tick.review_step(sqlite3.connect(":memory:"), "run", [], ticket, state, [report("reader", "REVIEW VERDICT: PUSH " + sha)])
-    assert card.call_args.args[1] == "Fixing" and "dispatch:coder" in cli.call_args.args
+    assert card.call_args.args[1] == "Fixing"
+    spec = next(call.args[-2] for call in cli.call_args_list if call.args[1] == "worker-start")
     assert (f"The reviewer's PUSH of {sha} was voided: the branch head moved or its task CI is not green.\n"
-            + tick.GREEN_INSTRUCTIONS) in cli.call_args.args[-1]
+            + tick.GREEN_INSTRUCTIONS) in spec
 
 ticket, state = review_fixture()
 db = sqlite3.connect(":memory:")
-with patch.object(tick, "green_report", return_value=None), patch.object(tick, "runtime",
-        side_effect=tick.OrcaError("lost receipt")) as cli:
+with patch.object(tick, "green_report", return_value=None), review_launch([tick.OrcaError("lost receipt")]) as cli:
     with check.assertRaisesRegex(tick.OrcaError, "lost receipt"):
         tick.review_step(db, "run", [], ticket, state, [recorded])
     with check.assertRaisesRegex(tick.OrcaError, "inspect uncertain"):
         tick.review_step(db, "run", [], ticket, state, [recorded])
-    assert cli.call_count == 1
+    assert sum(call.args[1] == "worker-start" for call in cli.call_args_list) == 1
 
 # Load the coordinator's handled mail through the review command, using fill's task title.
 args = SimpleNamespace(issue=41, coder=None, run=None, anchor=None)
@@ -1353,12 +1441,11 @@ with patch.object(tick, "tickets", return_value=[ticket]), patch.object(tick, "s
 ticket, state = review_fixture()
 db = sqlite3.connect(":memory:")
 with patch.object(tick, "green_report", return_value=None), patch.object(tick, "review_card",
-        side_effect=[tick.OrcaError("Project unavailable"), None]) as card, patch.object(tick, "runtime",
-        return_value={"delivery": "follow_up", "followUpOf": "coder", "dispatchId": "fix"}) as cli:
+        side_effect=[tick.OrcaError("Project unavailable"), None]) as card, review_launch(["fix"]) as cli:
     with check.assertRaisesRegex(tick.OrcaError, "Project unavailable"):
         tick.review_step(db, "run", [], ticket, state, [recorded])
     tick.review_step(db, "run", [], ticket, state, [recorded])
-    assert card.call_count == 2 and cli.call_count == 1
+    assert card.call_count == 2 and sum(call.args[1] == "worker-start" for call in cli.call_args_list) == 1
 
 # Only the multi-step UI advisor pairing may reuse the coder model.
 ticket, state = review_fixture()
@@ -1408,12 +1495,12 @@ with TemporaryDirectory() as tmp, patch.object(pick, "HOLDS", Path(tmp) / "holds
         assert all(call.args[1] not in ("worker-start", "send") for call in cli.call_args_list)
         assert tick.review_state(db, "run", 41)["expected"] == "reader"
     fix = report("reader", f"REVIEW VERDICT: FIX {sha}\nAdd a regression test.", msg_id="fix")
-    with patch.object(tick, "runtime", side_effect=[{"delivery": "follow_up", "followUpOf": "coder", "dispatchId": "coder2"},
-                                                 {"state": "released"}]) as cli:
+    with review_launch(["coder2"], holds=pick.HOLDS, rpc=lambda *args: {"state": "released"}) as cli:
         tick.review_step(db, "run", [], ticket, state, [fix])
         tick.review_step(db, "run", [], ticket, state, [fix])
         assert cli.call_args.args == ("orchestration", "worker-release", "--dispatch", "reader")
-        assert cli.call_count == 2 and "pane" not in json.loads(pick.HOLDS.read_text())
+        assert sum(call.args[1] == "worker-start" for call in cli.call_args_list) == 1
+        assert "pane" not in json.loads(pick.HOLDS.read_text())
 
 # Malformed verdicts leave a single actionable Project update with a mailbox reference.
 ticket, state = review_fixture()
@@ -1870,7 +1957,9 @@ class Fleet:
                                "startOptions": {"launch": {"effective": {"agent": self.agent, "model": self.model,
                                                                          "effort": self.effort}}}},
                     "projection": {"liveness": {"verdict": self.liveness}},
-                    "terminal": {"handle": self.terminal, "agentWait": self.wait}, "observation": {"agentWait": self.wait}}
+                    "terminal": {"handle": self.terminal, "agentWait": self.wait,
+                                 "accountId": getattr(self, "reported_account", None)},
+                    "observation": {"agentWait": self.wait}}
         if verb == ("terminal", "read"):
             return {"terminal": {"handle": self.terminal, "tail": self.screen, "source": "screen"}}
         if verb == ("orchestration", "worker-stop") and args[3] == "ctx_follow":
@@ -1965,6 +2054,35 @@ class Fleet:
         return [(e[e.index("--to") + 1], e[e.index("--subject") + 1]) for e in self.events
                 if e[:2] == ("orchestration", "send") and e[e.index("--to") + 1] != "dispatch:ctx_restart"]
 
+
+# A merger launched by review hits a limit and watch retries it on a different seat.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    ticket, state = review_fixture()
+    ticket.update(f.ticket, route=("codex", f.model, "medium", None))
+    state.update(stage="Reviewing", sha=sha, expected="reader", coder_terminal="term_coder")
+    verdict = report("reader", "REVIEW VERDICT: PUSH " + sha)
+    with review_launch(["merger"], seat="jzaw", label="jzaw", holds=f.holds), \
+            patch.object(tick, "green_report", return_value=sha), patch.object(tick, "review_card"):
+        tick.review_step(f.db, "run", [], ticket, state, [verdict])
+    f.dispatch, f.terminal = "merger", "pane-merger"
+    f.title, f.ticket["stage"] = "#553: Merging report", "Merging"
+    calls = f.tick()
+    assert calls.index(("orchestration", "worker-stop")) < calls.index(("orchestration", "worker-start"))
+    assert ("account", "select", "--agent", "codex", "--account", "x2") in f.events
+    holds = json.loads(f.holds.read_text())
+    assert "pane-merger" not in holds and holds["term_restart"]["account"] == "x2"
+    review = tick.review_state(f.db, "run", 553)
+    assert (review["coder"], review["expected"], review["coder_terminal"]) == ("ctx_restart", "ctx_restart", "term_restart")
+    assert f.cards[-1] == ("Merging", "coder gpt-6.2-astra medium @x2")
+
+# A limit without a hold can still exclude the account explicitly reported for that terminal.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    f.holds.write_text("{}")
+    f.reported_account = "jzaw"
+    assert ("orchestration", "worker-start") in f.tick()
+    assert ("account", "select", "--agent", "codex", "--account", "x2") in f.events
 
 # Near its limit: one handoff request, Handed off on the card, then the same Task retries on another seat.
 with TemporaryDirectory() as tmp:
@@ -2292,7 +2410,7 @@ pending_note = {"note": {"to": "coder", "subject": "#41: resume", "body": "read 
                 "card": {"number": 41, "stage": "Coding", "agent": state["agent"]}}
 db.execute("INSERT INTO watch VALUES ('run','pane-new',?)", (json.dumps(pending_note),))
 with patch.object(tick, "green_report", return_value=None) as verify, patch.object(tick, "review_card") as card, \
-        patch.object(tick, "runtime", return_value={"delivery": "follow_up", "followUpOf": "coder", "dispatchId": "fix"}) as cli:
+        review_launch(["fix"]) as cli:
     tick.review_step(db, "run", [], ticket, state, [recorded])
     verify.assert_not_called()
     card.assert_not_called()
@@ -2303,7 +2421,7 @@ with patch.object(tick, "green_report", return_value=None) as verify, patch.obje
     card.assert_not_called()
     db.execute("UPDATE watch SET state='{}'")
     tick.review_step(db, "run", [], ticket, state, [recorded])
-    assert card.call_args.args[1] == "Fixing" and cli.call_count == 1
+    assert card.call_args.args[1] == "Fixing" and sum(call.args[1] == "worker-start" for call in cli.call_args_list) == 1
 
 
 # A failed coordinator restore after a restart is retried from the watch row; the resume note does not wait for it.
@@ -2872,12 +2990,16 @@ def remote_start(root, stack, db, has_receipt, repo="hr-relay"):
     review_ticket = dict(work, item="card", agent=state["agent"])
     with (patch.object(tick, "tickets", return_value=[review_ticket]),
           patch.object(tick, "green_report", return_value=None) as check_ci,
+          patch.object(tick, "review_account", return_value=account),
+          patch.object(pick, "HOLDS", args.holds),
+          patch.object(pick.account_usage, "remote_account", side_effect=[{}, {"codex": {"activeAccountId": "seat"}}]),
           patch.object(tick, "review_card"), patch.object(tick, "runtime", side_effect=[
               {"messages": [report("ctx", "waiting for CI")]}, {"tasks": []},
-              {"delivery": "follow_up", "followUpOf": "ctx", "dispatchId": "fix"}]) as review_rpc):
+              full_start("fix", "wsl-fix")]) as review_rpc):
         tick.review_tick(SimpleNamespace(issue=99, coder=None), db)
     check_ci.assert_called_once()
-    assert review_rpc.call_args.args[:4] == ("orchestration", "send", "--to", "dispatch:ctx")
+    assert review_rpc.call_args.args[:4] == ("orchestration", "worker-start", "--on", host)
+    assert json.loads(args.holds.read_text())["wsl-fix"]["account"] == "seat"
 
 
 for has_receipt, repo in ((True, "hr-relay"), (False, "hr-relay"), (True, "dot-agents")):
@@ -2893,7 +3015,6 @@ with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory
     tick.review_state(db, "run", 41)
     tick.save_review(db, "run", 41, state)
     messages = [dict(recorded, created_at="2026-11-23T18:00:00Z")]
-    sends = []
     starts = []
     server = {"environmentId": "env_wsl", "name": host, "asOf": "2026-11-23T18:00:00Z"}
     attempt = {"id": "wsl-review", "taskId": "review-task", "runId": "run"}
@@ -2912,19 +3033,16 @@ with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory
             case "orchestration", "worker-start":
                 assert args[args.index("--on") + 1] == host
                 assert args[args.index("--worktree") + 1] == "path:/remote/worktree"
+                spec = args[args.index("--spec") + 1]
                 starts.append({"id": "review-task", "run_id": "run", "created_at": "2026-11-23T18:00:01Z",
-                               "task_title": args[args.index("--task-title") + 1],
-                               "spec": args[args.index("--spec") + 1]})
-                raise tick.OrcaError("lost reviewer receipt")
+                               "task_title": args[args.index("--task-title") + 1], "spec": spec})
+                if len(starts) == 1:
+                    raise tick.OrcaError("lost reviewer receipt")
+                return full_start("wsl-land", "wsl-merger")
             case "orchestration", "worker-show":
                 assert args[2:4] == ("--dispatch", "wsl-review")
                 return {"dispatch": attempt, "worker": {"stage": "server_record", "worktreeId": None},
                         "terminal": None}
-            case "orchestration", "send":
-                # Dispatch-addressed mail is relayed by the Run home to the worker server.
-                assert args[2:4] == ("--to", "dispatch:coder") and "--on" not in args
-                sends.append(args[-1])
-                return {"delivery": "follow_up", "followUpOf": "coder", "dispatchId": "wsl-land"}
         raise AssertionError(args)
 
     def reviewer_execution(target, path, argv):
@@ -2948,7 +3066,8 @@ with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory
         "worktree": {"id": "wsl-tree", "path": state["path"]}}))
     stack.enter_context(patch.object(pick.account_usage, "remote_output", side_effect=reviewer_execution))
     select = stack.enter_context(patch.object(pick.account_usage, "remote_account",
-                                             side_effect=[{}, {"claude": {"activeAccountId": "seat"}}]))
+                                             side_effect=[{}, {"claude": {"activeAccountId": "seat"}},
+                                                          {}, {"codex": {"activeAccountId": "seat"}}]))
     stack.enter_context(patch.object(pick.account_usage, "load_config", return_value={}))
     seat = stack.enter_context(patch.object(pick, "pick", return_value=(dict(account, host=host), [])))
     holds = Path(tmp) / "holds.json"
@@ -2966,9 +3085,11 @@ with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory
     assert tick.review_state(db, "run", 41)["host"] == host
     messages = [recorded, dict(report("wsl-review", "REVIEW VERDICT: PUSH " + sha, msg_id="verdict"), sequence=2)]
     tick.review_tick(args, db)
-    assert len(sends) == 1 and "Land the approved change" in sends[0]
+    assert len(starts) == 2 and "Land the approved change" in starts[-1]["spec"]
+    assert json.loads(holds.read_text())["wsl-merger"]["host"] == host
     state = tick.review_state(db, "run", 41)
-    assert (state["coder"], state["stage"], state["host"]) == ("wsl-land", "Merging", host)
+    assert (state["coder"], state["coder_terminal"], state["stage"], state["host"]) == (
+        "wsl-land", "wsl-merger", "Merging", host)
 
 # The tick dispatches the development full run at most every 20 minutes and never twice at once.
 with TemporaryDirectory() as tmp:

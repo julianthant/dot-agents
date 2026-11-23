@@ -1781,8 +1781,10 @@ def watch_pass(args, db, actions, errors):
         with db:
             if state is None:
                 db.execute("DELETE FROM watch WHERE run=? AND terminal=?", (run, terminal))
+                saved.pop(terminal, None)
             else:
                 db.execute("INSERT OR REPLACE INTO watch VALUES (?,?,?)", (run, terminal, json.dumps(state)))
+                saved[terminal] = json.dumps(state)
 
     def escalate(number, subject, body):
         # From the Run's own pane Orca accepts only status mail to run:<id> (sender_not_assignee otherwise).
@@ -1812,17 +1814,19 @@ def watch_pass(args, db, actions, errors):
         ticket = cards.get(number)
         pending = state.get("pending") or {}
         # A lost worker-start response may have launched the replacement already; never replay it.
-        if pending.get("starting") or (not crash and not state.get("account")):
-            reason = "start" if pending.get("starting") else "account"
-            if state.get("escalated") != reason:
-                escalate(number, "restart unconfirmed" if reason == "start" else "limit account unknown",
-                         f"Inspect the restart of Dispatch {dispatch} in Run {run}, then clear its watch row."
-                         if reason == "start" else f"Dispatch {dispatch} must restart ({why}), but no hold records "
-                         "its account, so another account cannot be proven. It was left running.")
+        if pending.get("starting"):
+            pending.setdefault("dispatch", dispatch)
+            pending.setdefault("number", number)
+            resume_start(terminal, state)
+            return
+        if not crash and not state.get("account"):
+            if state.get("escalated") != "account":
+                escalate(number, "limit account unknown", f"Dispatch {dispatch} must restart ({why}), but no hold "
+                         "records its account, so another account cannot be proven. It was left running.")
                 stage(ticket, "Needs you")
-                state["escalated"] = reason
+                state["escalated"] = "account"
                 save(terminal, state)
-                actions.append({"issue": number, "dispatch": dispatch, "reported": reason})
+                actions.append({"issue": number, "dispatch": dispatch, "reported": "account"})
             return
         state["pending"] = {"why": why, "crash": crash}
         if not crash:
@@ -1840,45 +1844,82 @@ def watch_pass(args, db, actions, errors):
         runtime("account", "select", "--agent", route[0], "--account", account["id"])
         if runtime("account", "list")[route[0]]["activeAccountId"] != account["id"]:
             raise OrcaError("selected account changed before restart")
-        if show["dispatch"]["status"] == "dispatched":
-            # --retry-of takes a settled attempt, so fence the old one first.
-            stop = runtime("orchestration", "worker-stop", "--dispatch", dispatch, "--full")
-            actions.append({"issue": number, "stopped": dispatch, "process": stop.get("processAction")})
-        state["pending"]["starting"] = True
-        save(terminal, state)
-        # The same Task keeps its title, dependencies and retry lineage for the review tick.
-        started = runtime("orchestration", "worker-start", *actor, "--task", task_id, "--retry-of", dispatch,
-                          "--worktree", "id:" + show["worker"]["worktreeId"], "--agent", route[0],
-                          "--model", route[1], "--effort", route[2], "--full")
-        new, handle = start_identity(started)
-        with pick.edit_holds(holds_path) as edit:
-            edit.pop(terminal, None)
-            edit[handle] = dict(account=account["id"], label=account["label"], agent=route[0], model=route[1],
-                                effort=route[2], host="local", at=int(now))
-        if number is not None:
-            review = review_state(db, run, number)
-            if review and review.get("coder") == dispatch:
-                review.update(coder=new, expected=new, coder_terminal=handle)
-                if review.get("agent"):
-                    review["agent"] = card_agent(review["agent"], False, account["label"])
-                save_review(db, run, number, review)
-            elif review and (review.get("reviewer") or {}).get("dispatch") == dispatch:
-                review["reviewer"].update(dispatch=new, terminal=handle)
-                review["expected"] = new
-                save_review(db, run, number, review)
-        save(terminal, None)
-        save(handle, {"relaunched": bool(state.get("relaunched") or crash), "account": account["id"]})
-        if ticket:
-            stage(ticket, phase(ticket, state, title), card_agent(ticket["agent"], "review" in title, account["label"]))
-        actions.append({"issue": number, "restarted": dispatch, "as": new, "why": why, "account": account["label"]})
         report = failure_of(show)
         note = (f"You replace Dispatch {dispatch}, which stopped: {why}."
                 + (f" Its handoff: {report['reportPath']}." if isinstance(report, dict) and report.get("reportPath") else "")
                 + (f" Its last report:\n{report['body'][:1500]}\n" if isinstance(report, dict) and report.get("body") else " ")
                 + "Read its handoff first if there is one; otherwise continue from the last commit on this branch.")
-        receipt = runtime("orchestration", "send", *actor, "--to", "dispatch:" + new,
-                          "--subject", f"#{number}: resume" if number else "resume", "--body", note)
-        actions[-1]["note"] = receipt.get("delivery")
+        if show["dispatch"]["status"] == "dispatched":
+            # --retry-of takes a settled attempt, so fence the old one first.
+            stop = runtime("orchestration", "worker-stop", "--dispatch", dispatch, "--full")
+            actions.append({"issue": number, "stopped": dispatch, "process": stop.get("processAction")})
+        # Everything adoption needs if the start response is lost.
+        state["pending"].update(starting=True, dispatch=dispatch, task=task_id, number=number, title=title,
+                                worktree=show["worker"]["worktreeId"], route=route, account=account["id"],
+                                label=account["label"], note=note)
+        save(terminal, state)
+        # The same Task keeps its title, dependencies and retry lineage for the review tick.
+        started = runtime("orchestration", "worker-start", *actor, "--task", task_id, "--retry-of", dispatch,
+                          "--worktree", "id:" + show["worker"]["worktreeId"], "--agent", route[0],
+                          "--model", route[1], "--effort", route[2], "--full")
+        adopt(terminal, state, *start_identity(started))
+
+    def resume_start(terminal, state):
+        """Adopt the retry Orca started for a lost worker-start response; otherwise ask the Run once."""
+        p = state["pending"]
+        if p.get("task"):
+            new = (runtime("orchestration", "dispatch-show", "--task", p["task"], "--full").get("dispatch") or {}).get("id")
+            if new and new != p["dispatch"]:
+                show = runtime("orchestration", "worker-show", "--dispatch", new, "--full")
+                d, worker = show["dispatch"], show.get("worker") or {}
+                if (d["id"] == new and d.get("retryOfDispatchId") == p["dispatch"] and d["runId"] == run
+                        and d["taskId"] == p["task"] and worker.get("worktreeId") == p["worktree"]
+                        and start_identity(worker)[0] == new):
+                    adopt(terminal, state, *start_identity(worker))
+                    return
+        if state.get("escalated") != "start":
+            escalate(p["number"], "restart unconfirmed",
+                     f"Inspect the restart of Dispatch {p['dispatch']} in Run {run}, then clear its watch row.")
+            stage(cards.get(p["number"]), "Needs you")
+            state["escalated"] = "start"
+            save(terminal, state)
+            actions.append({"issue": p["number"], "dispatch": p["dispatch"], "reported": "start"})
+
+    def adopt(terminal, state, new, handle):
+        p = state["pending"]
+        number, route, ticket = p["number"], p["route"], cards.get(p["number"])
+        with pick.edit_holds(holds_path) as edit:
+            edit.pop(terminal, None)
+            edit[handle] = dict(account=p["account"], label=p["label"], agent=route[0], model=route[1],
+                                effort=route[2], host="local", at=int(now))
+        if number is not None:
+            review = review_state(db, run, number)
+            if review and review.get("coder") == p["dispatch"]:
+                review.update(coder=new, expected=new, coder_terminal=handle)
+                if review.get("agent"):
+                    review["agent"] = card_agent(review["agent"], False, p["label"])
+                save_review(db, run, number, review)
+            elif review and (review.get("reviewer") or {}).get("dispatch") == p["dispatch"]:
+                review["reviewer"].update(dispatch=new, terminal=handle)
+                review["expected"] = new
+                save_review(db, run, number, review)
+        save(terminal, None)
+        row = {"relaunched": bool(state.get("relaunched") or p["crash"]), "account": p["account"],
+               "note": {"to": new, "subject": f"#{number}: resume" if number else "resume", "body": p["note"]}}
+        save(handle, row)
+        if ticket:
+            stage(ticket, phase(ticket, state, p["title"]), card_agent(ticket["agent"], "review" in p["title"], p["label"]))
+        actions.append({"issue": number, "restarted": p["dispatch"], "as": new, "why": p["why"], "account": p["label"]})
+        send_note(handle, row)
+
+    def send_note(handle, row):
+        """The resume note is resent each tick until Orca returns a receipt."""
+        note = row["note"]
+        receipt = runtime("orchestration", "send", *actor, "--to", "dispatch:" + note["to"],
+                          "--subject", note["subject"], "--body", note["body"])
+        row.pop("note")
+        save(handle, row)
+        actions.append({"note": receipt.get("delivery"), "to": note["to"]})
 
     def restore_prompt(ticket, state, title):
         """The forwarded prompt was answered: give the card back so review_tick reads the coder's report."""
@@ -1889,6 +1930,17 @@ def watch_pass(args, db, actions, errors):
         for key in ("prompt", "prompt_stage"):
             state.pop(key, None)
         actions.append({"issue": ticket and ticket["number"], "prompt cleared": True})
+
+    # The retry of a lost start is listed first and hides the old row from the loop below.
+    for terminal, raw in list(saved.items()):
+        state = json.loads(raw)
+        try:
+            if (state.get("pending") or {}).get("starting") and state["pending"].get("task"):
+                resume_start(terminal, state)
+            elif state.get("note"):
+                send_note(terminal, state)
+        except (OrcaError, OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as e:
+            errors.append({"terminal": terminal, "error": str(e)})
 
     seen_terminals, seen_tasks = set(), set()
     for w in close_workers(run):

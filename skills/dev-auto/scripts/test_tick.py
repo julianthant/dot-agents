@@ -1138,6 +1138,8 @@ class Fleet:
         self.seats = ["jzaw", "x2"]  # the limited account is first in accounts.toml order
         self.superseded = False
         self.start_error = None
+        self.lose_start = False  # Orca starts the retry, but the response is lost
+        self.note_error = None
         self.events, self.cards, self.now = [], [], 1_795_389_500
         self.ticket = dict(number=553, item="card", agent=f"coder {model} medium @jzaw", stage="Coding")
         self.title = "#553 coder"
@@ -1163,12 +1165,22 @@ class Fleet:
             # The Task's earlier attempt on its own, older pane is history too.
             retried = dict(row, dispatchId="ctx_first", dispatchStatus="failed", workerState="failed",
                            agentTerminalHandle="term_first", resource={"ownerDispatchId": "ctx_first"})
-            return {"workers": [*before, row, old, retried], "page": {"hasMore": False, "nextCursor": None}}
+            # After a retry, the replaced attempt stays listed behind it.
+            replaced = [dict(row, dispatchId="ctx_coder", dispatchStatus="failed", workerState="stopped",
+                             agentTerminalHandle="term_coder", resource={"ownerDispatchId": "ctx_coder"})
+                        ] if self.dispatch == "ctx_restart" else []
+            return {"workers": [*before, row, old, retried, *replaced], "page": {"hasMore": False, "nextCursor": None}}
+        if verb == ("orchestration", "dispatch-show"):
+            # Recorded shape: only the newest Dispatch's id and status.
+            return {"dispatch": {"id": self.dispatch, "status": self.status, "taskId": None, "assigneeHandle": None}}
         if verb == ("orchestration", "worker-show"):
             assert args[3] == self.dispatch, args
+            retry = "ctx_coder" if self.dispatch == "ctx_restart" else None
             return {"dispatch": {"id": self.dispatch, "runId": "run", "taskId": "task_coder", "status": self.status,
-                                 "assigneeHandle": self.terminal, "lastFailure": self.failure},
-                    "worker": {"state": self.state, "worktreeId": "repo::/wt",
+                                 "assigneeHandle": self.terminal, "lastFailure": self.failure,
+                                 "retryOfDispatchId": retry, "followUpOf": None},
+                    "worker": {"state": self.state, "worktreeId": "repo::/wt", "dispatchId": self.dispatch,
+                               "effects": [{"kind": "terminal", "role": "agent", "action": "created", "id": self.terminal}],
                                "startOptions": {"launch": {"effective": {"agent": self.agent, "model": self.model,
                                                                          "effort": "medium"}}}},
                     "projection": {"liveness": {"verdict": self.liveness}},
@@ -1193,9 +1205,13 @@ class Fleet:
             self.dispatch, self.terminal = "ctx_restart", "term_restart"
             self.status, self.state, self.liveness, self.failure = "dispatched", "ready", "live", None
             self.screen = CLAUDE_WORKING
+            if self.lose_start:
+                raise tick.OrcaError("timed out")
             return full_start("ctx_restart", "term_restart")
         if verb == ("orchestration", "send"):
             if args[args.index("--to") + 1] == "dispatch:ctx_restart":
+                if self.note_error:
+                    raise self.note_error
                 self.notes.append(args[args.index("--body") + 1])
             return {"delivery": "queued"}
         raise AssertionError(args)
@@ -1298,6 +1314,29 @@ with TemporaryDirectory() as tmp:
     f.start_error = None
     calls = f.tick(1)
     assert ("orchestration", "worker-start") not in calls and f.sent() == [("run:run", "#553: restart unconfirmed")]
+
+# A lost start response whose retry Orca did start is adopted on the next tick, never replayed.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    tick.review_state(f.db, "run", 553)
+    tick.save_review(f.db, "run", 553, {"coder": "ctx_coder", "expected": "ctx_coder", "coder_terminal": "term_coder"})
+    f.lose_start = True
+    with check.assertRaises(tick.OrcaError):
+        f.tick()
+    assert "timed out" in f.lines[0] and f.dispatch == "ctx_restart"
+    f.note_error = tick.OrcaError("mailbox busy")
+    with check.assertRaises(tick.OrcaError):
+        f.tick(1)
+    assert [e[:2] for e in f.events].count(("orchestration", "worker-start")) == 0 and f.notes == []
+    holds = json.loads(f.holds.read_text())
+    assert "term_coder" not in holds and holds["term_restart"]["account"] == "x2"
+    assert tick.review_state(f.db, "run", 553)["coder"] == "ctx_restart"
+    assert f.cards[-1] == ("Coding", "coder gpt-6.2-astra medium @x2") and f.sent() == []
+    f.note_error = None
+    calls = f.tick(1)
+    assert ("orchestration", "worker-start") not in calls and len(f.notes) == 1 and "ctx_coder" in f.notes[0]
+    f.tick(1)
+    assert len(f.notes) == 1
 
 # A crash relaunches once, on any seat, in the worker's own phase; a second crash goes to the Run as Needs you.
 with TemporaryDirectory() as tmp:

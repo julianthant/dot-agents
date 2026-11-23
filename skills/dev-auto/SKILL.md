@@ -64,8 +64,10 @@ selects the coordinator bot's prior Codex account again, or the account
 reviewer start and the watch restart do the same.
 
 For Codex workers, fill sets `notice.hide_rate_limit_model_nudge = true` in
-the new worktree's project config and adds `.codex/` to the worktree's
-`info/exclude`, so a coder cannot commit it. Codex applies project settings in trusted
+the new worktree's project config and adds `.codex/` once to the clone's shared
+`info/exclude` (`git rev-parse --git-path info/exclude` resolves to the common git
+directory), so `.codex/` is ignored in the main checkout and every worktree of that
+clone, and no checkout can commit it. Codex applies project settings in trusted
 workspaces. The installed 0.171.0 TUI reads this preference before showing its
 model-switch menu. Startup hook consent depends on the hooks' trust state.
 An operator reviews new or changed hooks. [Model nudge](https://github.com/openai/codex/blob/rust-v0.171.0/codex-rs/tui/src/chatwidget/rate_limits.rs#L475-L480) · [Hook review](https://github.com/openai/codex/blob/rust-v0.171.0/codex-rs/tui/src/startup_hooks_review.rs#L283-L293)

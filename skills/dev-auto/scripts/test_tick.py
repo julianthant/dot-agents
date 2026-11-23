@@ -840,6 +840,36 @@ for lose_start in (False, True):
         tick.review_step(db, "run", [], ticket, state, mail)
         assert card.call_args.args[1] == "Reviewing" and selects == ["seat", "coord"]
 
+# Orca confirms a reviewer start had no effects: the coordinator is restored and the report is read again.
+ticket, state = review_fixture()
+ticket["body"] = "Reviewer: codex / gpt-6.2-astra / medium"
+active, selects, refuse = ["coord"], [], [True]
+def refused_review(*args):
+    if args[:2] == ("account", "select"):
+        selects.append(args[-1])
+        active[0] = args[-1]
+        return {}
+    if args[:2] == ("account", "list"):
+        return {"codex": {"activeAccountId": active[0]}}
+    assert args[:2] == ("orchestration", "worker-start"), args
+    if refuse[0]:
+        raise tick.StartNotApplied("refused")
+    return full_start("reader", "pane")
+db = sqlite3.connect(":memory:")
+with patch.object(tick, "green_report", return_value=sha), patch.object(tick, "worker_settings"), \
+        patch.object(tick, "review_account", return_value={"id": "seat", "label": "review"}), \
+        patch.object(tick, "record_hold"), patch.object(pick, "coordinator", return_value=None), \
+        patch.object(pick.account_usage, "load_config", return_value={}), patch.object(tick, "review_card") as card, \
+        patch.object(tick, "runtime", side_effect=refused_review):
+    with check.assertRaisesRegex(tick.OrcaError, "no reviewer start effects"):
+        tick.review_step(db, "run", [], ticket, state, [recorded])
+    saved = tick.review_state(db, "run", 41)
+    assert selects == ["seat", "coord"] and active == ["coord"] and "pending" not in saved and "coordinator" not in saved
+    card.assert_not_called()
+    refuse[0] = False
+    tick.review_step(db, "run", [], ticket, state, [recorded])
+    assert card.call_args.args[1] == "Reviewing" and selects == ["seat", "coord", "seat", "coord"]
+
 # The coordinator moves to pick.coordinator's choice when its own account is past handoff; a race is reported.
 for fresh, listed in ((None, "coord"), ({"id": "fresh"}, "fresh"), (None, "other")):
     with patch.object(pick, "coordinator", return_value=fresh) as choose, \
@@ -975,6 +1005,15 @@ with patch.object(tick, "tickets", return_value=[ticket]), patch.object(tick, "s
                        {"dispatch": {"id": "ctx_elsewhere", "runId": "run_other", "taskId": "task"}}]
     with check.assertRaisesRegex(tick.OrcaError, "ctx_elsewhere belongs to Run run_other, not the bound Run run"):
         tick.review_tick(args, sqlite3.connect(":memory:"))
+    step.assert_not_called()
+    # Saved review state does not hide the mismatch.
+    saved_db = sqlite3.connect(":memory:")
+    tick.review_state(saved_db, "run", 41)
+    tick.save_review(saved_db, "run", 41, dict(state))
+    cli.side_effect = [{"messages": [recorded]}, {"tasks": []},
+                       {"dispatch": {"id": "ctx_elsewhere", "runId": "run_other", "taskId": "task"}}]
+    with check.assertRaisesRegex(tick.OrcaError, "ctx_elsewhere belongs to Run run_other"):
+        tick.review_tick(args, saved_db)
     step.assert_not_called()
 
 # A partial Project write resumes on restart without a second follow-up.
@@ -1123,7 +1162,7 @@ with patch.object(tick, "runtime", side_effect=ancestry), patch.object(tick, "gr
     assert sha in verify.call_args.args[1]
 
 def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncertain=False, remote_race=False,
-                  release_unknown=False, ticks=1):
+                  release_unknown=False, ticks=1, card_fails=False):
     root = Path(tmp)
     path = str(root / "task-tree")
     branch = "task/dev-auto/example"
@@ -1159,6 +1198,8 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
             return json.dumps([{"data": {"repository": {"issues": {"nodes": [issue]}}}}])
         if args[0] == "gh":
             assert args[1:3] == ("project", "item-edit")
+            if card_fails and sum(e[:3] == ("gh", "project", "item-edit") for e in events) == 1:
+                raise tick.OrcaError("Project unavailable")
             return ""
         if args[3:5] == ("remote", "get-url"):
             return "https://github.com/julianthant/dot-agents.git\n"
@@ -1223,7 +1264,10 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
             patch.object(tick, "runtime", side_effect=orca), patch.object(tick, "command", side_effect=cli), \
             redirect_stdout(io.StringIO()) as output:
         for _ in range(ticks):
-            tick.close_tick(args, db)
+            try:
+                tick.close_tick(args, db)
+            except tick.OrcaError:
+                assert card_fails  # the card write after a sent notice failed; the next tick retries only it
     assert [event[3] for event in events if event[:2] == REL] == ["ctx_merge", "ctx_review", "ctx_initial"] * ticks
     expected_holds = {"term_other", "term_reviewer"} if release_uncertain else {"term_other"}
     assert set(json.loads(holds.read_text())) == expected_holds
@@ -1234,7 +1278,7 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
         assert any(event[0] == "git" and event[3] == "push" for event in events) == remote_race
     else:
         assert present and local_ref == sha
-        assert edits == [("stage", "--single-select-option-id", "needs")]
+        assert edits == [("stage", "--single-select-option-id", "needs")] * (2 if card_fails else 1)
         assert "Needs you" in output.getvalue()
         sends = [event for event in events if event[:2] == ("orchestration", "send")]
         assert len(sends) == 1 and all("--type" in e and e[e.index("--type") + 1] == "status"
@@ -1244,7 +1288,7 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
 
 for scenario in ({}, {"merged": False}, {"dirty": True}, {"refused": True},
                  {"release_uncertain": True}, {"remote_race": True}, {"release_unknown": True},
-                 {"release_uncertain": True, "ticks": 2}):
+                 {"release_uncertain": True, "ticks": 2}, {"release_uncertain": True, "ticks": 3, "card_fails": True}):
     with TemporaryDirectory() as tmp:
         close_fixture(tmp, **scenario)
 
@@ -1570,6 +1614,41 @@ with TemporaryDirectory() as tmp:
     assert f.active == "coord" and len(f.notes) == 1
     f.tick(1)
     assert not f.db.execute("SELECT * FROM watch").fetchall()
+
+
+# Orca confirms a restart had no effects: the coordinator's account is restored, or kept owed, and the restart retried.
+for restore_fails in (False, True):
+    with TemporaryDirectory() as tmp:
+        f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+        f.start_error = tick.StartNotApplied("refused")
+        f.select_error = tick.OrcaError("account switch refused") if restore_fails else None
+        with check.assertRaises(tick.OrcaError):
+            f.tick()
+        row = json.loads(dict(f.db.execute("SELECT terminal,state FROM watch"))["term_coder"])
+        assert not row["pending"].get("starting") and f.notes == []
+        assert (f.active, row.get("coordinator")) == (("x2", "coord") if restore_fails else ("coord", None))
+        f.start_error = f.select_error = None
+        calls = f.tick(1)
+        assert ("orchestration", "worker-start") in calls and f.active == "coord" and len(f.notes) == 1
+
+# A replacement crashes before its resume note and account restore land: its successor inherits both.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    f.note_error = tick.OrcaError("mailbox busy")
+    f.select_error = tick.OrcaError("account switch refused")
+    with check.assertRaises(tick.OrcaError):
+        f.tick()
+    assert f.active == "x2" and f.cards[-1][0] == "Handed off"
+    f.liveness = "exited"  # the replacement crashes
+    with check.assertRaises(tick.OrcaError):
+        f.tick(1)
+    row = json.loads(dict(f.db.execute("SELECT terminal,state FROM watch"))["term_restart"])
+    assert row["relaunched"] and row["coordinator"] == "coord" and row["card"]["stage"] == "Coding"
+    assert "Its own resume note, never delivered" in row["note"]["body"]
+    f.note_error = f.select_error = None
+    f.tick(1)
+    assert f.active == "coord" and len(f.notes) == 1 and "never delivered" in f.notes[0]
+    assert f.cards[-1][0] == "Coding"
 
 
 class FailingWatchInsert:

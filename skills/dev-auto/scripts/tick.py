@@ -1416,9 +1416,19 @@ def review_step(db, run, actor, ticket, initial, messages):
         db.execute("INSERT OR REPLACE INTO reviews VALUES (?,?,?)", (run, number, json.dumps(state)))
     state["card_agent"] = state["agent"]
     if account:
-        result = runtime("orchestration", "worker-start", *actor, "--worktree", "path:" + state["path"],
-                         "--agent", route[0], "--model", route[1], "--effort", route[2],
-                         "--task-title", state["review_title"], "--spec", spec, "--full")
+        try:
+            result = runtime("orchestration", "worker-start", *actor, "--worktree", "path:" + state["path"],
+                             "--agent", route[0], "--model", route[1], "--effort", route[2],
+                             "--task-title", state["review_title"], "--spec", spec, "--full")
+        except StartNotApplied as e:
+            # No reviewer exists: drop the reservation so the report is read again, then restore the coordinator.
+            for key in ("pending", "review_title", "hold"):
+                state.pop(key, None)
+            with db:
+                db.execute("DELETE FROM review_mail WHERE run=? AND id=?", (run, message["id"]))
+                db.execute("INSERT OR REPLACE INTO reviews VALUES (?,?,?)", (run, number, json.dumps(state)))
+            review_coordinator(db, run, number, state)
+            raise OrcaError(f"#{number}: Orca confirmed no reviewer start effects: {e}") from e
         dispatch, terminal = start_identity(result)
         state["hold"]["terminal"] = terminal
         assign_reviewer(state, dispatch, terminal, state["hold"])
@@ -1454,6 +1464,10 @@ def review_tick(args, db):
         if args.issue and args.issue != number:
             continue
         try:
+            if args.coder:
+                owner = runtime("orchestration", "worker-show", "--dispatch", args.coder, "--full")["dispatch"]["runId"]
+                if owner != run:
+                    raise OrcaError(f"coder Dispatch {args.coder} belongs to Run {owner}, not the bound Run {run}")
             state = review_state(db, run, number)
             if not state:
                 ids = [t["id"] for t in tasks if t["title"] == f"#{number} coder"]
@@ -1469,15 +1483,11 @@ def review_tick(args, db):
                     dispatch = runtime("orchestration", "dispatch-show", "--task", ids[0], "--full")["dispatch"]["id"]
                 else:
                     raise OrcaError("multiple coder Tasks; select the intended Dispatch with --issue and --coder")
-                if not review_mail(messages, dispatch) and not args.coder:
+                if not review_mail(messages, dispatch):
+                    if args.coder:
+                        log("review", {"issue": number, "waiting": f"no succeeded report from {dispatch}"})
                     continue
                 show = runtime("orchestration", "worker-show", "--dispatch", dispatch, "--full")
-                if args.coder and show["dispatch"]["runId"] != run:
-                    raise OrcaError(f"coder Dispatch {dispatch} belongs to Run {show['dispatch']['runId']}, "
-                                    f"not the bound Run {run}")
-                if not review_mail(messages, dispatch):
-                    log("review", {"issue": number, "waiting": f"no succeeded report from {dispatch}"})
-                    continue
                 worker = show["worker"]
                 if (show["dispatch"]["id"] != dispatch or show["dispatch"]["runId"] != run or
                         (not args.coder and show["dispatch"]["taskId"] != ids[0])):
@@ -1714,7 +1724,8 @@ def close_tick(args, db):
     project, (_, (stage, _), (agent, _)), (_, needs_you) = project_fields()
     # Retry the same workspace if a partial close already removed the checkout.
     db.execute("CREATE TABLE IF NOT EXISTS closing (run TEXT, issue INTEGER, workspace TEXT, PRIMARY KEY(run,issue))")
-    db.execute("CREATE TABLE IF NOT EXISTS close_notice (run TEXT, issue INTEGER, reason TEXT, PRIMARY KEY(run,issue))")
+    db.execute("CREATE TABLE IF NOT EXISTS close_notice (run TEXT, issue INTEGER, reason TEXT, carded INTEGER,"
+               " PRIMARY KEY(run,issue))")
     for issue, card, branch in candidates:
         number = issue["number"]
         review = review_state(db, run, number) or {}
@@ -1760,13 +1771,18 @@ def close_tick(args, db):
             log("closed", {"issue": number, "branch": branch, "head": sha})
         except (OrcaError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as e:
             log("Needs you", {"issue": number, "reason": str(e)})
-            # One message per blocked state: a retry that fails the same way stays quiet.
-            if db.execute("SELECT reason FROM close_notice WHERE run=? AND issue=?", (run, number)).fetchone() != (str(e),):
+            # One message per blocked state; its card write is retried on its own.
+            notice = db.execute("SELECT reason,carded FROM close_notice WHERE run=? AND issue=?", (run, number)).fetchone()
+            if not notice or notice[0] != str(e):
                 runtime("orchestration", "send", *actor, "--to", "run:" + run, "--type", "status",
                         "--subject", f"#{number}: Needs you after close", "--body", str(e))
+                with db:
+                    db.execute("INSERT OR REPLACE INTO close_notice VALUES (?,?,?,0)", (run, number, str(e)))
+                notice = (str(e), 0)
+            if not notice[1]:
                 command(*edit, stage, "--single-select-option-id", needs_you)
                 with db:
-                    db.execute("INSERT OR REPLACE INTO close_notice VALUES (?,?,?)", (run, number, str(e)))
+                    db.execute("UPDATE close_notice SET carded=1 WHERE run=? AND issue=?", (run, number))
 
 
 def close(args):
@@ -1927,7 +1943,8 @@ def watch_pass(args, db, actions, errors):
         if account is None:
             actions.append({"issue": number, "dispatch": dispatch, "waiting for seat": reasons})
             return
-        prior = codex_active(route)
+        # An unconfirmed restore from an earlier start is still the coordinator's account.
+        prior = state.get("coordinator") or codex_active(route)
         runtime("account", "select", "--agent", route[0], "--account", account["id"])
         if runtime("account", "list")[route[0]]["activeAccountId"] != account["id"]:
             raise OrcaError("selected account changed before restart")
@@ -1935,7 +1952,8 @@ def watch_pass(args, db, actions, errors):
         note = (f"You replace Dispatch {dispatch}, which stopped: {why}."
                 + (f" Its handoff: {report['reportPath']}." if isinstance(report, dict) and report.get("reportPath") else "")
                 + (f" Its last report:\n{report['body'][:1500]}\n" if isinstance(report, dict) and report.get("body") else " ")
-                + "Read its handoff first if there is one; otherwise continue from the last commit on this branch.")
+                + "Read its handoff first if there is one; otherwise continue from the last commit on this branch."
+                + (f"\n\nIts own resume note, never delivered:\n{state['note']['body']}" if state.get("note") else ""))
         if show["dispatch"]["status"] == "dispatched":
             # --retry-of takes a settled attempt, so fence the old one first.
             stop = runtime("orchestration", "worker-stop", "--dispatch", dispatch, "--full")
@@ -1946,9 +1964,18 @@ def watch_pass(args, db, actions, errors):
                                 label=account["label"], note=note, coordinator=prior)
         save(terminal, state)
         # The same Task keeps its title, dependencies and retry lineage for the review tick.
-        started = runtime("orchestration", "worker-start", *actor, "--task", task_id, "--retry-of", dispatch,
-                          "--worktree", "id:" + show["worker"]["worktreeId"], "--agent", route[0],
-                          "--model", route[1], "--effort", route[2], "--full")
+        try:
+            started = runtime("orchestration", "worker-start", *actor, "--task", task_id, "--retry-of", dispatch,
+                              "--worktree", "id:" + show["worker"]["worktreeId"], "--agent", route[0],
+                              "--model", route[1], "--effort", route[2], "--full")
+        except StartNotApplied as e:
+            # Nothing started: the next tick restarts afresh, and the coordinator's account is restored or kept owed.
+            state["pending"] = {"why": why, "crash": crash}
+            if prior:
+                state["coordinator"] = prior
+            save(terminal, state)
+            send_note(terminal, state)
+            raise OrcaError(f"restart of {dispatch} not applied: {e}") from e
         adopt(terminal, state, *start_identity(started))
 
     def resume_start(terminal, state):
@@ -1995,7 +2022,7 @@ def watch_pass(args, db, actions, errors):
             row["coordinator"] = p["coordinator"]
         if ticket:
             # The card leaves Handed off only once the resume note has a receipt.
-            row["card"] = {"number": number, "stage": phase(ticket, state, p["title"]),
+            row["card"] = {"number": number, "stage": (state.get("card") or {}).get("stage") or phase(ticket, state, p["title"]),
                            "agent": card_agent(ticket["agent"], "review" in p["title"], p["label"])}
         # One transaction: an interruption leaves either the predecessor row (adopted again) or the new row.
         with db:

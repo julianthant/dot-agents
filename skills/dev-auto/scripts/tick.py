@@ -1289,6 +1289,9 @@ def review_step(db, run, actor, ticket, initial, messages):
                 instructions = "\n\n".join(f"Round {i}\n{v}" for i, v in enumerate(state["history"], 1))
         elif green_report(ticket, state["sha"]):
             stage = "Merging"
+        else:
+            instructions = (f"The reviewer's PUSH of {state['sha']} was voided: the branch head moved "
+                            f"or its task CI is not green.\n{GREEN_INSTRUCTIONS}")
     else:
         sha = green_report(ticket, message["subject"] + "\n" + body)
         if sha:

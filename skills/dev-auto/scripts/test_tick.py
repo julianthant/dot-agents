@@ -752,6 +752,16 @@ for i in range(3):
         tick.review_step(db, "run", [], ticket, state, [verdict])
         assert cli.call_count == 1
 
+# A PUSH whose head moved or whose CI is not green goes back to the coder, saying why.
+ticket, state = review_fixture()
+state.update(stage="Reviewing", expected="reader", sha=sha)
+with patch.object(tick, "green_report", return_value=None), patch.object(tick, "review_card") as card, \
+        patch.object(tick, "runtime", return_value={"delivery": "follow_up", "followUpOf": "coder", "dispatchId": "fix"}) as cli:
+    tick.review_step(sqlite3.connect(":memory:"), "run", [], ticket, state, [report("reader", "REVIEW VERDICT: PUSH " + sha)])
+    assert card.call_args.args[1] == "Fixing" and "dispatch:coder" in cli.call_args.args
+    assert (f"The reviewer's PUSH of {sha} was voided: the branch head moved or its task CI is not green.\n"
+            + tick.GREEN_INSTRUCTIONS) in cli.call_args.args[-1]
+
 ticket, state = review_fixture()
 db = sqlite3.connect(":memory:")
 with patch.object(tick, "green_report", return_value=None), patch.object(tick, "runtime",

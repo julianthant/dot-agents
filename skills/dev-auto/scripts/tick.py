@@ -2081,6 +2081,22 @@ def watch_pass(args, db, actions, errors):
                 return name
         return "Reviewing" if "review" in title else "Coding"
 
+    def followup_route(show, ticket, title):
+        """A follow-up Dispatch records no model: use the ticket's Coder line, else the Dispatch it follows."""
+        if "review" not in title and ticket and ticket.get("route"):
+            return tuple(ticket["route"][:3])
+        d = show["dispatch"]
+        for _ in range(10):
+            if not d.get("followUpOf"):
+                break
+            prev = runtime("orchestration", "worker-show", "--dispatch", d["followUpOf"], "--full")
+            effective = (((prev.get("worker") or {}).get("startOptions") or {}).get("launch") or {}).get("effective") or {}
+            route = tuple(effective.get(k) for k in ("agent", "model", "effort"))
+            if None not in route:
+                return route
+            d = prev["dispatch"]
+        raise OrcaError(f"no agent, model and effort recorded for Dispatch {show['dispatch']['id']} or its originals")
+
     def restart(w, show, state, why, crash):
         dispatch, terminal, task_id = w["dispatchId"], w["agentTerminalHandle"], show["dispatch"]["taskId"]
         task, number = issue_of(task_id)
@@ -2109,6 +2125,8 @@ def watch_pass(args, db, actions, errors):
         save(terminal, state)
         launch = show["worker"]["startOptions"]["launch"]["effective"]
         route = (launch["agent"], launch["model"], launch["effort"])
+        if None in route:
+            route = followup_route(show, ticket, title)
         source = None if crash else state["account"]
         seats = dict(cfg, account=[r for r in cfg["account"] if r["id"] != source])
         account, reasons = pick.pick(seats, *route, "local", now)

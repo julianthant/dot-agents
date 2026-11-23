@@ -18,7 +18,11 @@ default host is `local` and the default effort is `medium`.
    account ID, label, plan, and selection command for the caller to run. When no
    account qualifies, the picker exits 1 and writes skip reasons to stderr.
    It skips an account with under 10% of its 5-hour window or 5% of its week
-   left, so no start or restart lands on an account about to hand off.
+   left, so no start or restart lands on an account about to hand off. Each
+   window comes from the newest reading that has it; a Codex account reads the
+   shared sessions file only while it is Orca's active Codex account. A plan's
+   `prefer_models` in `limits.toml` put those models on its accounts first and
+   every other model on them last (Pro Lite takes gpt-6.2-astra before Plus).
 
    ```sh
    python3 scripts/pick.py pick --agent codex --model gpt-6.2-sol

@@ -69,15 +69,18 @@ def live_holds(host):
 
 
 def windows(cfg, row, now):
-    """(five_hour %, weekly %) from the newest reading of any age, Orca's or the CLI file's; a
-    window whose reset has passed reads 0. (None, None) when the account was never read.
-    Codex homes share one sessions folder, so a Codex row reads the file only when Orca has none."""
-    orca = account_usage.orca_usage(now).get(account_usage.orca_key(row, now))
-    found = [r for r in (orca, None if orca and row["agent"] == "codex" else account_usage.file_usage(row)) if r]
+    """(five_hour %, weekly %), each window from the newest reading that has it, Orca's or the CLI
+    file's; a window whose reset has passed reads 0. (None, None) when the account was never read.
+    Codex homes share one sessions folder, written by the active Codex account: only that row reads it."""
+    readings = account_usage.orca_usage(now)
+    key = account_usage.orca_key(row, now)
+    shared = row["agent"] == "codex" and readings.get(("active", "codex")) != key[1]
+    found = [r for r in (readings.get(key), None if shared else account_usage.file_usage(row)) if r]
     if not found:
         return None, None
-    _at, read = max(found, key=lambda r: float(r[0]))
-    out = {w: (0.0 if r and float(r) <= now else float(p)) for p, r, w in read}
+    out = {}
+    for _at, read in sorted(found, key=lambda r: float(r[0])):
+        out.update({w: (0.0 if r and float(r) <= now else float(p)) for p, r, w in read})
     return out.get("five_hour", 0.0), out.get("weekly", 0.0)
 
 
@@ -145,7 +148,11 @@ def pick(cfg, agent, model, effort, host, now, holds=None):
         holds = live_holds(host)
     route = f"{model}:{effort}"
     why = []
-    for row in cfg["account"]:
+    # A plan's prefer_models go there first; every other model tries that plan's accounts last.
+    def rank(row):
+        prefer = LIM.get(agent, {}).get(row.get("plan"), {}).get("prefer_models")
+        return 0 if prefer and model in prefer else 2 if prefer else 1
+    for row in sorted(cfg["account"], key=rank):
         if row["agent"] != agent or row["host"] != host or not row["enabled"]:
             continue
         name = row["label"]

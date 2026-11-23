@@ -40,6 +40,7 @@ handoff_5h = 95
 [codex.prolite]         # no 5-hour limit, no session cap
 weekly_handoff = 97     # at 97% weekly: every working session hands off to another account,
 weekly_single_sol = true  # then only one gpt-6.2-sol worker (any effort) runs here at a time
+prefer_models = ["gpt-6.2-astra"]  # operator 2026-11-23: gpt-6.2-astra starts go here before any Plus account
 
 # Weekly use narrows what runs on an account (Claude and Codex plus); only a window at 100%
 # blocks it, until that window resets. An account never read is skipped.

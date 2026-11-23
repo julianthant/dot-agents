@@ -77,13 +77,18 @@ with TemporaryDirectory() as temp:
 
 # Bug 2: starts and restarts skip an account nearly out (under 10% of 5 hours or 5% of the week left).
 accounts = {"account": [dict(id=i, label=i, agent="codex", plan=p, host="local", enabled=True)
-                        for i, p in (("ais", "plus"), ("jzaw", "prolite"), ("free", "plus"))]}
-use = {"ais": (91, 10), "jzaw": (0, 97), "free": (20, 20)}
+                        for i, p in (("ais", "plus"), ("lite", "prolite"), ("free", "plus"))]}
+use = {"ais": (91, 10), "lite": (0, 97), "free": (20, 20)}
+seat = lambda model: pick.pick(accounts, "codex", model, "medium", "local", 0, holds=[])
 with patch.object(pick, "windows", lambda cfg, row, now: use[row["id"]]):
-    chosen, why = pick.pick(accounts, "codex", "gpt-6.2-sol", "medium", "local", 0, holds=[])
-    assert chosen["id"] == "free" and why == ["ais: 5-hour 91%: under 10% left", "jzaw: weekly 97%: under 5% left"], why
-    use["jzaw"] = (99, 50)  # Pro Lite has no 5-hour window to run out of
-    assert pick.pick(accounts, "codex", "gpt-6.2-sol", "medium", "local", 0, holds=[])[0]["id"] == "jzaw"
+    chosen, why = seat("gpt-6.2-astra")
+    assert chosen["id"] == "free" and why == ["lite: weekly 97%: under 5% left", "ais: 5-hour 91%: under 10% left"], why
+    use["lite"] = (99, 50)  # Pro Lite has no 5-hour window to run out of
+    # Operator 2026-11-23: Astra goes to Pro Lite before any Plus seat; Sol keeps Plus first, Pro Lite last.
+    assert seat("gpt-6.2-astra")[0]["id"] == "lite"
+    assert seat("gpt-6.2-sol")[0]["id"] == "free"
+    use["free"] = (95, 20)
+    assert seat("gpt-6.2-sol")[0]["id"] == "lite"
 
 # Coordinator: keep the selected Codex account while under its handoff point, else switch.
 row = {"id": "a", "label": "a", "agent": "codex", "plan": "plus"}
@@ -152,7 +157,8 @@ with TemporaryDirectory() as temp, patch.object(pick, "HOLDS", Path(temp) / "hol
 
 print("pick: all checks pass")
 
-# Codex homes share one session folder, so the file reading is never per account: Orca's wins.
+# Codex homes share one sessions folder, written by the active Codex account: only that row reads it, and each
+# window comes from the newest reading that has it.
 now = 1_000_000
 row = {"agent": "codex", "id": "seat", "host": "local", "home": "/h"}
 orca = {("codex", "seat"): (now - 600, [(100, now + 3600, "five_hour"), (40, now + 86400, "weekly")])}
@@ -160,9 +166,18 @@ shared = (now - 60, [(23, now + 3600, "five_hour"), (94, now + 86400, "weekly")]
 with patch.object(pick.account_usage, "orca_usage", return_value=orca), \
         patch.object(pick.account_usage, "orca_key", return_value=("codex", "seat")), \
         patch.object(pick.account_usage, "file_usage", return_value=shared):
-    assert pick.windows({}, row, now) == (100.0, 40.0)
+    assert pick.windows({}, row, now) == (100.0, 40.0)  # another account wrote the file
     assert pick.windows({}, dict(row, agent="claude"), now) == (23.0, 94.0)
+    orca[("active", "codex")] = "seat"
+    assert pick.windows({}, row, now) == (23.0, 94.0)  # the active account's file is fresher than Orca
+    del orca[("active", "codex")]
 with patch.object(pick.account_usage, "orca_usage", return_value={}), \
         patch.object(pick.account_usage, "orca_key", return_value=("codex", "seat")), \
         patch.object(pick.account_usage, "file_usage", return_value=shared):
-    assert pick.windows({}, row, now) == (23.0, 94.0)
+    assert pick.windows({}, row, now) == (None, None)  # never read: the shared file is not this account's
+# A newer reading without the weekly window keeps the older weekly use instead of reading 0.
+weekly_only = (now - 30, [(10, now + 3600, "five_hour")])
+with patch.object(pick.account_usage, "orca_usage", return_value=orca), \
+        patch.object(pick.account_usage, "orca_key", return_value=("codex", "seat")), \
+        patch.object(pick.account_usage, "file_usage", return_value=weekly_only):
+    assert pick.windows({}, dict(row, agent="claude"), now) == (10.0, 40.0)

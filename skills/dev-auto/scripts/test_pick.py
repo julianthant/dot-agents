@@ -184,3 +184,14 @@ with patch.object(pick.account_usage, "orca_usage", return_value=orca), \
         patch.object(pick.account_usage, "orca_key", return_value=("codex", "seat")), \
         patch.object(pick.account_usage, "file_usage", return_value=weekly_only):
     assert pick.windows({}, dict(row, agent="claude"), now) == (10.0, 40.0)
+
+# The same Orca id may exist on two hosts. Remote usage, including inactive
+# accounts, must never pick up the local reading or a local CLI file.
+remote = {"agent": "codex", "host": "Juzzark-WSL", "id": "seat", "home": "", "plan": "plus"}
+remote_result = {"codex": {"activeAccountId": "other"}, "rateLimits": {"inactiveCodexAccounts": [
+    {"accountId": "seat", "rateLimits": {"updatedAt": 2000, "session": {"usedPercent": 36}}}]}}
+with patch.object(pick.account_usage, "remote_account", return_value=remote_result) as read:
+    pick.account_usage.ORCA_USAGE.clear()
+    assert pick.windows({}, remote, 3) == (36, 0)
+    assert pick.windows({}, remote, 3) == (36, 0)
+    read.assert_called_once_with("Juzzark-WSL", "list")

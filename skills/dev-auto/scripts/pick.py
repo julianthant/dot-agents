@@ -127,6 +127,19 @@ def codex_reason(plan_name, plan, route, held, five, week):
     return None
 
 
+# A worker started this close to empty hands off within minutes, so starts and restarts skip the account.
+MIN_LEFT_5H = 10
+MIN_LEFT_WEEKLY = 5
+
+
+def low_quota(plan, five, week):
+    if "handoff_5h" in plan and 100 - five < MIN_LEFT_5H:  # Pro Lite has no 5-hour limit
+        return f"5-hour {five:.0f}%: under {MIN_LEFT_5H}% left"
+    if 100 - week < MIN_LEFT_WEEKLY:
+        return f"weekly {week:.0f}%: under {MIN_LEFT_WEEKLY}% left"
+    return None
+
+
 def pick(cfg, agent, model, effort, host, now, holds=None):
     if holds is None:
         holds = live_holds(host)
@@ -149,6 +162,10 @@ def pick(cfg, agent, model, effort, host, now, holds=None):
             continue
         if max(five, week) >= 100:
             why.append(f"{name}: limit reached (5-hour {five:.0f}%, weekly {week:.0f}%)")
+            continue
+        low = low_quota(plan, five, week)
+        if low:
+            why.append(f"{name}: {low}")
             continue
         mine = [h for h in holds if h["account"] == row["id"]]
         if agent == "claude":

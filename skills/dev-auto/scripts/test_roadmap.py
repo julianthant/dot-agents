@@ -235,7 +235,44 @@ class Roadmap(unittest.TestCase):
     def test_a_stopped_worker_overrides_a_coding_card(self):
         live, other = self.live_rows({"dispatchStatus": "failed", "workerState": "stopped"})
         self.assertEqual((live["stage"], live["status"], live["who"][0]["host"]), (0, "stopped", "Mac"))
+        self.assertTrue(live["warning"])
         self.assertIsNone(other)
+
+    def block_ticket(self, *blockers):
+        snap = json.loads(tick.SNAPSHOT.read_text())
+        snap["open"][0]["blockedBy"] = {"nodes": list(blockers), "totalCount": len(blockers)}
+        tick.SNAPSHOT.write_text(json.dumps(snap))
+
+    def test_a_parked_ticket_keeps_its_review_stage(self):
+        self.block_ticket({"number": 653, "state": "OPEN"}, {"number": 654, "state": "CLOSED"},
+                          {"number": 655, "state": "OPEN"})
+        self.heads = "green refs/heads/task/lane/1\n"
+        self.runs({"head_branch": "task/lane/1", "head_sha": "green", "event": "push",
+                   "status": "completed", "conclusion": "success"})
+        with self.local_worker({"dispatchStatus": "failed", "workerState": "stopped"}, stage="Merging", sha="green"):
+            live = roadmap.render()["issues"][0]["now"]
+        self.assertEqual((live["stage"], live["status"], live["warning"]), (3, "parked on #653, #655", False))
+
+    def test_a_parked_ticket_with_failed_task_ci_still_warns(self):
+        self.block_ticket({"number": 653, "state": "OPEN"})
+        self.heads = "red refs/heads/task/lane/1\n"
+        self.runs({"head_branch": "task/lane/1", "head_sha": "red", "event": "push",
+                   "status": "completed", "conclusion": "failure"})
+        with self.local_worker({"dispatchStatus": "completed", "workerState": "succeeded"}):
+            live = roadmap.render()["issues"][0]["now"]
+        self.assertEqual((live["stage"], live["status"], live["warning"]), (1, "parked on #653 · CI failed", True))
+
+    def test_a_parked_ticket_with_failed_pr_checks_still_warns(self):
+        self.block_ticket({"number": 653, "state": "OPEN"})
+        self.prs = {"devPrs": [{"n": 637, "head": "task/lane/1", "checks": "failing", "issues": [1]}]}
+        live, _ = self.live_rows({"dispatchStatus": "failed", "workerState": "stopped"})
+        self.assertEqual((live["stage"], live["status"], live["warning"]),
+                         (3, "parked on #653 · PR checks failing", True))
+
+    def test_a_blocked_ticket_with_a_working_coder_still_shows_activity(self):
+        self.block_ticket({"number": 653, "state": "OPEN"})
+        live, _ = self.live_rows({})
+        self.assertEqual((live["status"], live["warning"]), ("working", False))
 
     def test_a_working_wsl_worker_names_its_host(self):
         live, _ = self.live_rows({"server": {"name": "Juzzark-WSL"}, "projection": None})

@@ -362,6 +362,8 @@ with TemporaryDirectory() as tmp:
         if argv[:3] == ("gh", "project", "item-edit"):
             recovery_edits.append(argv)
             return ""
+        if "--git-path" in argv:
+            return str(root / "info/exclude")
         if "get-url" in argv:
             return "git@github.com:julianthant/hr-relay.git"
         if "for-each-ref" in argv or "ls-remote" in argv:
@@ -454,6 +456,8 @@ with TemporaryDirectory() as temp, ExitStack() as stack:
     raced = False
     def git(*argv):
         calls.append(argv)
+        if "--git-path" in argv:
+            return str(root / "info/exclude")
         if "get-url" in argv:
             return "git@github.com:julianthant/hr-relay.git"
         if "for-each-ref" in argv:
@@ -539,6 +543,20 @@ with TemporaryDirectory() as tmp:
     tick.configure_codex_notice(Path(tmp))
     check.assertEqual(tomllib.loads(cfg.read_text())["notice"], {"hide_other_banner": True,
                                                                  "hide_rate_limit_model_nudge": True})
+
+# A Codex worktree keeps its .codex/ settings out of git status, so a coder cannot commit them.
+with TemporaryDirectory() as tmp:
+    repo, wt = Path(tmp) / "repo", Path(tmp) / "wt"
+    run = lambda *argv: subprocess.run(["git", *argv], check=True, capture_output=True, text=True).stdout
+    run("init", "-q", "-b", "main", str(repo))
+    run("-C", str(repo), "-c", "user.name=F", "-c", "user.email=f@example.invalid", "commit", "-q", "--allow-empty", "-m", "base")
+    run("-C", str(repo), "worktree", "add", "-q", "-b", "task/x", str(wt))
+    for _ in range(2):
+        tick.worker_settings(wt, ("codex", "gpt-6.2-sol", "high", None))
+    assert (wt / ".codex/config.toml").exists()
+    check.assertEqual(run("-C", str(wt), "status", "--porcelain", "--untracked-files=all"), "")
+    exclude = Path(run("-C", str(wt), "rev-parse", "--path-format=absolute", "--git-path", "info/exclude").strip())
+    check.assertEqual(exclude.read_text().splitlines().count(".codex/"), 1)
 
 with patch.object(tick, "command", side_effect=[json.dumps({"id": "project"}), json.dumps({"fields": [
         {"name": "Status", "id": "status", "options": [{"name": "In Progress", "id": "progress"}]},

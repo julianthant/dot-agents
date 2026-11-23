@@ -777,6 +777,12 @@ def worker_settings(path, route):
         raise OrcaError("worker setting points outside the worktree")
     before = settings.read_bytes() if settings.exists() else None
     if route[0] == "codex":
+        exclude = Path(command("git", "-C", str(path), "rev-parse", "--path-format=absolute",
+                               "--git-path", "info/exclude").strip())
+        lines = exclude.read_text().splitlines() if exclude.exists() else []
+        if ".codex/" not in lines:
+            exclude.parent.mkdir(parents=True, exist_ok=True)
+            exclude.write_text("".join(line + "\n" for line in [*lines, ".codex/"]))
         written = configure_codex_notice(path)
         if written is None:
             return None

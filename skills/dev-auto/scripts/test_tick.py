@@ -782,6 +782,80 @@ with TemporaryDirectory() as tmp:
         tick.snapshot()
         check.assertEqual(calls[-1], ("CLOSED", None))  # ten minutes on: a full closed read again
 
+# Bug 8: the roadmap moved here renders a recorded snapshot exactly as the live script did for the same GitHub
+# replies (ROADMAP_BEFORE is that script's output), while reading issues from the shared snapshot.
+import roadmap
+
+def rm_card(status, agent, stage, area, project=5):
+    return {"id": "item", "project": {"number": project, "owner": {"login": "julianthant"}},
+            "status": status and {"name": status}, "agent": agent and {"text": agent},
+            "stage": stage and {"name": stage}, "area": area and {"name": area}}
+def rm_issue(n, state, updated, title, reason=None, cards=(), labels=(), blocked=(), parent=None, kids=0, done=0, ms=None, kind="Task"):
+    conn = lambda xs: {"totalCount": len(xs), "nodes": list(xs)}
+    return {"number": n, "title": title, "body": "Owned paths: `a`", "state": state, "stateReason": reason, "updatedAt": updated,
+            "issueType": kind and {"name": kind}, "milestone": ms and {"title": ms}, "parent": parent and {"number": parent},
+            "subIssuesSummary": {"total": kids, "completed": done} if kids else None,
+            "assignees": conn([]), "subIssues": conn([{}] * kids), "closedByPullRequestsReferences": conn([]),
+            "labels": conn([{"name": l} for l in labels]), "blockedBy": conn([{"number": b, "state": s} for b, s in blocked]),
+            "blocking": conn([]), "projectItems": conn(list(cards))}
+RM_OPEN = [rm_issue(10, "OPEN", "2026-11-23T09:00:00Z", "area / older", cards=[rm_card("Todo", None, "Queued", "Tick")], ms="Staging cut"),
+        rm_issue(11, "OPEN", "2026-11-23T10:00:00Z", "area / newest", cards=[rm_card(None, None, None, None, 7), rm_card("In Progress", "coder m e @a", "Coding", "Roadmap")],
+              labels=["later", "bug"], blocked=[(10, "OPEN"), (3, "CLOSED")], parent=1),
+        rm_issue(12, "OPEN", "2026-11-23T09:30:00Z", "feature", kind="Feature", kids=3, done=1)]
+RM_CLOSED = [rm_issue(3, "CLOSED", "2026-11-22T08:00:00Z", "done one", reason="COMPLETED", cards=[rm_card("Done", None, None, "Tick")]),
+          rm_issue(4, "CLOSED", "2026-11-22T07:00:00Z", "dropped", reason="NOT_PLANNED", kind=None)]
+RM_ROLL = [{"conclusion": "SUCCESS"}, {"status": "IN_PROGRESS", "conclusion": ""}]
+RM_PR = lambda n, roll: {"number": n, "title": f"pr {n}", "headRefName": f"task/a/{n}", "autoMergeRequest": None if n % 2 else {},
+                         "statusCheckRollup": roll, "isDraft": False, "closingIssuesReferences": [{"number": 11}], "updatedAt": "2026-11-23T09:00:00Z"}
+def rm_answer(args):
+    """The recorded gh reply for one command line, for both the old and the moved script."""
+    a = " ".join(args)
+    if args[:2] == ["project", "field-list"]:
+        return {"fields": [{"name": "Status", "options": [{"name": "Todo"}]}, {"name": "Area", "options": [{"name": "Tick"}, {"name": "Roadmap"}]}]}
+    if args[:2] == ["pr", "list"]:
+        return [RM_PR(21, RM_ROLL), RM_PR(22, [{"conclusion": "FAILURE"}])] if "development" in args else [RM_PR(30, [{"conclusion": "SUCCESS"}])]
+    if args[:2] == ["release", "list"]:
+        return [{"tagName": "v1.2.0", "publishedAt": "2026-11-20T12:00:00Z"}]
+    if "search/issues" in args:
+        assert "q=repo:julianthant/hr-relay is:pr is:merged base:development merged:>2026-11-20" in args, args
+        return {"total_count": 7, "items": [{}]}
+    if a.startswith("api repos/julianthant/hr-relay/compare/"):
+        return {"ahead_by": 4 if "staging..." in a else 9}
+    if a == "api repos/julianthant/hr-relay/commits/main":
+        return {"commit": {"committer": {"date": "2026-11-19T00:00:00Z"}}}
+    if a.endswith("matching-refs/heads/cut/"):
+        return [{"ref": "refs/heads/cut/2026-11-21"}]
+    if args[:2] == ["run", "list"]:
+        return [{"conclusion": "success", "status": "completed", "createdAt": "2026-11-23T06:00:00Z", "headSha": "abc", "url": "u"}]
+    if "milestones" in a:
+        return [{"title": "Staging cut"}, {"title": "Later"}]
+    raise AssertionError(args)
+
+ROADMAP_BEFORE = json.loads(
+    "{\"areas\":[\"Tick\",\"Roadmap\"],\"milestones\":[\"Staging cut\",\"Later\"],\"issues\":[{\"n\":11,\"t\":\"area / newest\",\"type\":"
+    "\"Task\",\"open\":true,\"done\":false,\"ms\":null,\"later\":true,\"parent\":1,\"kids\":0,\"kidsDone\":0,\"blockers\":[10],\"deps\""
+    ":[10,3],\"who\":\"coder m e @a\",\"updated\":\"2026-11-23T10:00:00Z\",\"status\":\"In Progress\",\"agent\":\"Coding\",\"area\":\""
+    "Roadmap\"},{\"n\":12,\"t\":\"feature\",\"type\":\"Feature\",\"open\":true,\"done\":false,\"ms\":null,\"later\":false,\"parent\":nul"
+    "l,\"kids\":3,\"kidsDone\":1,\"blockers\":[],\"deps\":[],\"who\":null,\"updated\":\"2026-11-23T09:30:00Z\",\"status\":null,\"age"
+    "nt\":null,\"area\":null},{\"n\":10,\"t\":\"area / older\",\"type\":\"Task\",\"open\":true,\"done\":false,\"ms\":\"Staging cut\",\"la"
+    "ter\":false,\"parent\":null,\"kids\":0,\"kidsDone\":0,\"blockers\":[],\"deps\":[],\"who\":null,\"updated\":\"2026-11-23T09:00:"
+    "00Z\",\"status\":\"Todo\",\"agent\":\"Queued\",\"area\":\"Tick\"},{\"n\":3,\"t\":\"done one\",\"type\":\"Task\",\"open\":false,\"done\":t"
+    "rue,\"ms\":null,\"later\":false,\"parent\":null,\"kids\":0,\"kidsDone\":0,\"blockers\":[],\"deps\":[],\"who\":null,\"updated\":\""
+    "2026-11-22T08:00:00Z\",\"status\":\"Done\",\"agent\":null,\"area\":\"Tick\"},{\"n\":4,\"t\":\"dropped\",\"type\":null,\"open\":fals"
+    "e,\"done\":false,\"ms\":null,\"later\":false,\"parent\":null,\"kids\":0,\"kidsDone\":0,\"blockers\":[],\"deps\":[],\"who\":null,"
+    "\"updated\":\"2026-11-22T07:00:00Z\",\"status\":null,\"agent\":null,\"area\":null}],\"pipeline\":{\"devPrs\":[{\"n\":21,\"t\":\"p"
+    "r 21\",\"head\":\"task/a/21\",\"auto\":false,\"draft\":false,\"checks\":\"running\",\"issues\":[11],\"updated\":\"2026-11-23T09:"
+    "00:00Z\"},{\"n\":22,\"t\":\"pr 22\",\"head\":\"task/a/22\",\"auto\":true,\"draft\":false,\"checks\":\"failing\",\"issues\":[11],\"up"
+    "dated\":\"2026-11-23T09:00:00Z\"}],\"mergedSinceRelease\":7,\"devAheadOfStaging\":4,\"devAheadOfMain\":9,\"stagingPr\":[{"
+    "\"n\":30,\"head\":\"task/a/30\",\"checks\":\"green\"}],\"release\":{\"tagName\":\"v1.2.0\",\"publishedAt\":\"2026-11-20T12:00:00Z"
+    "\"},\"cuts\":[\"cut/2026-11-21\"],\"fullRun\":{\"conclusion\":\"success\",\"status\":\"completed\",\"createdAt\":\"2026-11-23T06"
+    ":00:00Z\",\"headSha\":\"abc\",\"url\":\"u\"}}}")
+
+with patch.object(roadmap, "gh", lambda *a: rm_answer(list(a))):
+    built = roadmap.build({"open": RM_OPEN, "closed": RM_CLOSED})  # open issues in creation order, as the snapshot keeps them
+built.pop("generated")
+check.assertEqual(built, ROADMAP_BEFORE)
+
 # Orca identifies agent terminals separately from plain shells and links recovery worktrees to issues.
 items = [dict(base, number=row["number"], branch=row["branch"], paths=[str(row["number"])]) for row in parsed]
 items.append(dict(base, number=484, branch="task/speed/read", paths=["disjoint"]))

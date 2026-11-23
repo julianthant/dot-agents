@@ -998,7 +998,9 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
         assert present and local_ref == sha
         assert edits == [("stage", "--single-select-option-id", "needs")]
         assert "Needs you" in output.getvalue()
-        assert any(event[:2] == ("orchestration", "send") for event in events)
+        sends = [event for event in events if event[:2] == ("orchestration", "send")]
+        assert sends and all("--type" in e and e[e.index("--type") + 1] == "status"
+                             and e[e.index("--to") + 1] == "run:run" for e in sends), sends
         assert any(event[:2] == RM for event in events) == refused
 
 

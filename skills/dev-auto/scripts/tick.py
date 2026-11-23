@@ -1646,7 +1646,7 @@ def close_tick(args, db):
         except (OrcaError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as e:
             log("Needs you", {"issue": number, "reason": str(e)})
             if args.issue or (card["stage"] or {}).get("name") != "Needs you":
-                runtime("orchestration", "send", *actor, "--to", "run:" + run, "--type", "escalation",
+                runtime("orchestration", "send", *actor, "--to", "run:" + run, "--type", "status",
                         "--subject", f"#{number}: Needs you after close", "--body", str(e))
                 command(*edit, stage, "--single-select-option-id", needs_you)
 

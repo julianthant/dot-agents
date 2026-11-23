@@ -1,0 +1,101 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/geist";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+    --color-faint: var(--faint);
+    --color-run: var(--run);
+    --color-run-bg: var(--run-bg);
+    --color-you: var(--you);
+    --color-you-bg: var(--you-bg);
+    --color-blk: var(--blk);
+    --color-blk-bg: var(--blk-bg);
+    --color-done: var(--done);
+    --color-done-bg: var(--done-bg);
+    --font-mono: ui-monospace, 'SF Mono', Menlo, monospace;
+    --font-heading: var(--font-sans);
+    --font-sans: 'Geist Variable', sans-serif;
+    --color-ring: var(--ring);
+    --color-input: var(--input);
+    --color-border: var(--border);
+    --color-destructive: var(--destructive);
+    --color-accent-foreground: var(--accent-foreground);
+    --color-accent: var(--accent);
+    --color-muted-foreground: var(--muted-foreground);
+    --color-muted: var(--muted);
+    --color-secondary-foreground: var(--secondary-foreground);
+    --color-secondary: var(--secondary);
+    --color-primary-foreground: var(--primary-foreground);
+    --color-primary: var(--primary);
+    --color-popover-foreground: var(--popover-foreground);
+    --color-popover: var(--popover);
+    --color-card-foreground: var(--card-foreground);
+    --color-card: var(--card);
+    --color-foreground: var(--foreground);
+    --color-background: var(--background);
+    --radius-sm: calc(var(--radius) * 0.6);
+    --radius-md: calc(var(--radius) * 0.8);
+    --radius-lg: var(--radius);
+    --radius-xl: calc(var(--radius) * 1.4);
+    --radius-2xl: calc(var(--radius) * 1.8);
+    --radius-3xl: calc(var(--radius) * 2.2);
+    --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+:root {
+    /* Concord dark: night control room. Only status earns color. */
+    color-scheme: dark;
+    --background: #11161d;
+    --foreground: #e6ebf1;
+    --card: #18202a;
+    --card-foreground: #e6ebf1;
+    --popover: #1e2834;
+    --popover-foreground: #e6ebf1;
+    --primary: #e6ebf1;
+    --primary-foreground: #11161d;
+    --secondary: #222c3a;
+    --secondary-foreground: #e6ebf1;
+    --muted: #1b2430;
+    --muted-foreground: #8f9cac;
+    --faint: #66737f;
+    --accent: #222c3a;
+    --accent-foreground: #e6ebf1;
+    --destructive: #e5636a;
+    --border: #263241;
+    --input: #263241;
+    --ring: #5b8def;
+    --radius: 0.625rem;
+    --run: #5b8def;
+    --run-bg: #1d2d4a;
+    --you: #e8a33c;
+    --you-bg: #3b2d16;
+    --blk: #e5636a;
+    --blk-bg: #3a1d22;
+    --done: #52c48c;
+    --done-bg: #173326;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+    }
+  body {
+    @apply bg-background text-foreground;
+    }
+  button:not(:disabled), [role="button"]:not(:disabled) {
+    cursor: pointer;
+    }
+  html {
+    @apply font-sans;
+    }
+}
+@layer base {
+  body { font-size: 14px; line-height: 1.45; font-variant-numeric: tabular-nums; }
+  ::selection { background: var(--run-bg); color: var(--foreground); }
+  :focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+  * { scrollbar-color: var(--border) transparent; scrollbar-width: thin; }
+  a { text-underline-offset: 3px; }
+}

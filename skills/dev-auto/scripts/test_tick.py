@@ -779,6 +779,8 @@ with TemporaryDirectory() as tmp:
         tick.stale_snapshot()  # a Project write: the next read refetches open issues and still reads closed ones since
         tick.tickets()
         check.assertEqual(calls[6:], [("OPEN", None), ("OPEN", None), ("CLOSED", "since=2026-11-23T02:12:21Z")])
+        with patch.object(tick, "SNAPSHOT", Path(tmp) / "missing" / "issues.json"):
+            tick.stale_snapshot()  # no snapshot yet (nor its directory): nothing to mark
         tick.tickets(fresh=True)  # fill's refresh before side effects never uses a cached read
         check.assertEqual(len(calls), 12)
         clock[0] += 600

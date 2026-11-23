@@ -494,6 +494,8 @@ def snapshot(fresh=False):
 def stale_snapshot():
     """After a Project write, the next reader refetches open issues but keeps the closed list."""
     import fcntl
+    if not SNAPSHOT.exists():
+        return
     with SNAPSHOT.with_suffix(".lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:

@@ -1,6 +1,7 @@
 import json
+import os
 import sqlite3
-from contextlib import closing, redirect_stdout
+from contextlib import closing, redirect_stderr, redirect_stdout
 from io import StringIO
 import subprocess
 import time
@@ -195,6 +196,41 @@ class Roadmap(unittest.TestCase):
     def live_rows(self, worker):
         with self.local_worker(worker):
             return [r["now"] for r in roadmap.render()["issues"]]
+
+    def test_headless_render_reads_the_explicit_run_even_if_terminal_inventory_fails(self):
+        diagnostic = "terminal_surface_ownership_unavailable"
+
+        def command(*args):
+            self.assertEqual(args[:2], (tick.ORCA, "orchestration"))
+            self.assertEqual(args[-3:], ("--environment", "local", "--json"))
+            self.assertEqual(args[args.index("--run") + 1], roadmap.RUN)
+            self.assertNotIn("--from", args)
+            result = {
+                "worker-list": {"workers": [{
+                    "dispatchId": "ctx_coder", "taskId": "task_coder", "dispatchStatus": "dispatched",
+                    "projection": {"stage": {"activity": "working"}},
+                }], "page": {"hasMore": False}},
+                "task-list": {"tasks": [{"id": "task_coder", "task_title": "#1 coder"}]},
+                "inbox": {"messages": []},
+            }[args[2]]
+            return json.dumps({"ok": True, "result": result})
+
+        self.warm()
+        tick.SNAPSHOT.with_name("starts.sqlite").touch()
+        log = StringIO()
+        with (patch.dict(os.environ, {}, clear=True), patch.object(tick, "command", side_effect=command),
+              patch.object(roadmap, "readiness", side_effect=tick.OrcaError(diagnostic)), redirect_stderr(log)):
+            live = roadmap.render()["issues"][0]["now"]
+        self.assertEqual(live["status"], "working")
+        self.assertIn(f"roadmap readiness: {diagnostic}", log.getvalue())
+
+    def test_refused_worker_inventory_fails_the_render_instead_of_publishing_empty_now(self):
+        diagnostic = "terminal_surface_ownership_unavailable"
+        self.warm()
+        tick.SNAPSHOT.with_name("starts.sqlite").touch()
+        with patch.object(tick, "runtime", side_effect=tick.OrcaError(diagnostic)):
+            with self.assertRaisesRegex(tick.OrcaError, f"roadmap worker inventory.*{diagnostic}"):
+                roadmap.render()
 
     def test_a_stopped_worker_overrides_a_coding_card(self):
         live, other = self.live_rows({"dispatchStatus": "failed", "workerState": "stopped"})

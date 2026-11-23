@@ -225,11 +225,12 @@ def live_workers(numbers):
     except (sqlite3.Error, ValueError) as e:
         print(f"roadmap reviews: {e}", file=sys.stderr)
 
+    # Run-scoped reads work from launchd without a terminal or supervisor anchor.
     try:
         workers = {w["dispatchId"]: w for w in tick.fleet_workers(RUN)}
+        tasks = {t["id"]: t for t in tick.runtime("orchestration", "task-list", "--run", RUN, "--full")["tasks"]}
     except REFUSED as e:
-        print(f"roadmap workers: {e}", file=sys.stderr)
-        return reviews, {}
+        raise tick.OrcaError(f"roadmap worker inventory for {RUN}: {e}") from e
 
     # Fleet summaries identify paired workers but omit the activity and attention projection.
     for host in {tick.worker_host(w) for w in workers.values() if w.get("dispatchStatus") == "dispatched"
@@ -243,23 +244,19 @@ def live_workers(numbers):
             print(f"roadmap paired workers: {e}", file=sys.stderr)
 
     current = {}
-    try:
-        tasks = {t["id"]: t for t in tick.runtime("orchestration", "task-list", "--run", RUN, "--full")["tasks"]}
-        for w in workers.values():
-            t = tasks.get(w.get("taskId"))
-            if not t:
-                continue
-            if w.get("dispatchStatus") != "dispatched" and worker_status(w) != "stopped":
-                continue
-            title = t.get("task_title") or ""
-            match = re.search(r"#(\d+)", title) or re.search(r"hr-relay ?#(\d+)", t.get("spec") or "")
-            if match and (n := int(match[1])) in numbers:
-                role = "reviewer" if re.match(r"^#\d+ reviewer\b", title) else "coder"
-                old = current.get((n, role))
-                if old is None or (old.get("dispatchStatus") != "dispatched" and w.get("dispatchStatus") == "dispatched"):
-                    current[n, role] = w
-    except REFUSED as e:
-        print(f"roadmap tasks: {e}", file=sys.stderr)
+    for w in workers.values():
+        t = tasks.get(w.get("taskId"))
+        if not t:
+            continue
+        if w.get("dispatchStatus") != "dispatched" and worker_status(w) != "stopped":
+            continue
+        title = t.get("task_title") or ""
+        match = re.search(r"#(\d+)", title) or re.search(r"hr-relay ?#(\d+)", t.get("spec") or "")
+        if match and (n := int(match[1])) in numbers:
+            role = "reviewer" if re.match(r"^#\d+ reviewer\b", title) else "coder"
+            old = current.get((n, role))
+            if old is None or (old.get("dispatchStatus") != "dispatched" and w.get("dispatchStatus") == "dispatched"):
+                current[n, role] = w
 
     for n, s in reviews.items():
         for role, dispatch in (("coder", s.get("coder")), ("reviewer", (s.get("reviewer") or {}).get("dispatch"))):

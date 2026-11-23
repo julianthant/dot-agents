@@ -157,8 +157,6 @@ def orca_usage(now):
     for agent in ("claude", "codex"):
         selected = (result.get(agent) or {}).get("activeAccountId")
         found.append((agent, selected, limits.get(agent)))
-        if selected:
-            readings["active", agent] = selected
         for other in limits.get(f"inactive{agent.title()}Accounts") or []:
             found.append((agent, other.get("accountId"), other.get("rateLimits")))
     # Orca's own logins: (agent, id) -> home, so a row whose id is not Orca's can be found

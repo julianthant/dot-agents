@@ -157,8 +157,8 @@ with TemporaryDirectory() as temp, patch.object(pick, "HOLDS", Path(temp) / "hol
 
 print("pick: all checks pass")
 
-# Codex homes share one sessions folder, written by the active Codex account: only that row reads it, and each
-# window comes from the newest reading that has it.
+# Codex homes share one sessions folder whose newest row names no writer: Codex reads only Orca's per-account
+# reading, even as the active account; each window comes from the newest reading that has it.
 now = 1_000_000
 row = {"agent": "codex", "id": "seat", "host": "local", "home": "/h"}
 orca = {("codex", "seat"): (now - 600, [(100, now + 3600, "five_hour"), (40, now + 86400, "weekly")])}
@@ -169,8 +169,11 @@ with patch.object(pick.account_usage, "orca_usage", return_value=orca), \
     assert pick.windows({}, row, now) == (100.0, 40.0)  # another account wrote the file
     assert pick.windows({}, dict(row, agent="claude"), now) == (23.0, 94.0)
     orca[("active", "codex")] = "seat"
-    assert pick.windows({}, row, now) == (23.0, 94.0)  # the active account's file is fresher than Orca
+    # A newer reading another account wrote does not override this seat's 97% weekly.
+    orca[("codex", "seat")] = (now - 600, [(10, now + 3600, "five_hour"), (97, now + 86400, "weekly")])
+    assert pick.windows({}, row, now) == (10.0, 97.0)
     del orca[("active", "codex")]
+    orca[("codex", "seat")] = (now - 600, [(100, now + 3600, "five_hour"), (40, now + 86400, "weekly")])
 with patch.object(pick.account_usage, "orca_usage", return_value={}), \
         patch.object(pick.account_usage, "orca_key", return_value=("codex", "seat")), \
         patch.object(pick.account_usage, "file_usage", return_value=shared):

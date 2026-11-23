@@ -71,10 +71,10 @@ def live_holds(host):
 def windows(cfg, row, now):
     """(five_hour %, weekly %), each window from the newest reading that has it, Orca's or the CLI
     file's; a window whose reset has passed reads 0. (None, None) when the account was never read.
-    Codex homes share one sessions folder, written by the active Codex account: only that row reads it."""
+    Codex homes share one sessions folder whose newest row names no account: Codex reads only Orca's."""
     readings = account_usage.orca_usage(now)
     key = account_usage.orca_key(row, now)
-    shared = row["agent"] == "codex" and readings.get(("active", "codex")) != key[1]
+    shared = row["agent"] == "codex"
     found = [r for r in (readings.get(key), None if shared else account_usage.file_usage(row)) if r]
     if not found:
         return None, None

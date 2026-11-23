@@ -1794,7 +1794,10 @@ def close_tick(args, db):
     # Retry the same workspace if a partial close already removed the checkout.
     db.execute("CREATE TABLE IF NOT EXISTS closing (run TEXT, issue INTEGER, workspace TEXT, PRIMARY KEY(run,issue))")
     db.execute("CREATE TABLE IF NOT EXISTS close_notice (run TEXT, issue INTEGER, reason TEXT, sent INTEGER,"
-               " carded INTEGER, PRIMARY KEY(run,issue))")
+               " carded INTEGER, request TEXT, PRIMARY KEY(run,issue))")
+    # Older rows keep NULL, which marks a notice recorded before requests were saved.
+    if "request" not in [column[1] for column in db.execute("PRAGMA table_info(close_notice)")]:
+        db.execute("ALTER TABLE close_notice ADD COLUMN request TEXT")
     for issue, card, branch in candidates:
         number = issue["number"]
         review = review_state(db, run, number) or {}
@@ -1840,29 +1843,36 @@ def close_tick(args, db):
             log("closed", {"issue": number, "branch": branch, "head": sha})
         except (OrcaError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as e:
             log("Needs you", {"issue": number, "reason": str(e)})
-            # One message per blocked state, recorded before sending; its card write is retried on its own.
+            # One message per blocked state, its request id saved before sending; its card write is retried on its own.
             # Orca may rewrite a body in transit, so the subject alone names the blocked state.
             digest = hashlib.sha256(str(e).encode()).hexdigest()[:12]
             subject = f"#{number}: Needs you after close ({digest})"
-            notice = db.execute("SELECT reason,sent,carded FROM close_notice WHERE run=? AND issue=?",
+            notice = db.execute("SELECT reason,sent,carded,request FROM close_notice WHERE run=? AND issue=?",
                                 (run, number)).fetchone()
-            fresh = not notice or notice[0] != str(e)
-            if fresh:
+            if not notice or notice[0] != str(e):
+                notice = (str(e), 0, 0, str(uuid.uuid4()))
                 with db:
-                    db.execute("INSERT OR REPLACE INTO close_notice VALUES (?,?,?,0,0)", (run, number, str(e)))
-                notice = (str(e), 0, 0)
+                    db.execute("INSERT OR REPLACE INTO close_notice VALUES (?,?,?,0,0,?)", (run, number, str(e), notice[3]))
             if not notice[1]:
-                # A send whose reply was lost may have landed: look for it before sending again.
-                landed = not fresh and any(
-                    m.get("subject") == subject
-                    # A notice recorded before subjects carried the digest went out under the old subject.
-                    or (m.get("subject") == f"#{number}: Needs you after close" and m.get("body") == str(e)) for m in
-                    runtime("orchestration", "inbox", "--terminal", "run:" + run, "--limit", "10000", "--full")["messages"])
-                if not landed:
+                request, landed = notice[3], False
+                if not request:
+                    # A notice recorded before requests were saved may have landed, under either subject.
+                    reply = runtime("orchestration", "inbox", "--terminal", "run:" + run, "--limit", "10000", "--full")
+                    messages = reply["messages"]
+                    mail = [m for m in messages if m.get("type") == "status"
+                            and m.get("subject") in (subject, f"#{number}: Needs you after close")]
+                    landed = any(m.get("subject") == subject or m.get("body") == str(e) for m in mail)
+                    if not mail and not (len(messages) >= 10000 or reply.get("truncated")):
+                        request = str(uuid.uuid4())
+                        with db:
+                            db.execute("UPDATE close_notice SET request=? WHERE run=? AND issue=?", (request, run, number))
+                if request:
                     runtime("orchestration", "send", *actor, "--to", "run:" + run, "--type", "status",
-                            "--subject", subject, "--body", str(e))
-                with db:
-                    db.execute("UPDATE close_notice SET sent=1 WHERE run=? AND issue=?", (run, number))
+                            "--subject", subject, "--body", str(e), "--retry-request", request)
+                # A legacy-subject notice with another body, or an incomplete listing, stays pending for the next tick.
+                if request or landed:
+                    with db:
+                        db.execute("UPDATE close_notice SET sent=1 WHERE run=? AND issue=?", (run, number))
             if not notice[2]:
                 command(*edit, stage, "--single-select-option-id", needs_you)
                 with db:

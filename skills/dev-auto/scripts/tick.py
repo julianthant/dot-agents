@@ -1352,8 +1352,9 @@ def review_step(db, run, actor, ticket, initial, messages):
     dot = ticket["repo"] == "dot-agents"
     if stage == "Merging":
         closes = f"Closes {OWNER}/hr-relay#{number}" if dot else f"Closes #{number}"
-        instructions = (f"Starting at approved {state['sha']}, merge origin/{'main' if dot else 'development'}, "
-                        f"push {ticket['branch']}, open or update the PR into {ticket['base'].removeprefix('origin/')}, "
+        trunk = "main" if dot else "development"
+        instructions = (f"Starting at approved {state['sha']}, merge origin/{trunk}, "
+                        f"push {ticket['branch']}, open or update the PR into {trunk}, "
                         f"end the body with {closes}, mark the PR ready, and enable auto-merge through required checks.")
     if account:
         spec = reviewer_spec(ticket, state["sha"], route[1] == state["model"])

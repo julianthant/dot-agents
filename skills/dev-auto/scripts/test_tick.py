@@ -729,6 +729,16 @@ with patch.object(tick, "green_report", return_value=sha), \
     assert card.call_args.args[1] == "Merging"
     assert "auto-merge" in cli.call_args.args[-1] and "Closes #41" in cli.call_args.args[-1]
 
+# Every task PR lands on the repository's trunk, whatever base the ticket recorded (feature branches are gone).
+for repo, trunk in (("hr-relay", "development"), ("dot-agents", "main")):
+    ticket, state = review_fixture()
+    ticket.update(base="origin/feature/dashboard-state-tests", repo=repo, body="Reviewer: none. Tier: UI, simple.")
+    with patch.object(tick, "green_report", return_value=sha), patch.object(tick, "review_card"), \
+            patch.object(tick, "runtime", return_value={"delivery": "follow_up", "followUpOf": "coder", "dispatchId": "land"}) as cli:
+        tick.review_step(sqlite3.connect(":memory:"), "run", [], ticket, state, [recorded])
+    landing = cli.call_args.args[-1]
+    assert f"merge origin/{trunk}," in landing and f"open or update the PR into {trunk}," in landing, landing
+
 # A no-review route can land only on green. A red report receives a new coder dispatch.
 ticket, state = review_fixture()
 ticket["body"] = "Reviewer: none (green CI clears it). Tier: UI, simple."

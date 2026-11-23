@@ -2170,6 +2170,38 @@ for current in ("follow", "follow_retry"):
         tick.review_tick(args, db)
         assert step.call_args.args[-2]["expected"] == current and step.call_args.args[-1] == [followed_report]
 
+# Bug 3: an older coder Task's success report does not outrank the follow-up's root, which has no report; a
+# Task with no Dispatch is skipped, and the next issue still runs.
+args = SimpleNamespace(issue=None, coder=None, run=None, anchor=None)
+ticket, state = review_fixture()
+ticket.update(agent=state["agent"], stage="Coding")
+empty = dict(ticket, number=40)
+db = sqlite3.connect(":memory:")
+db.execute("CREATE TABLE followups (run TEXT, issue INTEGER, dispatch TEXT, PRIMARY KEY(run,issue))")
+db.execute("INSERT INTO followups VALUES ('run', 41, 'follow')")
+reports = [report("old", f"I pushed {sha}.", msg_id="old-report"), report("follow", f"I pushed {sha}.", msg_id="follow-report")]
+attempts = {"old": {"id": "old", "runId": "run", "taskId": "task_old"},
+            "coder": {"id": "coder", "runId": "run", "taskId": "task"},
+            "follow": {"id": "follow", "runId": "run", "taskId": "task_follow", "followUpOf": "coder"}}
+def discovery(*argv):
+    if argv[:2] == ("orchestration", "inbox"):
+        return {"messages": reports}
+    if argv[:2] == ("orchestration", "task-list"):
+        return {"tasks": [{"title": "#40 coder", "id": "task_none"}, {"title": "#41 coder", "id": "task_old"},
+                          {"title": "#41 coder", "id": "task"}, {"title": "#41 coder", "id": "task_unstarted"}]}
+    if argv[:2] == ("orchestration", "dispatch-show"):
+        return {"dispatch": {"task_old": {"id": "old"}, "task": {"id": "coder"}, "task_follow": {"id": "follow"}}.get(argv[3])}
+    if argv[:2] == ("orchestration", "worker-show"):
+        return {"dispatch": attempts[argv[3]],
+                "worker": {"worktreeId": "tree", "startOptions": {"launch": {"effective": {"model": "gpt-6.2-sol"}}}}}
+    assert argv[:2] == ("worktree", "show"), argv
+    return {"worktree": {"id": "tree", "path": "/fixture", "branch": "refs/heads/task/ui/header"}}
+with patch.object(tick, "tickets", return_value=[empty, ticket]), patch.object(tick, "supervisor", return_value=([], "run")), \
+        patch.object(tick, "command", return_value="https://github.com/julianthant/hr-relay.git\n"), \
+        patch.object(tick, "review_step") as step, patch.object(tick, "runtime", discovery):
+    tick.review_tick(args, db)
+    assert step.call_count == 1 and step.call_args.args[-2]["expected"] == "follow"
+
 # A replacement that reports while its resume note is undelivered waits; review acts once delivery is confirmed.
 ticket, state = review_fixture()
 db = sqlite3.connect(":memory:")

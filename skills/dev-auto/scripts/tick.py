@@ -1601,11 +1601,16 @@ def review_tick(args, db):
                     continue
                 if not ticket["item"] or (not args.issue and ticket["stage"] not in ("Coding", "CI running")):
                     continue
-                followed = None
+                followed = task_id = None
                 if args.coder:
                     dispatch = args.coder
-                elif len(ids) == 1:
-                    dispatch = runtime("orchestration", "dispatch-show", "--task", ids[0], "--full")["dispatch"]["id"]
+                else:
+                    attempts = {i: runtime("orchestration", "dispatch-show", "--task", i, "--full")["dispatch"]["id"]
+                                for i in ids}
+                    # Restarts can leave several coder Tasks: the newest succeeded report names the current one.
+                    task_id = max(ids, key=lambda i: max((m["sequence"] for m in review_mail(messages, attempts[i])),
+                                                         default=-1))
+                    dispatch = attempts[task_id]
                     if db.execute("SELECT 1 FROM sqlite_master WHERE name='followups'").fetchone():
                         row = db.execute("SELECT dispatch FROM followups WHERE run=? AND issue=?", (run, number)).fetchone()
                         # Watch sent a resume note to the settled coder: its follow-up Dispatch is the current coder.
@@ -1614,8 +1619,6 @@ def review_tick(args, db):
                             task = runtime("orchestration", "worker-show", "--dispatch", row[0], "--full")["dispatch"]["taskId"]
                             current = runtime("orchestration", "dispatch-show", "--task", task, "--full")["dispatch"]["id"]
                             followed, first, dispatch = row[0], dispatch, current
-                else:
-                    raise OrcaError("multiple coder Tasks; select the intended Dispatch with --issue and --coder")
                 if not review_mail(messages, dispatch):
                     if args.coder:
                         log("review", {"issue": number, "waiting": f"no succeeded report from {dispatch}"})
@@ -1623,7 +1626,7 @@ def review_tick(args, db):
                 show = runtime("orchestration", "worker-show", "--dispatch", dispatch, "--full")
                 worker = show["worker"]
                 if (show["dispatch"]["id"] != dispatch or show["dispatch"]["runId"] != run or
-                        (not args.coder and show["dispatch"]["taskId"] != ids[0]
+                        (not args.coder and show["dispatch"]["taskId"] != task_id
                          and not (followed and in_coder_chain(dispatch, first, run)))):
                     raise OrcaError("coder Dispatch identity changed")
                 tree = runtime("worktree", "show", "--worktree", "id:" + worker["worktreeId"])["worktree"]

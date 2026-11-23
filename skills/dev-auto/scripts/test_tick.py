@@ -1223,6 +1223,18 @@ with patch.object(tick, "tickets", return_value=[ticket]), patch.object(tick, "s
     assert step.call_args.args[-1] == [recorded] and step.call_args.args[-2]["expected"] == "coder"
     assert cli.call_args_list[0].args == ("orchestration", "inbox", "--terminal", "run:run", "--limit", "10000", "--full")
 
+# Bug 3 (#488, #517): restarts left two "#41 coder" Tasks; the one whose attempt reported is reviewed.
+with patch.object(tick, "tickets", return_value=[ticket]), patch.object(tick, "supervisor", return_value=([], "run")), \
+        patch.object(tick, "command", return_value="https://github.com/julianthant/hr-relay.git\n"), \
+        patch.object(tick, "review_step") as step, patch.object(tick, "runtime") as cli:
+    cli.side_effect = [{"messages": [recorded]}, {"tasks": [{"title": "#41 coder", "id": "task_old"}, {"title": "#41 coder", "id": "task"}]},
+                       {"dispatch": {"id": "old"}}, {"dispatch": {"id": "coder"}},
+                       {"dispatch": {"id": "coder", "runId": "run", "taskId": "task"},
+                           "worker": {"worktreeId": "tree", "startOptions": {"launch": {"effective": {"model": "gpt-6.2-sol"}}}}},
+                       {"worktree": {"id": "tree", "path": "/fixture", "branch": "refs/heads/task/ui/header"}}]
+    tick.review_tick(args, sqlite3.connect(":memory:"))
+    assert step.call_args.args[-2]["expected"] == "coder"
+
 # An explicit coder that reports to another Run fails loudly instead of exiting quietly.
 args = SimpleNamespace(issue=41, coder="ctx_elsewhere", run=None, anchor=None)
 with patch.object(tick, "tickets", return_value=[ticket]), patch.object(tick, "supervisor", return_value=([], "run")), \

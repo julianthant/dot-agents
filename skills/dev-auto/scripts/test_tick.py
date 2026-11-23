@@ -2758,7 +2758,11 @@ def remote_start(root, stack, db, has_receipt):
     work = dict(base, number=99, sha="abc", base="origin/main")
     wt = {"id": "wsl-tree", "branch": work["branch"], "head": "abc", "path": "/remote/worktree"}
     dispatch = {"id": "ctx", "taskId": "task", "runId": "run"}
+    mirror = {"dispatch": dispatch, "worker": {"dispatchId": "ctx", "state": "ready", "stage": "server_record",
+                                               "agentTerminalHandle": None, "worktreeId": None}, "terminal": None}
+    server = {"environmentId": "env_wsl", "name": host, "asOf": "2026-11-23T18:00:00Z"}
     listed = False
+    execution_worktree = "other-tree" if has_receipt else wt["id"]
     starts = []
 
     def home_rpc(*args):
@@ -2770,12 +2774,15 @@ def remote_start(root, stack, db, has_receipt):
         if args[:2] == ("orchestration", "worker-list"):
             assert "--include-remote" in args and args[args.index("--run") + 1] == "run"
             if listed and "--cursor" not in args:
-                return {"workers": [{"dispatchId": "other", "taskId": "other", "host": host}],
+                return {"workers": [{"dispatchId": "other", "taskId": "other", "server": server}],
                         "page": {"hasMore": True, "nextCursor": "next"}}
             if listed:
                 assert args[args.index("--cursor") + 1] == "next"
-            return {"workers": [{"dispatchId": "ctx", "taskId": "task", "state": "ready", "host": host}]
+            return {"workers": [{"dispatchId": "ctx", "taskId": "task", "workerState": "ready", "server": server}]
                     if listed else [], "page": {"hasMore": False}}
+        if args[:2] == ("orchestration", "worker-show"):
+            assert args == ("orchestration", "worker-show", "--dispatch", "ctx", "--full")
+            return mirror
         return {"task-create": {"task": {"id": "task"}}, "dispatch-show": {"dispatch": None}}[args[1]]
 
     def remote_rpc(target, *args):
@@ -2783,20 +2790,33 @@ def remote_start(root, stack, db, has_receipt):
         if args[:2] == ("worktree", "create"):
             assert args[args.index("--repo") + 1] == "path:/remote/relay"
             return {"worktree": wt}
-        if args[:2] == ("orchestration", "worker-show"):
-            assert args[args.index("--dispatch") + 1] == "ctx"
-            return {"dispatch": dict(dispatch, assigneeHandle="wsl-term"), "worker": {"state": "ready", "worktreeId": wt["id"]},
-                    "terminal": {"handle": "wsl-term"}}
         if args[:2] == ("worktree", "show"):
             assert args == ("worktree", "show", "--worktree", "id:wsl-tree")
             return {"worktree": wt}
         assert args[:2] == ("terminal", "read") and "wsl-term" in args
         return {"terminal": {"tail": ["ready"]}}
 
+    git_output = iter(("", work["branch"], "abc"))
+
+    def remote_command(target, path, argv):
+        assert target == host
+        if argv[0] == "git":
+            return next(git_output)
+        assert str(path) == wt["path"]
+        assert tuple(argv[1:]) == ("orchestration", "worker-show", "--dispatch", "ctx", "--full",
+                                   "--environment", "local", "--json")
+        return json.dumps({"ok": True, "result": {
+            "dispatch": dict(dispatch, runId="wsl-run", assigneeHandle="wsl-term"),
+            "worker": {"dispatchId": "ctx", "state": "ready", "stage": "input_accepted",
+                       "agentTerminalHandle": "wsl-term", "worktreeId": execution_worktree},
+            "terminal": {"handle": "wsl-term", "worktreeId": wt["id"]},
+            "observation": {"agentWait": None, "exactWorker": True, "status": "live"},
+        }})
+
     stack.enter_context(patch.object(tick, "runtime", side_effect=home_rpc))
     stack.enter_context(patch.object(tick, "supervisor", return_value=([], "run")))
     stack.enter_context(patch.object(tick, "project_fields", return_value=("p", [], ("field", "waiting"))))
-    stack.enter_context(patch.object(pick.account_usage, "remote_output", side_effect=["", work["branch"], "abc"]))
+    stack.enter_context(patch.object(pick.account_usage, "remote_output", side_effect=remote_command))
     stack.enter_context(patch.object(pick.account_usage, "host_orca", side_effect=remote_rpc))
     select = stack.enter_context(patch.object(pick.account_usage, "remote_account",
                                              side_effect=[{}, {"codex": {"activeAccountId": "seat"}}]))
@@ -2807,7 +2827,10 @@ def remote_start(root, stack, db, has_receipt):
                                     "git@github.com:julianthant/hr-relay.git" if "get-url" in argv else ""))
     args = SimpleNamespace(repo_path=root, issue=99, dry_run=False, holds=root / "holds.json")
     if has_receipt:
-        tick.launch(db, Path("/remote/relay"), work, dict(account, host=host), args, args.holds)
+        with check.assertRaisesRegex(tick.OrcaError, "unverified worker"):
+            tick.launch(db, Path("/remote/relay"), work, dict(account, host=host), args, args.holds)
+        assert tick.review_state(db, "run", 99) is None
+        execution_worktree = wt["id"]
     else:
         with check.assertRaisesRegex(tick.OrcaError, "no Dispatch"):
             tick.launch(db, Path("/remote/relay"), work, dict(account, host=host), args, args.holds)
@@ -2835,6 +2858,6 @@ def remote_start(root, stack, db, has_receipt):
     assert review_rpc.call_args.args[:4] == ("orchestration", "send", "--to", "dispatch:ctx")
 
 
-for has_receipt in (False, True):
+for has_receipt in (True, False):
     with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory:") as db:
         remote_start(Path(tmp), stack, db, has_receipt)

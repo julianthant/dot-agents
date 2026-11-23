@@ -46,6 +46,10 @@ default host is `local` and the default effort is `medium`.
 ## Fill and startup recovery
 
 Run `scripts/tick.py fill --repo-path <checkout> --dry-run` to see the plan.
+A routed Task or Bug can start when its branch and seat are available and its
+card is ready. Fill posts one comment on a newly started ticket if its owned
+paths overlap live work. The comment names the live tickets and their
+overlapping paths. The PR that merges second resolves any conflict.
 A real tick fetches the selected issue's base and verifies the new checkout's
 commit. Use the same accounts file for every picker and fill process. Their
 shared ledger is `holds.json` beside that file. Deploy the updated picker to
@@ -58,7 +62,7 @@ response, rerun fill from the same coordinating Run. It looks up the existing
 Dispatch and verifies its Run, Task and worktree before recording the hold and
 Project fields. If Orca still cannot establish the outcome, inspect the
 reported Task with `orca orchestration dispatch-show --task <task> --full`.
-A missing Dispatch keeps that issue pending while disjoint issues can fill
+A missing Dispatch keeps that issue pending while other issues can fill
 other available seats. After inspecting the Task and confirming a replacement
 would be safe, run `scripts/tick.py fill --release <issue>` to clear just its
 pending reservation. Release exits without launching anything. Preparation errors and an explicit no-effects refusal leave no issue reservation. A
@@ -95,7 +99,10 @@ newest 400) are read in full every ten minutes and only the recently updated
 ones in between.
 
 `scripts/roadmap.py > data.json` renders the roadmap from the same snapshot;
-launchd runs it every 15 seconds (`StartInterval` 15). Each run polls issues
+for each open Task and Bug it adds `ready` and `holdReason` from the same
+read-only plan used by fill. Readiness is computed per checkout for the next
+fill of `~/Projects/hr-relay` or `~/.agents`.
+Launchd runs it every 15 seconds (`StartInterval` 15). Each run polls issues
 (`since=`), PRs and workflow runs with `If-None-Match` and keeps the ETags in
 `roadmap.json` beside the snapshot; a 304 costs no quota. The issue poll's
 `since=` moves every ten minutes with a minute of overlap, and a change is a

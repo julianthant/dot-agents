@@ -8,8 +8,11 @@ issues, PRs and workflow runs with REST conditional requests (a 304 costs no quo
 passing, refetches the snapshot or the pipeline.
 """
 import datetime
+from argparse import Namespace
 import json
+from pathlib import Path
 import re
+import sqlite3
 import subprocess
 import sys
 import time
@@ -128,12 +131,36 @@ def render():
     tmp = STATE.with_suffix(".tmp")
     tmp.write_text(json.dumps(state))
     tmp.replace(STATE)
-    return build(snap, state)
+    try:
+        decisions = readiness(snap)
+    except REFUSED as e:
+        print(f"roadmap readiness: {e}", file=sys.stderr)
+        decisions = {}
+    return build(snap, state, decisions)
 
 
-def build(snap, github=None):
+def readiness(snap):
+    tickets = tick.tickets(rows=snap["open"])
+    decisions = {}
+    home = Path.home()
+    for name, checkout in (("hr-relay", home / "Projects/hr-relay"), ("dot-agents", home / ".agents")):
+        if not any(t["repo"] == name and t["kind"] in ("Task", "Bug") for t in tickets):
+            continue
+        args = Namespace(repo_path=checkout, dry_run=True, holds=None, issue=None)
+        try:
+            decisions.update(tick.fill(args, issues=tickets, emit=lambda *_: None))
+        except (*REFUSED, sqlite3.Error) as e:
+            print(f"roadmap {name} readiness: {e}", file=sys.stderr)
+    return decisions
+
+
+def build(snap, github=None, decisions=None):
     issues = sorted(snap["open"], key=lambda n: n["updatedAt"], reverse=True) + snap["closed"]
     rows = [row(n) for n in issues]
+    for r in rows:
+        if decisions is not None and r["open"] and r["type"] in ("Task", "Bug"):
+            reason = decisions.get(r["n"], "readiness unavailable")
+            r.update(ready=reason is None, holdReason=reason)
     areas = lambda meta: [o["name"] for o in meta["fields"]["Area"]["options"]]
     area_order = []
     try:

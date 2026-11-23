@@ -1343,7 +1343,8 @@ def record_fill_worker(db, number, rec, path):
         return
     _, model, effort, advisor = rec["route"]
     agent = f"coder {model} {effort}" + ("+advisor" if advisor else "") + " @" + rec["label"]
-    state = dict(path=path, host=rec.get("host", "local"), model=model, agent=agent, history=[], stage="Coding")
+    state = dict(path=path, host=rec.get("host", "local"), holds=rec["holds"], model=model, agent=agent,
+                 history=[], stage="Coding")
     assign_coder(state, rec["dispatch"], rec["terminal"])
     save_review(db, run, number, state)
 
@@ -1563,11 +1564,11 @@ def green_report(ticket, body):
         return head
 
 
-def review_account(route, host, role):
+def review_account(route, host):
     import pick
     account, reasons = pick.pick(pick.account_usage.load_config(), *route[:3], host, time.time())
     if account is None:
-        raise OrcaError(f"no {role} seat: " + ", ".join(reasons))
+        raise OrcaError("no reviewer seat: " + ", ".join(reasons))
     return account
 
 
@@ -1601,30 +1602,19 @@ def reviewer_spec(ticket, sha, same_model):
                if same_model else ""))
 
 
+def assign_coder(state, dispatch, terminal):
+    state.update(coder=dispatch, expected=dispatch, coder_terminal=terminal)
+
+
 def assign_reviewer(state, dispatch, terminal, hold):
+    if hold.get("account"):
+        record_hold(dict(hold, terminal=terminal))
+    state.pop("hold", None)
     state["expected"] = dispatch
     state["reviewer"] = {"dispatch": dispatch, "terminal": terminal, "holds": hold["holds"]}
     route = hold["route"]
     advisor = "+advisor" if route[3] else ""
     state["card_agent"] = f"{state['agent']} · reviewer {route[1]} {route[2]}{advisor} @{hold['label']}"
-
-
-def assign_coder(state, dispatch, terminal):
-    state.update(coder=dispatch, expected=dispatch, coder_terminal=terminal)
-
-
-def finish_review_start(db, run, number, state, stage, dispatch, terminal, hold):
-    if hold.get("account"):
-        record_hold(dict(hold, terminal=terminal))
-    if stage == "Reviewing":
-        assign_reviewer(state, dispatch, terminal, hold)
-    else:
-        state["agent"] = card_agent(state["agent"], False, hold["label"])
-        finish_followup(state, stage, dispatch, terminal)
-    for key in ("pending", "released", "start", "review_title", "hold"):
-        state.pop(key, None)
-    state.update(stage=stage, publish=True)
-    save_review(db, run, number, state)
 
 
 def review_dispatch(run, task, state):
@@ -1634,32 +1624,23 @@ def review_dispatch(run, task, state):
     return (runtime("orchestration", "dispatch-show", "--task", task, "--full").get("dispatch") or {}).get("id")
 
 
-def adopt_review_start(db, run, ticket, state, messages):
+def adopt_reviewer(db, run, ticket, state, messages):
     import pick
     number = ticket["number"]
-    start = state.get("start")
-    reservation = state.get("pending") or state.get("released")
-    error = OrcaError(f"#{number}: inspect uncertain Orca action for message {reservation} before continuing")
-    report = next((m for m in review_mail(messages, state["expected"]) if m["id"] == reservation), None)
-    if not report or not report.get("created_at"):
+    error = OrcaError(f"#{number}: inspect uncertain Orca action for message {state['pending']} before continuing")
+    report = next((m for m in review_mail(messages, state["coder"]) if m["id"] == state["pending"]), None)
+    if not report or not state.get("sha") or state["stage"] not in ("Coding", "Fixing") or not report.get("created_at"):
         raise error
-    if start:
-        stage, title, spec = (start[key] for key in ("stage", "title", "spec"))
-        route = tuple(state["hold"]["route"])
-    else:
-        # Older reviewer reservations stored only the message ID or reviewer title.
-        stage = "Reviewing"
-        route = review_route(ticket["body"])
-        if not route or not state.get("sha") or state["stage"] not in ("Coding", "Fixing"):
-            raise error
-        title = state.get("review_title", f"#{number} reviewer")
-        spec = reviewer_spec(ticket, state["sha"], route[1] == state["model"])
+    # Older reservations stored only the message ID. Match the original task spec and creation time.
+    title = state.get("review_title", f"#{number} reviewer")
     tasks = runtime("orchestration", "task-list", "--run", run, "--full")["tasks"]
+    route = review_route(ticket["body"])
+    if not route:
+        raise error
+    spec = reviewer_spec(ticket, state["sha"], route[1] == state["model"])
     matches = [t for t in tasks if t["run_id"] == run and t["task_title"] == title
                and t["spec"] == spec
                and t["created_at"].replace(" ", "T")[:19] >= report["created_at"][:19]]
-    if not matches and state.get("released"):
-        return
     if len(matches) != 1:
         raise error
     task = matches[0]["id"]
@@ -1703,7 +1684,11 @@ def adopt_review_start(db, run, ticket, state, messages):
         else:
             raise error
         hold = {"route": route, "label": label, "holds": str(pick.HOLDS)}
-    finish_review_start(db, run, number, state, stage, dispatch, terminal, hold)
+    assign_reviewer(state, dispatch, terminal, hold)
+    state.pop("pending")
+    state.pop("review_title", None)
+    state.update(stage="Reviewing", publish=True)
+    save_review(db, run, number, state)
 
 
 GREEN_INSTRUCTIONS = "Report the pushed branch head as a full SHA after its task CI is green."
@@ -1715,7 +1700,38 @@ def coder_spec(ticket, stage, instructions):
             f"Issue {OWNER}/hr-relay#{ticket['number']}. Branch {ticket['branch']}, base {ticket['base']}.\n{instructions}")
 
 
-def finish_followup(state, stage, dispatch, terminal):
+def followup_attempt(run, state, dispatch):
+    attempt = runtime("orchestration", "worker-show", "--dispatch", dispatch, "--full")["dispatch"]
+    if (attempt["id"], attempt["runId"]) != (dispatch, run):
+        raise OrcaError(f"unverified follow-up Dispatch {dispatch} in Run {run}")
+    host = state.get("host", "local")
+    if host != "local" and not attempt.get("assigneeHandle"):
+        execution = execution_worker_show(host, state["path"], dispatch)["dispatch"]
+        if (execution["id"], execution["taskId"]) != (dispatch, attempt["taskId"]):
+            raise OrcaError(f"unverified follow-up Dispatch {dispatch} on {host}")
+        attempt = dict(attempt, assigneeHandle=execution.get("assigneeHandle"))
+    return attempt
+
+
+def finish_followup(run, state, stage, attempt, previous):
+    import pick
+    dispatch = attempt["id"]
+    terminal = attempt.get("assigneeHandle")
+    if not terminal:
+        raise OrcaError(f"no terminal assigned to follow-up Dispatch {dispatch}")
+    if attempt.get("followUpOf") not in (None, previous):
+        raise OrcaError(f"follow-up Dispatch {dispatch} changed predecessor")
+    if previous == state["coder"]:
+        source = state.get("coder_terminal")
+        saved_hold = (state.get("followup") or {}).get("hold")
+    else:
+        source = followup_attempt(run, state, previous).get("assigneeHandle")
+        saved_hold = None
+    if source or saved_hold:
+        with pick.edit_holds(Path(state.get("holds") or pick.HOLDS)) as holds:
+            hold = holds.get(source) or saved_hold
+            if hold and hold.get("account") and hold.get("host", "local") == state.get("host", "local"):
+                holds.setdefault(terminal, hold)
     assign_coder(state, dispatch, terminal)
     state["card_agent"] = state["agent"]
     if stage == "Fixing" and state.get("reviewer"):
@@ -1745,11 +1761,11 @@ def recover_followup(run, ticket, state, messages, message_id):
     dispatch = review_dispatch(run, task, state)
     if not dispatch:
         return False
-    attempt = runtime("orchestration", "worker-show", "--dispatch", dispatch, "--full")["dispatch"]
-    if (attempt["id"] != dispatch or attempt["taskId"] != task or attempt["runId"] != run
+    attempt = followup_attempt(run, state, dispatch)
+    if (attempt["taskId"] != task
             or not in_coder_chain(attempt.get("followUpOf"), state["coder"], run)):
         return False
-    finish_followup(state, stage, dispatch, attempt.get("assigneeHandle") or state.get("coder_terminal"))
+    finish_followup(run, state, stage, attempt, attempt["followUpOf"])
     state.update(stage=stage, publish=True)
     return True
 
@@ -1801,15 +1817,17 @@ def review_step(db, run, actor, ticket, initial, messages):
     host = state.get("host", "local")
     reservation = state.get("pending") or state.get("released")
     if reservation:
-        if not state.get("start") and recover_followup(run, ticket, state, messages, reservation):
-            for key in ("pending", "released"):
-                state.pop(key, None)
+        if recover_followup(run, ticket, state, messages, reservation):
+            state.pop("pending", None)
+            state.pop("released", None)
             save_review(db, run, number, state)
-        elif state.get("start") or state.get("pending"):
-            adopt_review_start(db, run, ticket, state, messages)
-        if state.get("released"):
-            for key in ("released", "followup", "review_title", "start", "hold"):
-                state.pop(key, None)
+        elif state.get("pending"):
+            adopt_reviewer(db, run, ticket, state, messages)
+        else:
+            state.pop("released")
+            state.pop("followup", None)
+            state.pop("review_title", None)
+            state.pop("hold", None)
             save_review(db, run, number, state)
     review_coordinator(db, run, number, state)
     if state.get("publish"):
@@ -1834,7 +1852,7 @@ def review_step(db, run, actor, ticket, initial, messages):
     body = message["body"]
     stage = "Fixing"
     instructions = GREEN_INSTRUCTIONS
-    route = ticket["route"]
+    account = None
     if state["stage"] == "Reviewing":
         header = body.splitlines()[0] if body else ""
         verdict = re.fullmatch(r"REVIEW VERDICT: (PUSH|FIX) ([a-f0-9]{40})", header)
@@ -1871,10 +1889,31 @@ def review_step(db, run, actor, ticket, initial, messages):
                               and re.search(r"(?i)\bTier:\s*UI,?\s+multi-step\b", ticket["body"]))
                 if route[1] == state["model"] and not ui_advisor:
                     raise OrcaError("reviewer must use a different model from the coder")
+                owed = host == "local" and route[0] == "codex" and set(owed_restores(db)) - {f"reviews:{run}:{number}"}
+                if owed:
+                    log("review", {"issue": number, "waiting": f"coordinator restore still owed by {sorted(owed)}"})
+                    return
+                account = review_account(route, host)
+                path = Path(state["path"])
+                if host == "local":
+                    worker_settings(path, route)
+                    account_rpc = lambda *args: runtime("account", *args)
+                    prior = state.get("coordinator") or codex_active(route)
+                else:
+                    if route[0] == "codex" or route[3]:
+                        remote_tree_settings(host, path, {"path": state["path"]}, route)
+                    account_rpc = lambda *args: account_usage.remote_account(host, *args)
+                    prior = None
+                if prior:
+                    # Owed from here on: the next tick restores it before reading this report again.
+                    state["coordinator"] = prior
+                    save_review(db, run, number, state)
+                account_rpc("select", "--agent", route[0], "--account", account["id"])
+                if account_rpc("list")[route[0]]["activeAccountId"] != account["id"]:
+                    raise OrcaError("reviewer account selection changed")
                 stage = "Reviewing"
             else:
                 stage = "Merging"
-                route = ticket["route"]
 
     dot = ticket["repo"] == "dot-agents"
     if stage == "Merging":
@@ -1883,71 +1922,56 @@ def review_step(db, run, actor, ticket, initial, messages):
         instructions = (f"Starting at approved {state['sha']}, merge origin/{trunk}, "
                         f"push {ticket['branch']}, open or update the PR into {trunk}, "
                         f"end the body with {closes}, mark the PR ready, and enable auto-merge through required checks.")
-    if stage == "Reviewing":
+    if account:
         spec = reviewer_spec(ticket, state["sha"], route[1] == state["model"])
-        title = f"#{number} reviewer {message['id']}"
-    else:
-        spec = coder_spec(ticket, stage, instructions)
-        title = f"#{number}: {stage} {message['id']}"
-    if stage != "Needs you":
-        role = {"Reviewing": "reviewer", "Fixing": "coder", "Merging": "merger"}[stage]
-        if not route:
-            raise OrcaError(f"missing {role} route")
-        owed = host == "local" and route[0] == "codex" and set(owed_restores(db)) - {f"reviews:{run}:{number}"}
-        if owed:
-            log("review", {"issue": number, "waiting": f"coordinator restore still owed by {sorted(owed)}"})
-            return
-        account = review_account(route, host, role)
-        path = Path(state["path"])
-        if host == "local":
-            worker_settings(path, route)
-            account_rpc = lambda *args: runtime("account", *args)
-            prior = codex_active(route)
-        else:
-            if route[0] == "codex" or route[3]:
-                remote_tree_settings(host, path, {"path": state["path"]}, route)
-            account_rpc = lambda *args: account_usage.remote_account(host, *args)
-            prior = None
-        if prior:
-            # Owed from here on: the next tick restores it before reading this report again.
-            state["coordinator"] = prior
-            save_review(db, run, number, state)
-        account_rpc("select", "--agent", route[0], "--account", account["id"])
-        if account_rpc("list")[route[0]]["activeAccountId"] != account["id"]:
-            raise OrcaError(f"{role} account selection changed")
-        state["start"] = {"stage": stage, "title": title, "spec": spec}
+        state["review_title"] = f"#{number} reviewer {message['id']}"
         state["hold"] = {"account": account["id"], "label": account["label"], "route": route,
                          "time": int(time.time()), "holds": str(pick.HOLDS), "host": host}
+    else:
+        spec = coder_spec(ticket, stage, instructions)
+        if stage != "Needs you":
+            hold = (pick.account_usage.load_json(state.get("holds") or pick.HOLDS) or {}).get(state.get("coder_terminal"))
+            state["followup"] = {"stage": stage, "spec": spec, "hold": hold}
     # A lost response may already have launched a worker. Reserve before issuing the command.
     state["pending"] = message["id"]
     with db:
         db.execute("INSERT INTO review_mail VALUES (?,?)", (run, message["id"]))
         db.execute("INSERT OR REPLACE INTO reviews VALUES (?,?,?)", (run, number, json.dumps(state)))
-    if stage != "Needs you":
+    state["card_agent"] = state["agent"]
+    if account:
         try:
             result = runtime("orchestration", "worker-start", *actor, *(("--on", host) if host != "local" else ()),
                              "--worktree", "path:" + state["path"],
                              "--agent", route[0], "--model", route[1], "--effort", route[2],
-                             "--task-title", title, "--spec", spec, "--full")
+                             "--task-title", state["review_title"], "--spec", spec, "--full")
         except StartNotApplied as e:
-            for key in ("pending", "start", "hold"):
+            # No reviewer exists: drop the reservation so the report is read again, then restore the coordinator.
+            for key in ("pending", "review_title", "hold"):
                 state.pop(key, None)
             with db:
                 db.execute("DELETE FROM review_mail WHERE run=? AND id=?", (run, message["id"]))
                 db.execute("INSERT OR REPLACE INTO reviews VALUES (?,?,?)", (run, number, json.dumps(state)))
             review_coordinator(db, run, number, state)
-            raise OrcaError(f"#{number}: Orca confirmed no {role} start effects: {e}") from e
+            raise OrcaError(f"#{number}: Orca confirmed no reviewer start effects: {e}") from e
         dispatch, terminal = start_identity(result)
-        finish_review_start(db, run, number, state, stage, dispatch, terminal, state["hold"])
-    else:
+        assign_reviewer(state, dispatch, terminal, state["hold"])
+        state.pop("review_title")
+    elif stage == "Needs you":
         # From the Run's own pane Orca accepts only status mail to run:<id> (sender_not_assignee otherwise).
         runtime("orchestration", "send", *actor, "--to", "run:" + run, "--type", "status",
                 "--subject", f"#{number}: third FIX", "--body", instructions)
-        if state.get("reviewer"):
-            state["release"] = state.pop("reviewer")
-        state.pop("pending")
-        state.update(stage=stage, publish=True, card_agent="coordinator")
-        save_review(db, run, number, state)
+        state["card_agent"] = "coordinator"
+    else:
+        # The Run home relays Dispatch-addressed mail to the coder's execution server.
+        result = runtime("orchestration", "send", *actor, "--to", "dispatch:" + state["coder"],
+                         "--subject", f"#{number}: {stage}", "--body", spec)
+        dispatch = followup_dispatch(result, state["coder"], run)
+        finish_followup(run, state, stage, followup_attempt(run, state, dispatch), result["followUpOf"])
+    if stage == "Needs you" and state.get("reviewer"):
+        state["release"] = state.pop("reviewer")
+    state.pop("pending")
+    state.update(stage=stage, publish=True)
+    save_review(db, run, number, state)
     review_coordinator(db, run, number, state)
     publish_review(db, run, ticket, state)
 
@@ -2402,16 +2426,6 @@ def held_label(agent, terminal):
     return card_agent(agent, False, label) if label else agent
 
 
-def reported_account(show, terminal):
-    observed = show.get("terminal") or {}
-    dispatch = show["dispatch"]
-    for details, handle in ((observed, observed.get("handle")), (dispatch, dispatch.get("assigneeHandle"))):
-        account = details.get("accountId")
-        if handle == terminal and isinstance(account, str) and account:
-            return account
-    return None
-
-
 def card_agent(text, reviewer, label):
     parts = (text or "").split(" · ")
     i = 1 if reviewer and len(parts) > 1 else 0
@@ -2490,10 +2504,7 @@ def watch_pass(args, db, actions, errors):
         for name in (state.get("previous_stage"), ticket and ticket["stage"]):
             if name and name not in ("Handed off", "Needs you"):
                 return name
-        if "review" in title:
-            return "Reviewing"
-        match = re.match(r"#\d+: (Fixing|Merging)\b", title)
-        return match[1] if match else "Coding"
+        return "Reviewing" if "review" in title else "Coding"
 
     def role_of(d):
         """The role the first Task title in this Dispatch's retry and follow-up ancestry names, else None."""
@@ -2537,8 +2548,6 @@ def watch_pass(args, db, actions, errors):
             pending.setdefault("number", number)
             resume_start(terminal, state)
             return
-        if not crash and not state.get("account"):
-            state["account"] = reported_account(show, terminal)
         if not crash and not state.get("account"):
             if state.get("escalated") != "account":
                 escalate(number, "limit account unknown", f"Dispatch {dispatch} must restart ({why}), but no hold "

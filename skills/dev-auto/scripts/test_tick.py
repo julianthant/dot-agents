@@ -218,7 +218,7 @@ with TemporaryDirectory() as tmp:
     assert errs[0].startswith("absence not verified: git worktree list exit 128"), errs
 
 
-# The dry-run plan reserves both paths and account capacity in priority order.
+# The dry-run plan reserves account capacity in priority order.
 from unittest import TestCase
 check = TestCase()
 base = dict(status="Todo", kind="Task", later=False, assigned=False, blocked=False, busy=False,
@@ -235,10 +235,9 @@ for t in tickets:
 account = dict(id="seat", label="example")
 def seat(route, held):
     return (account, []) if len(held) < 1 else (None, ["capacity"])
-with redirect_stdout(io.StringIO()) as output:
-    plan = list(tick.fill_plan(tickets, seat))
-check.assertEqual([t["number"] for t, a in plan], [1])
-check.assertIn("capacity", output.getvalue())
+plan = list(tick.fill_plan(tickets, seat))
+check.assertEqual([t["number"] for t, a, _ in plan if a], [1])
+check.assertEqual({t["number"]: why for t, _, why in plan}[2], "no seat")
 body = """## Owned paths
 
 src/backend/logs/ (writers), tests/backend/logs*.ts
@@ -280,11 +279,19 @@ with TemporaryDirectory() as tmp, sqlite3.connect(":memory:") as db:
     root = Path(tmp)
     card = []
     starts = []
+    comments = []
     ticket = dict(base, number=51, sha="sha", base="origin/main", route=("claude", "claude-sonnet-5-5", "medium", "opus"))
     args = SimpleNamespace(anchor=None, run=None)
     def cli(*args):
         if args[0] == "git":
             return "sha" if "rev-parse" in args else ticket["branch"]
+        if args[:2] == ("gh", "api"):
+            check.assertIn("/issues/51/comments", args[3])
+            return "1\n" if comments else ""
+        if args[:3] == ("gh", "issue", "comment"):
+            check.assertTrue(starts)
+            comments.append(args[-1])
+            raise tick.OrcaError("comment receipt lost")
         check.assertEqual(args[:3], ("gh", "project", "item-edit"))
         card.append(args[-1])
         return ""
@@ -317,10 +324,15 @@ with TemporaryDirectory() as tmp, sqlite3.connect(":memory:") as db:
     with patch.object(tick, "project_fields", return_value=("project", [("s","progress"),("c","coding"),("a",None)], ("c","needs-you"))), \
          patch.object(tick, "runtime", local), patch.object(tick, "command", cli), \
          patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE":"fixture"}), redirect_stdout(io.StringIO()):
-        tick.launch(db, root, ticket, account, args, root / "holds.json")
+        with check.assertRaisesRegex(tick.OrcaError, "comment receipt lost"):
+            tick.launch(db, root, dict(ticket, overlap_note="Overlaps #40 on `src/a`."), account, args, root / "holds.json")
+        rec = json.loads(db.execute("SELECT receipt FROM starts WHERE issue=51").fetchone()[0])
+        tick.reconcile_start(db, 51, rec, [])
         with check.assertRaisesRegex(tick.OrcaError, "51"):
             tick.launch(db, root, ticket, account, args, root / "holds.json")
     check.assertEqual(len(starts), 1)
+    check.assertEqual(len(comments), 1)
+    check.assertIn("Overlaps #40 on `src/a`.", comments[0])
     check.assertEqual(json.loads((root / "holds.json").read_text())["fixture-terminal"]["account"], "seat")
     check.assertEqual(card, ["progress", "coding", "coder claude-sonnet-5-5 medium+advisor @example"])
 
@@ -570,7 +582,7 @@ with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory
     raced = False
     stack.enter_context(patch.object(tick, "tickets", side_effect=lambda fresh=False: [dict(t) for t in (stuck, overlap_ticket, ticket)]))
     stack.enter_context(patch.object(tick, "supervisor", return_value=([], "own")))
-    def live_inventory(path, issues, repo):
+    def live_inventory(path, issues, repo, emit):
         next(t for t in issues if t["number"] == 40)["live"] = True
         return set()
     stack.enter_context(patch.object(tick, "inventory", side_effect=live_inventory))
@@ -936,7 +948,7 @@ with patch.object(tick, "runtime", side_effect=[{"worktrees": trees, "truncated"
 check.assertEqual([(t.get("occupied", False), t["busy"]) for t in items],
                   [(True, True), (True, True), (True, False), (False, False)])
 check.assertIn("task/closed/lane", out.getvalue())
-check.assertEqual([t["number"] for t, _ in plan], [484])
+check.assertEqual([t["number"] for t, a, _ in plan if a], [484])
 
 # A task report needs the current remote branch SHA and its own successful task workflow.
 review_ticket = {"number": 41, "branch": "task/ui/header", "repo": "hr-relay"}

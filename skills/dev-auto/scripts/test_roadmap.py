@@ -1,26 +1,33 @@
 import json
+from contextlib import redirect_stdout
+from io import StringIO
 import subprocess
 import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import tick
 import roadmap
+import pick
 
 # Replies as `gh api -i` prints them (headers trimmed to the ones read); a 304 exits 1 with an empty body.
 R304 = 'HTTP/2.0 304 Not Modified\r\nEtag: "{tag}"\r\nX-Ratelimit-Remaining: 3992\r\n\r\n'
 R200 = 'HTTP/2.0 200 OK\r\nCache-Control: private, max-age=60, s-maxage=60\r\nEtag: W/"{tag}"\r\n\r\n{body}'
 SINCE = "2026-11-23T13:00:00Z"
 COMMAND = tick.command  # the real one, run over a faked gh process
+READINESS = roadmap.readiness
 
 
 def issue(n, stage):
     return {"number": n, "title": f"lane / {n}", "issueType": {"name": "Task"}, "state": "OPEN", "stateReason": None,
-            "milestone": None, "labels": {"nodes": []}, "parent": None, "subIssues": {"totalCount": 0},
-            "subIssuesSummary": None, "blockedBy": {"nodes": []}, "updatedAt": "2026-11-23T12:00:00Z",
-            "projectItems": {"nodes": [{"id": f"item{n}", "project": {"number": 5, "owner": {"login": "julianthant"}},
+            "body": "Coder: codex / gpt-6.2-sol / medium", "blocking": {"nodes": [], "totalCount": 0},
+            "assignees": {"totalCount": 0}, "closedByPullRequestsReferences": {"totalCount": 0},
+            "milestone": None, "labels": {"nodes": [], "totalCount": 0}, "parent": None, "subIssues": {"totalCount": 0},
+            "subIssuesSummary": None, "blockedBy": {"nodes": [], "totalCount": 0}, "updatedAt": "2026-11-23T12:00:00Z",
+            "projectItems": {"totalCount": 1, "nodes": [{"id": f"item{n}", "project": {"number": 5, "owner": {"login": "julianthant"}},
                                         "status": {"name": "In Progress"}, "agent": None,
                                         "stage": stage and {"name": stage}, "area": None}]}}
 
@@ -56,6 +63,9 @@ class Roadmap(unittest.TestCase):
         p = patch.object(roadmap.subprocess, "run", side_effect=self.gh_api)
         p.start()
         self.addCleanup(p.stop)
+        p = patch.object(roadmap, "readiness", return_value={})
+        p.start()
+        self.addCleanup(p.stop)
 
     def answer(self, a):
         raise AssertionError(f"unexpected GitHub read {a}")
@@ -87,6 +97,42 @@ class Roadmap(unittest.TestCase):
     def edit(self, field, *value, item="item1"):
         with patch.object(tick.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "{}", "")):
             COMMAND("gh", "project", "item-edit", "--project-id", "proj", "--id", item, "--field-id", field, *value)
+
+    def test_ready_rows_match_fill_dry_run_and_held_rows_explain_why(self):
+        self.warm()
+        bug, blocked, full, later, missing = [issue(n, "Queued") for n in range(1, 6)]
+        for n in (bug, blocked, full, later, missing):
+            n["projectItems"]["nodes"][0]["status"]["name"] = "Todo"
+        bug["issueType"]["name"] = "Bug"
+        blocked["blockedBy"] = {"totalCount": 1, "nodes": [{"number": 1, "state": "OPEN"}]}
+        later["milestone"] = {"title": "Later"}
+        missing["title"] = "missing / base"
+        snap = json.loads(tick.SNAPSHOT.read_text())
+        snap["open"] = [bug, blocked, full, later, missing]
+        tick.SNAPSHOT.write_text(json.dumps(snap))
+
+        def refs(argv):
+            return {"get-url": "https://github.com/julianthant/hr-relay.git",
+                    "for-each-ref": "", "ls-remote": "abc refs/heads/feature/lane"}[argv[3]]
+
+        def seat(*args, holds):
+            return (None, ["capacity"]) if holds else ({"id": "seat", "label": "seat"}, [])
+
+        with (patch.object(roadmap, "readiness", READINESS), patch.object(self, "answer", side_effect=refs),
+              patch.object(Path, "home", return_value=tick.SNAPSHOT.parent),
+              patch.object(tick, "inventory", return_value=set()),
+              patch.object(pick.account_usage, "load_config", return_value={}),
+              patch.object(pick, "pick", side_effect=seat)):
+            rows = roadmap.render()["issues"]
+            with redirect_stdout(StringIO()) as output:
+                tick.fill(SimpleNamespace(repo_path=Path("/fixture"), issue=None, dry_run=True, holds=None))
+        starts = [json.loads(line.split("would start ", 1)[-1])["issue"]
+                  for line in output.getvalue().splitlines() if "would start " in line]
+        self.assertEqual(starts, [1])
+        self.assertEqual([r["n"] for r in rows if r["ready"]], starts)
+        self.assertEqual({r["n"]: r["holdReason"] for r in rows},
+                         {1: None, 2: "blocked by #1", 3: "no seat", 4: "needs operator",
+                          5: "base missing on origin"})
 
     def test_tick_edits_reach_the_roadmap_without_a_github_read(self):
         self.warm()

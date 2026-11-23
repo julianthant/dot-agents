@@ -15,6 +15,7 @@ Coordinator verbs refuse a sender with no stable Orca pane, so the script opens 
 
 from pathlib import Path
 import argparse
+from contextlib import closing
 import hashlib
 import sqlite3
 import tempfile
@@ -559,9 +560,9 @@ def write_through(args):
     edit_snapshot(change)
 
 
-def tickets(fresh=False):
+def tickets(fresh=False, *, rows=None):
     result = []
-    for i in snapshot(fresh)["open"]:
+    for i in snapshot(fresh)["open"] if rows is None else rows:
         card = next((c for c in nodes(i["projectItems"]) if c["project"]["number"] == PROJECT
                      and c["project"]["owner"]["login"] == OWNER), None)
         body = i["body"]
@@ -582,6 +583,7 @@ def tickets(fresh=False):
             base = "origin/development"
         else:
             base = "origin/feature/" + branch.split("/")[1] if branch else None
+        blockers = [b["number"] for b in nodes(i["blockedBy"]) if b["state"] == "OPEN"]
         result.append({
             "number": i["number"], "title": i["title"], "item": card.get("id"), "body": body,
             "agent": (card.get("agent") or {}).get("text"), "stage": stage,
@@ -590,7 +592,7 @@ def tickets(fresh=False):
             "busy": bool(i["closedByPullRequestsReferences"]["totalCount"] or stage not in (None, "Queued")),
             "later": (i["milestone"] or {}).get("title", "").lower() == "later"
                      or any(label["name"].lower() == "later" for label in nodes(i["labels"])),
-            "blocked": bool(i["subIssues"]["totalCount"] or any(b["state"] == "OPEN" for b in nodes(i["blockedBy"]))),
+            "blocked": bool(i["subIssues"]["totalCount"] or blockers), "blockers": blockers,
             "score": sum(b["state"] == "OPEN" for b in nodes(i["blocking"])),
             "route": coder_route(body), "paths": owned_paths(body), "branch": branch, "base": base,
             "repo": "dot-agents" if dot else "hr-relay",
@@ -611,33 +613,71 @@ def overlap(left, right):
                for a in map(root, left) for b in map(root, right))
 
 
-def fill_plan(tickets, seat, issue=None):
-    busy = [t for t in tickets if t["busy"] or t["assigned"] or t["status"] == "In Progress"]
+def fill_plan(tickets, seat, issue=None, owed=lambda: ()):
     held = []
+    branches = set()
     for t in sorted(tickets, key=lambda t: (-t["score"], t["number"])):
         if issue and t["number"] != issue:
             continue
-        reasons = list(t.get("skip", []))
-        for condition, reason in ((t["status"] != "Todo", "status is not Todo"), (t["kind"] != "Task", "not a Task"),
-                                  (t["later"], "later"), (t["blocked"], "open blocker or subtasks"),
-                                  (t["assigned"], "assigned"), (t["busy"], "active work"),
-                                  (not t["route"], "missing coder route"), (not t["branch"], "missing task branch")):
-            if condition:
-                reasons.append(reason)
-        for b in busy:
-            if b["number"] != t["number"] and b["repo"] == t["repo"] and (
-                    b["branch"] == t["branch"] or overlap(b["paths"], t["paths"])):
-                reasons.append(f"overlaps #{b['number']} ({', '.join(b['paths'])})")
-        if reasons:
-            log("skip", {"issue": t["number"], "reason": reasons})
+        if t["kind"] not in ("Task", "Bug"):
             continue
-        account, why = seat(t["route"], held)
+        branch = t["repo"], t["branch"]
+        blockers = ", ".join(f"#{n}" for n in t.get("blockers", ()))
+        skip = t.get("skip") or []
+        reason = next((reason for condition, reason in (
+            (t["later"] or t.get("stage") == "Needs you", "needs operator"),
+            (t["blocked"], f"blocked by {blockers}" if blockers else "has subtasks"),
+            (t["assigned"] or t["busy"] or t["status"] == "In Progress", "active work"),
+            (not t["route"], "needs operator (missing coder route)"),
+            (t["status"] != "Todo", "status is not Todo"),
+            (not t["branch"], "missing task branch"),
+            (t.get("occupied"), "existing worktree"),
+            (branch in branches, "task branch already planned"),
+            (skip, skip[0] if skip else None),
+        ) if condition), None)
+        if reason:
+            yield t, None, reason
+            continue
+        restores = owed() if t["route"][0] == "codex" else ()
+        if restores:
+            yield t, None, f"coordinator restore still owed by {sorted(restores)}"
+            continue
+        account, _ = seat(t["route"], held)
         if not account:
-            log("no seat", {"issue": t["number"], "reason": why or ["no eligible account"]})
+            yield t, None, "no seat"
             continue
         held.append(dict(account=account["id"], agent=t["route"][0], model=t["route"][1], effort=t["route"][2]))
-        busy.append(t)
-        yield t, account
+        branches.add(branch)
+        yield t, account, None
+
+
+def overlap_note(ticket, issues):
+    matches = []
+    for live in issues:
+        if live["number"] == ticket["number"] or not live.get("live"):
+            continue
+        paths = [p for p in live["paths"] if overlap([p], ticket["paths"])]
+        if paths:
+            matches.append(f"- #{live['number']}: " + ", ".join(f"`{p}`" for p in paths))
+    if matches:
+        return ("This ticket overlaps live work on the owned paths below. Preserve the other tickets’ changes. "
+                "If the PRs conflict, the PR that merges second resolves the conflict.\n\n" + "\n".join(matches))
+
+
+def post_overlap_note(db, number, rec):
+    note = rec.get("overlap_note")
+    if not note:
+        return
+    # The marker also covers a GitHub reply lost after the comment was created.
+    marker = "<!-- dev-auto-overlap-" + hashlib.sha256(rec["task"].encode()).hexdigest() + " -->"
+    repo = f"{OWNER}/hr-relay"
+    comments = command("gh", "api", "--paginate", f"repos/{repo}/issues/{number}/comments",
+                       "--jq", f'.[] | select(.body | contains("{marker}")) | .id')
+    if not comments.strip():
+        command("gh", "issue", "comment", str(number), "-R", repo, "--body", f"{note}\n\n{marker}")
+    del rec["overlap_note"]
+    with db:
+        db.execute("UPDATE starts SET receipt=? WHERE issue=?", (json.dumps(rec), number))
 
 
 def runtime(*args):
@@ -719,7 +759,7 @@ def record_start(db, number, rec):
         db.execute("UPDATE starts SET receipt='done' WHERE issue=?", (number,))
 
 
-def inventory(repo_path, issues, repo):
+def inventory(repo_path, issues, repo, emit=log):
     trees = runtime("worktree", "list", "--repo", "path:" + str(repo_path), "--limit", "10000")
     terms = runtime("terminal", "list", "--limit", "10000")
     if trees["truncated"] or terms["truncated"]:
@@ -736,13 +776,13 @@ def inventory(repo_path, issues, repo):
         for t in matches:
             t["occupied"] = True
             if tree["id"] in agents:
-                t["busy"] = True
+                t["busy"] = t["live"] = True
         if not matches and tree["id"] in agents:
-            log("skip", {"branch": branch, "reason": "live worktree has no matching open issue with owned paths"})
+            emit("skip", {"branch": branch, "reason": "live worktree has no matching open issue with owned paths"})
     return {t["handle"] for t in terms["terminals"]}
 
 
-def fill_tick(args, db):
+def fill_tick(args, db, *, issues=None, emit=log):
     import pick
     repo_path = args.repo_path.resolve()
     remote = command("git", "-C", str(repo_path), "remote", "get-url", "origin").strip()
@@ -774,7 +814,7 @@ def fill_tick(args, db):
                 else:
                     record_start(db, n, rec)
             except (OrcaError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as e:
-                log("pending", {"issue": n, "reason": str(e)})
+                emit("pending", {"issue": n, "reason": str(e)})
         previous = dict(db.execute("SELECT issue,receipt FROM starts"))
 
     pending = {}
@@ -792,16 +832,14 @@ def fill_tick(args, db):
                 t["busy"] = True
         return issues
 
-    issues = mark_pending([t for t in tickets() if t["repo"] == repo])
-    live = inventory(repo_path, issues, repo)
+    issues = mark_pending([dict(t) for t in (tickets() if issues is None else issues) if t["repo"] == repo])
+    live = inventory(repo_path, issues, repo, emit)
     refs = set(command("git", "-C", str(repo_path), "for-each-ref", "--format=%(refname:short)",
                        "refs/heads", "refs/remotes/origin").splitlines())
     remote_refs = command("git", "-C", str(repo_path), "ls-remote", "--heads", "origin")
     heads = {line.split()[1] for line in remote_refs.splitlines()}
     for t in issues:
         t["skip"] = []
-        if t.get("occupied"):
-            t["skip"].append("existing worktree")
         if t["number"] in previous:
             t["skip"].append("reserved or completed")
         if t["branch"] in refs or "origin/" + (t["branch"] or "") in refs or "refs/heads/" + (t["branch"] or "") in heads:
@@ -822,20 +860,24 @@ def fill_tick(args, db):
         return pick.pick(cfg, *route[:3], "local", time.time(), holds=held + extra)
 
     count = 0
-    for ticket, acct in fill_plan(issues, seat, args.issue):
+    decisions = {}
+    def owed():
+        return owed_restores(db) if db else ()
+
+    for ticket, acct, reason in fill_plan(issues, seat, args.issue, owed):
         route, n = ticket["route"], ticket["number"]
-        owed = route[0] == "codex" and db and owed_restores(db)
-        if owed:
-            log("skip", {"issue": n, "reason": f"coordinator restore still owed by {sorted(owed)}"})
+        decisions[n] = reason
+        if reason:
+            emit("skip", {"issue": n, "reason": reason})
             continue
-        log("would start" if args.dry_run else "start", dict(issue=n, repo=repo, branch=ticket["branch"],
+        emit("would start" if args.dry_run else "start", dict(issue=n, repo=repo, branch=ticket["branch"],
             base=ticket["base"], agent=route[0], model=route[1], effort=route[2], advisor=route[3], account=acct["label"]))
         if not args.dry_run:
             # Refresh GitHub, ownership and the picker immediately before committing to side effects.
             current = mark_pending([t for t in tickets(fresh=True) if t["repo"] == repo])
-            latest = inventory(repo_path, current, repo)
-            candidate = next(fill_plan(current, lambda r, extra: seat(r, extra, latest, pending), n), None)
-            if not candidate or candidate[0].get("occupied") or candidate[1]["id"] != acct["id"] or any(
+            latest = inventory(repo_path, current, repo, emit)
+            candidate = next(fill_plan(current, lambda r, extra: seat(r, extra, latest, pending), n, owed), None)
+            if not candidate or not candidate[1] or candidate[1]["id"] != acct["id"] or any(
                 candidate[0][k] != ticket[k] for k in ("branch", "base", "route", "paths", "item")):
                 raise OrcaError(f"#{n} readiness or seat changed")
             ref = "refs/heads/" + ticket["base"].removeprefix("origin/")
@@ -847,7 +889,8 @@ def fill_tick(args, db):
             if latest_refs.split() != [sha, ref]:
                 raise OrcaError(f"#{n} base changed or task branch already exists on origin")
             try:
-                launch(db, repo_path, dict(ticket, sha=sha), acct, args, holds_path)
+                launch(db, repo_path, dict(ticket, sha=sha, overlap_note=overlap_note(ticket, current)),
+                       acct, args, holds_path)
             except (OrcaError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as e:
                 if not db or not db.execute("SELECT name FROM sqlite_master WHERE name='starts'").fetchone():
                     raise
@@ -855,11 +898,12 @@ def fill_tick(args, db):
                 if not row or row[0] == "done":
                     raise
                 pending[n] = json.loads(row[0])
-                log("pending", {"issue": n, "reason": str(e)})
+                emit("pending", {"issue": n, "reason": str(e)})
                 continue
         count += 1
     if not count:
-        log("fill", "no eligible start")
+        emit("fill", "no eligible start")
+    return decisions
 
 
 def supervisor(args):
@@ -1055,6 +1099,8 @@ def launch(db, repo_path, t, acct, args, holds_path):
         rec = dict(task=task, run=run, worktree=wt["id"], account=acct["id"], label=acct["label"],
                    route=route, project=project, item=t["item"], fields=fields, time=int(time.time()),
                    holds=str(holds_path), waiting_field=waiting_field, coordinator=prior)
+        if t.get("overlap_note"):
+            rec["overlap_note"] = t["overlap_note"]
         # The fill lock covers preparation. A durable Task identity precedes the only start call.
         with db:
             db.execute("UPDATE starts SET receipt=? WHERE issue=?", (json.dumps(rec), number))
@@ -1154,6 +1200,8 @@ def reconcile_start(db, number, rec, actor):
         raise OrcaError(f"#{number} reserved: assignee changed for Dispatch {dispatch_id}")
     # The verified attempt has consumed the worker's selection; the coordinator's comes back before anything else can fail.
     return_coordinator(db, number, rec)
+    if terminal:
+        post_overlap_note(db, number, rec)
     resource = (show.get("projection") or {}).get("resource") or {}
     released_failure = worker["state"] == "failed" and resource.get("terminalState") == "released"
     if released_failure or dispatch.get("status") == "completed":
@@ -1202,15 +1250,15 @@ def reconcile_start(db, number, rec, actor):
     log("started", {"issue": number, "dispatch": dispatch_id})
 
 
-def fill(args):
+def fill(args, *, issues=None, emit=log):
     import fcntl
     state = Path.home() / ".local/state/dev-auto"
     path = state / "starts.sqlite"
     if args.dry_run:
         if path.exists():
-            with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as db:
-                return fill_tick(args, db)
-        return fill_tick(args, None)
+            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+                return fill_tick(args, db, issues=issues, emit=emit)
+        return fill_tick(args, None, issues=issues, emit=emit)
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (state / "fill.lock").open("a+") as lock:
         try:

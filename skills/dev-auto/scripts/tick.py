@@ -2346,12 +2346,14 @@ def watch_pass(args, db, actions, errors):
         terminal, dispatch, task_id = w["agentTerminalHandle"], w["dispatchId"], w["taskId"]
         owner = (w.get("resource") or {}).get("ownerDispatchId")
         # worker-list is newest first: act only on the current attempt of each pane and Task.
-        if not terminal or terminal in seen_terminals or (owner and owner != dispatch):
+        if not terminal or (owner and owner != dispatch):
             continue
+        # A newer attempt on a pane a follow-up took is still its Task's current one: record both first.
+        history = terminal in seen_terminals or task_id in seen_tasks
         seen_terminals.add(terminal)
-        if task_id in seen_tasks:
-            continue
         seen_tasks.add(task_id)
+        if history:
+            continue
         state = json.loads(saved.get(terminal) or "null")
         live = w["dispatchStatus"] == "dispatched"
         if not live and state is None and (w["dispatchStatus"] != "failed" or w.get("workerState") == "stopped"):

@@ -1665,6 +1665,7 @@ class Fleet:
         self.seats = ["jzaw", "x2"]  # the limited account is first in accounts.toml order
         self.superseded = False
         self.task_status = "dispatched"
+        self.follow_row = False
         self.effort = "medium" if model else None  # a follow-up Dispatch records no model or effort
         self.follow_of = None  # the Dispatch this one follows up
         self.started_retry = None  # whether the restart passed --retry-of
@@ -1709,7 +1710,10 @@ class Fleet:
             replaced = [dict(row, dispatchId="ctx_coder", dispatchStatus="failed", workerState="stopped",
                              agentTerminalHandle="term_coder", resource={"ownerDispatchId": "ctx_coder"})
                         ] if self.dispatch == "ctx_restart" else []
-            return {"workers": [*before, row, old, retried, *replaced], "page": {"hasMore": False, "nextCursor": None}}
+            # A settled follow-up Task's newer Dispatch on the same pane.
+            follow = [dict(row, dispatchId="ctx_follow", taskId="task_follow", dispatchStatus="succeeded",
+                           workerState="succeeded", resource={"ownerDispatchId": "ctx_follow"})] if self.follow_row else []
+            return {"workers": [*follow, *before, row, old, retried, *replaced], "page": {"hasMore": False, "nextCursor": None}}
         if verb == ("orchestration", "dispatch-show") and args[3] == "task_follow":
             current = "ctx_follow_retry" if self.follow_retried else "ctx_follow"
             return {"dispatch": {"id": current, "status": "dispatched", "taskId": None, "assigneeHandle": None}}
@@ -2210,6 +2214,13 @@ with TemporaryDirectory() as tmp:
     assert f.cards[-1][0] == "Needs you"
     f.tick(1)
     assert f.sent() == []
+
+# Bug 5: the retry shares its pane with a newer follow-up; the Task's earlier, failed attempts stay history.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.dispatch, f.terminal, f.status, f.state, f.follow_row = "ctx_restart", "term_restart", "succeeded", "succeeded", True
+    calls = f.tick()
+    assert not [e for e in f.events if e[:2] in (("orchestration", "worker-show"), ("orchestration", "worker-start"))], f.events
 
 # Bug 6: a follow-up Dispatch records no model; its restart takes the Coder line, or a reviewer's original Dispatch.
 for title, follow_of, want in (("#553 coder", None, ("gpt-6.2-astra", "medium")), ("#553 reviewer", "ctx_orig", ("gpt-6.2-sol", "xhigh"))):

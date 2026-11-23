@@ -1544,6 +1544,9 @@ class Fleet:
                 if self.note_error:
                     raise self.note_error
                 self.notes.append(args[args.index("--body") + 1])
+                if self.status != "dispatched":
+                    # Mail to a settled Dispatch starts a follow-up Dispatch of the same Task.
+                    return {"delivery": "follow_up", "followUpOf": "ctx_restart", "dispatchId": "ctx_follow"}
             return {"delivery": "queued"}
         raise AssertionError(args)
 
@@ -1676,8 +1679,12 @@ with TemporaryDirectory() as tmp:
 
 
 # The replacement settles while its resume note cannot be sent: the note and card target outlive the worker scan.
+# The note then starts a follow-up Dispatch, which review expects from the same transaction that clears the note.
 with TemporaryDirectory() as tmp:
     f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    tick.review_state(f.db, "run", 553)
+    tick.save_review(f.db, "run", 553, {"coder": "ctx_coder", "expected": "ctx_coder", "coder_terminal": "term_coder",
+                                        "agent": "coder gpt-6.2-astra medium @x1"})
     f.note_error = tick.OrcaError("mailbox busy")
     with check.assertRaises(tick.OrcaError):
         f.tick()
@@ -1687,9 +1694,12 @@ with TemporaryDirectory() as tmp:
         f.tick(1)
     row = json.loads(dict(f.db.execute("SELECT terminal,state FROM watch"))["term_restart"])
     assert row["note"]["to"] == "ctx_restart" and row["card"]["stage"] == "Coding"
+    assert tick.resume_pending(f.db, "run", 553, {"ctx_restart"})  # review waits on the note
     f.note_error = None
     f.tick(1)
     assert len(f.notes) == 1 and f.cards[-1] == ("Coding", "coder gpt-6.2-astra medium @x2")
+    review = tick.review_state(f.db, "run", 553)
+    assert (review["coder"], review["expected"]) == ("ctx_follow", "ctx_follow") and "followed up" in f.lines[0]
     f.tick(1)
     assert not f.db.execute("SELECT * FROM watch").fetchall() and len(f.notes) == 1
 

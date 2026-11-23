@@ -2123,7 +2123,26 @@ def watch_pass(args, db, actions, errors):
             receipt = runtime("orchestration", "send", *actor, "--to", "dispatch:" + note["to"],
                               "--subject", note["subject"], "--body", note["body"])
             row.pop("note")
-            save(handle, row)
+            found = re.match(r"#(\d+):", note["subject"])
+            number = int(found[1]) if found else None
+            review = None
+            if receipt.get("delivery") in ("follow_up", "reopened", "started_fresh"):
+                # The replacement had settled, so the note started a new Dispatch; review must expect that one.
+                new = followup_dispatch(receipt, note["to"], run)
+                review = review_state(db, run, number) if number is not None else None
+                if review and review.get("coder") == note["to"]:
+                    review.update(coder=new, expected=new)
+                elif review and (review.get("reviewer") or {}).get("dispatch") == note["to"]:
+                    review["reviewer"]["dispatch"] = review["expected"] = new
+                else:
+                    review = None
+                actions.append({"issue": number, "followed up": note["to"], "as": new})
+            # One transaction: review stays gated on the note until it expects the Dispatch that received it.
+            with db:
+                if review:
+                    db.execute("INSERT OR REPLACE INTO reviews VALUES (?,?,?)", (run, number, json.dumps(review)))
+                db.execute("INSERT OR REPLACE INTO watch VALUES (?,?,?)", (run, handle, json.dumps(row)))
+            saved[handle] = json.dumps(row)
             actions.append({"note": receipt.get("delivery"), "to": note["to"]})
         if row.get("card"):
             card = row["card"]

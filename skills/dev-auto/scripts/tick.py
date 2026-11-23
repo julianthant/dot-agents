@@ -617,7 +617,9 @@ def fill_tick(args, db):
                 rec = json.loads(receipt)
                 if not isinstance(rec, dict):
                     raise ValueError("invalid reservation receipt")
-                if "task" in rec:
+                if rec.get("not_applied"):
+                    drop_unapplied(db, n, rec)
+                elif "task" in rec:
                     actor, run = supervisor(args)
                     if rec["run"] != run:
                         raise OrcaError(f"reconcile from its owning Run {rec['run']}")
@@ -907,13 +909,21 @@ def launch(db, repo_path, t, acct, args, holds_path):
         with db:
             db.execute("UPDATE starts SET receipt=? WHERE issue=?", (json.dumps(rec), number))
     except StartNotApplied as e:
-        restore_coordinator(prior)
+        rec["not_applied"] = True
         with db:
-            db.execute("DELETE FROM starts WHERE issue=?", (number,))
+            db.execute("UPDATE starts SET receipt=? WHERE issue=?", (json.dumps(rec), number))
+        drop_unapplied(db, number, rec)
         raise OrcaError(f"#{number}: Orca confirmed no start effects; inspect prepared worktree {path}: {e}") from e
     except (OrcaError, OSError, ValueError, subprocess.TimeoutExpired) as e:
         log("start receipt unavailable", {"issue": number, "task": task, "reason": str(e)})
     reconcile_start(db, number, rec, actor)
+
+
+def drop_unapplied(db, number, rec):
+    """A start Orca confirmed never happened: restore the coordinator, then free the reservation."""
+    restore_coordinator(rec.get("coordinator"))
+    with db:
+        db.execute("DELETE FROM starts WHERE issue=?", (number,))
 
 
 def codex_prompt(tail):
@@ -1383,12 +1393,14 @@ def review_step(db, run, actor, ticket, initial, messages):
                     raise OrcaError("reviewer must use a different model from the coder")
                 account = review_account(route)
                 worker_settings(Path(state["path"]), route)
-                prior = codex_active(route)
+                prior = state.get("coordinator") or codex_active(route)
+                if prior:
+                    # Owed from here on: the next tick restores it before reading this report again.
+                    state["coordinator"] = prior
+                    save_review(db, run, number, state)
                 runtime("account", "select", "--agent", route[0], "--account", account["id"])
                 if runtime("account", "list")[route[0]]["activeAccountId"] != account["id"]:
                     raise OrcaError("reviewer account selection changed")
-                if prior:
-                    state["coordinator"] = prior
                 stage = "Reviewing"
             else:
                 stage = "Merging"
@@ -1724,8 +1736,8 @@ def close_tick(args, db):
     project, (_, (stage, _), (agent, _)), (_, needs_you) = project_fields()
     # Retry the same workspace if a partial close already removed the checkout.
     db.execute("CREATE TABLE IF NOT EXISTS closing (run TEXT, issue INTEGER, workspace TEXT, PRIMARY KEY(run,issue))")
-    db.execute("CREATE TABLE IF NOT EXISTS close_notice (run TEXT, issue INTEGER, reason TEXT, carded INTEGER,"
-               " PRIMARY KEY(run,issue))")
+    db.execute("CREATE TABLE IF NOT EXISTS close_notice (run TEXT, issue INTEGER, reason TEXT, sent INTEGER,"
+               " carded INTEGER, PRIMARY KEY(run,issue))")
     for issue, card, branch in candidates:
         number = issue["number"]
         review = review_state(db, run, number) or {}
@@ -1771,15 +1783,26 @@ def close_tick(args, db):
             log("closed", {"issue": number, "branch": branch, "head": sha})
         except (OrcaError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as e:
             log("Needs you", {"issue": number, "reason": str(e)})
-            # One message per blocked state; its card write is retried on its own.
-            notice = db.execute("SELECT reason,carded FROM close_notice WHERE run=? AND issue=?", (run, number)).fetchone()
-            if not notice or notice[0] != str(e):
-                runtime("orchestration", "send", *actor, "--to", "run:" + run, "--type", "status",
-                        "--subject", f"#{number}: Needs you after close", "--body", str(e))
+            # One message per blocked state, recorded before sending; its card write is retried on its own.
+            subject = f"#{number}: Needs you after close"
+            notice = db.execute("SELECT reason,sent,carded FROM close_notice WHERE run=? AND issue=?",
+                                (run, number)).fetchone()
+            fresh = not notice or notice[0] != str(e)
+            if fresh:
                 with db:
-                    db.execute("INSERT OR REPLACE INTO close_notice VALUES (?,?,?,0)", (run, number, str(e)))
-                notice = (str(e), 0)
+                    db.execute("INSERT OR REPLACE INTO close_notice VALUES (?,?,?,0,0)", (run, number, str(e)))
+                notice = (str(e), 0, 0)
             if not notice[1]:
+                # A send whose reply was lost may have landed: look for it before sending again.
+                landed = not fresh and any(
+                    m.get("subject") == subject and m.get("body") == str(e) for m in
+                    runtime("orchestration", "inbox", "--terminal", "run:" + run, "--limit", "10000", "--full")["messages"])
+                if not landed:
+                    runtime("orchestration", "send", *actor, "--to", "run:" + run, "--type", "status",
+                            "--subject", subject, "--body", str(e))
+                with db:
+                    db.execute("UPDATE close_notice SET sent=1 WHERE run=? AND issue=?", (run, number))
+            if not notice[2]:
                 command(*edit, stage, "--single-select-option-id", needs_you)
                 with db:
                     db.execute("UPDATE close_notice SET carded=1 WHERE run=? AND issue=?", (run, number))
@@ -1945,6 +1968,10 @@ def watch_pass(args, db, actions, errors):
             return
         # An unconfirmed restore from an earlier start is still the coordinator's account.
         prior = state.get("coordinator") or codex_active(route)
+        if prior:
+            # Owed until confirmed: the next tick restores it before another start.
+            state["coordinator"] = prior
+            save(terminal, state)
         runtime("account", "select", "--agent", route[0], "--account", account["id"])
         if runtime("account", "list")[route[0]]["activeAccountId"] != account["id"]:
             raise OrcaError("selected account changed before restart")
@@ -1971,8 +1998,6 @@ def watch_pass(args, db, actions, errors):
         except StartNotApplied as e:
             # Nothing started: the next tick restarts afresh, and the coordinator's account is restored or kept owed.
             state["pending"] = {"why": why, "crash": crash}
-            if prior:
-                state["coordinator"] = prior
             save(terminal, state)
             send_note(terminal, state)
             raise OrcaError(f"restart of {dispatch} not applied: {e}") from e

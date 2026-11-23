@@ -336,10 +336,14 @@ with TemporaryDirectory() as tmp:
     cancels = []
     cancel_fails = False
     active, selects = ["coord"], []  # the coordinator bot's Codex account
+    restore_fails = [False]
     def recovery_runtime(*argv):
         verb = argv[:2]
         operations.append(verb)
         if verb == ("account", "select"):
+            if restore_fails[0] and argv[-1] == "coord":
+                restore_fails[0] = False
+                raise tick.OrcaError("account switch refused")
             selects.append(argv[-1])
             if not preparation_failed:  # a racing selection holds the account while preparation fails
                 active[0] = argv[-1]
@@ -413,6 +417,16 @@ with TemporaryDirectory() as tmp:
                 tick.launch(db, root, codex_ticket, account, args, holds)
             check.assertEqual(db.execute("SELECT count(*) FROM starts").fetchone(), (0,))
             check.assertEqual((selects[-2:], active), (["seat", "coord"], ["coord"]))
+            # The restore fails once after a refused start: the next fill restores it without a Dispatch lookup.
+            restore_fails[0] = True
+            with check.assertRaisesRegex(tick.OrcaError, "account switch refused"):
+                tick.launch(db, root, codex_ticket, account, args, holds)
+            check.assertTrue(json.loads(db.execute("SELECT receipt FROM starts").fetchone()[0])["not_applied"])
+            operations.clear()
+            tick.fill_tick(args, db)
+            check.assertEqual(db.execute("SELECT count(*) FROM starts").fetchone(), (0,))
+            check.assertEqual((selects[-1], active), ("coord", ["coord"]))
+            check.assertNotIn(("orchestration", "dispatch-show"), operations)
             operations.clear()
             refused = False
             with check.assertRaisesRegex(tick.OrcaError, "fixture-task"):
@@ -870,6 +884,35 @@ with patch.object(tick, "green_report", return_value=sha), patch.object(tick, "w
     tick.review_step(db, "run", [], ticket, state, [recorded])
     assert card.call_args.args[1] == "Reviewing" and selects == ["seat", "coord", "seat", "coord"]
 
+# The reviewer seat's selection cannot be verified: the owed coordinator account is restored before the next try.
+ticket, state = review_fixture()
+ticket["body"] = "Reviewer: codex / gpt-6.2-astra / medium"
+active, selects, raced = ["coord"], [], [True]
+def racing_review(*args):
+    if args[:2] == ("account", "select"):
+        selects.append(args[-1])
+        active[0] = args[-1]
+        return {}
+    if args[:2] == ("account", "list"):
+        if raced[0] and active[0] == "seat":
+            raced[0] = False
+            return {"codex": {"activeAccountId": "other"}}
+        return {"codex": {"activeAccountId": active[0]}}
+    assert args[:2] == ("orchestration", "worker-start"), args
+    return full_start("reader", "pane")
+db = sqlite3.connect(":memory:")
+with patch.object(tick, "green_report", return_value=sha), patch.object(tick, "worker_settings"), \
+        patch.object(tick, "review_account", return_value={"id": "seat", "label": "review"}), \
+        patch.object(tick, "record_hold"), patch.object(pick, "coordinator", return_value=None), \
+        patch.object(pick.account_usage, "load_config", return_value={}), patch.object(tick, "review_card") as card, \
+        patch.object(tick, "runtime", side_effect=racing_review):
+    with check.assertRaisesRegex(tick.OrcaError, "reviewer account selection changed"):
+        tick.review_step(db, "run", [], ticket, state, [recorded])
+    assert tick.review_state(db, "run", 41)["coordinator"] == "coord"
+    tick.review_step(db, "run", [], ticket, state, [recorded])
+    assert selects == ["seat", "coord", "seat", "coord"] and active == ["coord"]
+    assert card.call_args.args[1] == "Reviewing"
+
 # The coordinator moves to pick.coordinator's choice when its own account is past handoff; a race is reported.
 for fresh, listed in ((None, "coord"), ({"id": "fresh"}, "fresh"), (None, "other")):
     with patch.object(pick, "coordinator", return_value=fresh) as choose, \
@@ -1162,7 +1205,7 @@ with patch.object(tick, "runtime", side_effect=ancestry), patch.object(tick, "gr
     assert sha in verify.call_args.args[1]
 
 def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncertain=False, remote_race=False,
-                  release_unknown=False, ticks=1, card_fails=False):
+                  release_unknown=False, ticks=1, card_fails=False, send_lost=False):
     root = Path(tmp)
     path = str(root / "task-tree")
     branch = "task/dev-auto/example"
@@ -1188,6 +1231,7 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
     events = []
     tree = dict(id=worktree, path=path, branch=ref, isMainWorktree=False)
     present = True
+    mailbox = []
     local_ref = sha
     remote_present = remote_race
 
@@ -1254,7 +1298,12 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
             present = False
             return {"removed": True}
         if args[:2] == ("orchestration", "send"):
+            if send_lost and not mailbox:
+                mailbox.append({"subject": args[args.index("--subject") + 1], "body": args[args.index("--body") + 1]})
+                raise tick.OrcaError("timed out")  # Orca accepted it; the reply is lost
             return {}
+        if args[:2] == ("orchestration", "inbox"):
+            return {"messages": mailbox}
         raise AssertionError(args)
 
     with sqlite3.connect(":memory:") as db, patch.object(pick, "HOLDS", holds), \
@@ -1267,7 +1316,7 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
             try:
                 tick.close_tick(args, db)
             except tick.OrcaError:
-                assert card_fails  # the card write after a sent notice failed; the next tick retries only it
+                assert card_fails or send_lost  # a later tick retries only the unconfirmed step
     assert [event[3] for event in events if event[:2] == REL] == ["ctx_merge", "ctx_review", "ctx_initial"] * ticks
     expected_holds = {"term_other", "term_reviewer"} if release_uncertain else {"term_other"}
     assert set(json.loads(holds.read_text())) == expected_holds
@@ -1288,7 +1337,8 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
 
 for scenario in ({}, {"merged": False}, {"dirty": True}, {"refused": True},
                  {"release_uncertain": True}, {"remote_race": True}, {"release_unknown": True},
-                 {"release_uncertain": True, "ticks": 2}, {"release_uncertain": True, "ticks": 3, "card_fails": True}):
+                 {"release_uncertain": True, "ticks": 2}, {"release_uncertain": True, "ticks": 3, "card_fails": True},
+                 {"release_uncertain": True, "ticks": 3, "send_lost": True}):
     with TemporaryDirectory() as tmp:
         close_fixture(tmp, **scenario)
 
@@ -1351,6 +1401,7 @@ class Fleet:
         self.lose_start = False  # Orca starts the retry, but the response is lost
         self.note_error = None
         self.select_error = None  # selecting the coordinator's account fails
+        self.stop_lost = False  # worker-stop applies, but its reply is lost
         self.active, self.fresh = "coord", None  # the coordinator bot's Codex account; pick.coordinator's choice
         self.events, self.cards, self.now = [], [], 1_795_389_500
         self.ticket = dict(number=553, item="card", agent=f"coder {model} medium @jzaw", stage="Coding")
@@ -1401,6 +1452,9 @@ class Fleet:
             return {"terminal": {"handle": self.terminal, "tail": self.screen, "source": "screen"}}
         if verb == ("orchestration", "worker-stop"):
             self.state, self.status, self.failure = "stopped", "failed", "stopped"
+            if self.stop_lost:
+                self.stop_lost = False
+                raise tick.OrcaError("timed out")
             return {"dispatchId": self.dispatch, "processAction": "closed_agent_terminal"}
         if verb == ("account", "select"):
             if self.select_error and args[-1] == "coord":
@@ -1630,6 +1684,18 @@ for restore_fails in (False, True):
         f.start_error = f.select_error = None
         calls = f.tick(1)
         assert ("orchestration", "worker-start") in calls and f.active == "coord" and len(f.notes) == 1
+
+# The worker-stop reply is lost after the worker seat is selected: the next tick restores the coordinator first.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    f.stop_lost = True
+    with check.assertRaises(tick.OrcaError):
+        f.tick()
+    assert f.active == "x2" and json.loads(dict(f.db.execute("SELECT terminal,state FROM watch"))["term_coder"])["coordinator"] == "coord"
+    calls = f.tick(1)
+    selects = [e[-1] for e in f.events if e[:2] == ("account", "select")]
+    assert selects == ["coord", "x2", "coord"] and f.active == "coord", selects
+    assert ("orchestration", "worker-start") in calls and len(f.notes) == 1
 
 # A replacement crashes before its resume note and account restore land: its successor inherits both.
 with TemporaryDirectory() as tmp:

@@ -2682,3 +2682,23 @@ with TemporaryDirectory() as home:
     finally:
         holder.stdin.close()
         holder.wait(timeout=10)
+
+# A dry run spends the remaining local ticket first and spills the next one to
+# the remote host. At the remote target another ticket must remain queued.
+with TemporaryDirectory() as tmp, ExitStack() as stack:
+    root = Path(tmp)
+    args = SimpleNamespace(repo_path=root, dry_run=True, issue=None, holds=root / "holds.json")
+    work = [dict(ticket, number=n, branch=f"task/test/{n}", paths=[str(n)]) for n in range(3)]
+    stack.enter_context(patch.object(tick, "tickets", return_value=work))
+    stack.enter_context(patch.object(tick, "command", side_effect=["git@github.com:julianthant/hr-relay.git", "",
+                                                                   "abc refs/heads/main"]))
+    stack.enter_context(patch.object(pick.account_usage, "load_config", return_value={
+        "local_target_tickets": 1, "hosts": {"Juzzark-WSL": {"target_tickets": 1}}}))
+    stack.enter_context(patch.object(pick.account_usage, "host_checkout", return_value="/remote/relay"))
+    stack.enter_context(patch.object(tick, "inventory", return_value=set()))
+    stack.enter_context(patch.object(pick, "pick", side_effect=lambda cfg, a, m, e, host, now, holds:
+                                    (dict(account, host=host), [])))
+    with redirect_stdout(io.StringIO()) as result:
+        tick.fill_tick(args, None)
+    starts = [line for line in result.getvalue().splitlines() if "would start" in line]
+    assert len(starts) == 2 and '"host": "local"' in starts[0] and '"host": "Juzzark-WSL"' in starts[1]

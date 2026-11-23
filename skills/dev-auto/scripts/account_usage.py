@@ -227,16 +227,16 @@ def orca_usage(now, host="local"):
     """Read each host once per picker snapshot, including inactive managed accounts."""
     if (now, host) in ORCA_USAGE:
         return ORCA_USAGE[now, host]
-    if host != "local":
-        result = remote_account(host, "list")
-    else:
-        try:
+    try:
+        if host != "local":
+            result = remote_account(host, "list")
+        else:
             reply = subprocess.run([ORCA, "account", "list", "--json"], capture_output=True,
                                    text=True, timeout=120, check=False)
             data = json.loads(reply.stdout) or {}
             result = (data.get("result") or {}) if data.get("ok", True) else {}
-        except (OSError, subprocess.TimeoutExpired, ValueError):
-            result = {}
+    except (OSError, subprocess.TimeoutExpired, ValueError, zlib.error):
+        result = {}
     limits = result.get("rateLimits") or {}
     readings = {}
     found = [("grok", None, limits.get("grok"))]

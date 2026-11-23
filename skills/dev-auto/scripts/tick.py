@@ -848,11 +848,19 @@ def fill_tick(args, db, *, issues=None, emit=log):
     remote_target = cfg.get("hosts", {}).get(wsl, {}).get("target_tickets", 0)
     if repo == "hr-relay" and remote_target > 0:
         targets[wsl] = remote_target
-        paths[wsl] = Path(pick.account_usage.host_checkout(wsl, repo))
 
     def scan(items):
         counts = {}
-        live = {host: inventory(path, items, repo, emit, host, counts) for host, path in paths.items()}
+        live = {"local": inventory(repo_path, items, repo, emit, "local", counts)}
+        if wsl in targets:
+            try:
+                if wsl not in paths:
+                    paths[wsl] = Path(pick.account_usage.host_checkout(wsl, repo))
+                live[wsl] = inventory(paths[wsl], items, repo, emit, wsl, counts)
+            except (OSError, ValueError, OrcaError, subprocess.TimeoutExpired) as exc:
+                emit("skip", {"host": wsl, "reason": str(exc)})
+                del targets[wsl]
+                paths.pop(wsl, None)
         return live, counts, time.time()
 
     snapshot = scan(issues)
@@ -873,7 +881,8 @@ def fill_tick(args, db, *, issues=None, emit=log):
         all_holds = json.loads(holds_path.read_text()) if holds_path.exists() else {}
         reasons = []
         now = state[2]
-        for host, handles in state[0].items():
+        for host in targets:
+            handles = state[0][host]
             planned = [h for h in extra if h["host"] == host]
             held = [h for handle, h in all_holds.items() if handle in handles and h["host"] == host]
             reserved = [rec for rec in reservations.values() if rec.get("host", "local") == host
@@ -911,8 +920,15 @@ def fill_tick(args, db, *, issues=None, emit=log):
             # Refresh GitHub, ownership and the picker immediately before committing to side effects.
             current = mark_pending([t for t in tickets(fresh=True) if t["repo"] == repo])
             latest = scan(current)
+            if host not in targets:
+                decisions[n] = "host unavailable"
+                continue
             candidate = next(fill_plan(current, lambda r, extra: seat(r, extra, latest, pending),
                                        n, owed), None)
+            if host != "local" and candidate and candidate[2] == "no seat":
+                decisions[n] = "no seat"
+                emit("skip", {"issue": n, "host": host, "reason": "no seat"})
+                continue
             if not candidate or not candidate[1] or candidate[1]["id"] != acct["id"] or candidate[1].get("host", "local") != host or any(
                 candidate[0][k] != ticket[k] for k in ("branch", "base", "route", "paths", "item")):
                 raise OrcaError(f"#{n} readiness or seat changed")

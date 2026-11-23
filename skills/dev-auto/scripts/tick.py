@@ -2415,11 +2415,16 @@ def watch_pass(args, db, actions, errors):
             errors.append({"terminal": terminal, "error": str(e)})
 
     seen_terminals, seen_tasks = set(), set()
-    for w in close_workers(run):
+    workers = list(close_workers(run))
+    task_of = {w["dispatchId"]: w["taskId"] for w in workers}
+    for w in workers:
         terminal, dispatch, task_id = w["agentTerminalHandle"], w["dispatchId"], w["taskId"]
         owner = (w.get("resource") or {}).get("ownerDispatchId")
         # worker-list is newest first: act only on the current attempt of each pane and Task.
         if not terminal or (owner and owner != dispatch):
+            # A pane handed to another Task's follow-up still makes this its Task's newest attempt.
+            if owner and task_of.get(owner) != task_id:
+                seen_tasks.add(task_id)
             continue
         # A newer attempt on a pane a follow-up took is still its Task's current one: record both first.
         history = terminal in seen_terminals or task_id in seen_tasks

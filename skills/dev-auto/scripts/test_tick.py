@@ -1704,6 +1704,7 @@ class Fleet:
         self.superseded = False
         self.task_status = "dispatched"
         self.follow_row = False
+        self.transferred = False  # the follow-up owns the current attempt's pane, which lists no older attempt
         # The follow-up's own worker in its fresh pane, listed once it exists.
         self.follow_status, self.follow_liveness = "succeeded", "exited"
         self.effort = "medium" if model else None  # a follow-up Dispatch records no model or effort
@@ -1739,7 +1740,7 @@ class Fleet:
         if verb == ("orchestration", "worker-list"):
             row = dict(dispatchId=self.dispatch, taskId="task_coder", runId="run", workerState=self.state,
                        dispatchStatus=self.status, agentTerminalHandle=self.terminal,
-                       resource={"ownerDispatchId": self.dispatch},
+                       resource={"ownerDispatchId": "ctx_follow" if self.transferred else self.dispatch},
                        projection={"host": {"kind": "local"}, "liveness": {"verdict": self.liveness}})
             # An older attempt on the same pane is history.
             old = dict(row, dispatchId="ctx_older", dispatchStatus="failed", resource={"ownerDispatchId": "ctx_older"})
@@ -1760,7 +1761,8 @@ class Fleet:
                           resource={"ownerDispatchId": "ctx_follow"},
                           projection={"host": {"kind": "local"}, "liveness": {"verdict": self.follow_liveness}})
                      ] if self.followups and self.follow_terminal and self.follow_terminal != self.terminal else []
-            return {"workers": [*fresh, *follow, *before, row, old, retried, *replaced], "page": {"hasMore": False, "nextCursor": None}}
+            olds = [] if self.transferred else [old]
+            return {"workers": [*fresh, *follow, *before, row, *olds, retried, *replaced], "page": {"hasMore": False, "nextCursor": None}}
         if verb == ("orchestration", "dispatch-show") and args[3] == "task_follow":
             current = "ctx_follow_retry" if self.follow_retried else "ctx_follow"
             return {"dispatch": {"id": current, "status": "dispatched", "taskId": None, "assigneeHandle": None}}
@@ -2370,6 +2372,13 @@ with TemporaryDirectory() as tmp:
     f = Fleet(tmp, screen=CLAUDE_WORKING)
     f.dispatch, f.terminal, f.status, f.state, f.follow_row = "ctx_restart", "term_restart", "succeeded", "succeeded", True
     calls = f.tick()
+    assert not [e for e in f.events if e[:2] in (("orchestration", "worker-show"), ("orchestration", "worker-start"))], f.events
+# Bug 5: ownership of the newest attempt's pane moved to the follow-up; the Task's older failed attempt stays history.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.dispatch, f.terminal, f.status, f.state, f.follow_row = "ctx_restart", "term_restart", "succeeded", "succeeded", True
+    f.transferred = True
+    f.tick()
     assert not [e for e in f.events if e[:2] in (("orchestration", "worker-show"), ("orchestration", "worker-start"))], f.events
 
 # Bug 6: a follow-up Dispatch records no model; its restart takes the Coder line, or a reviewer's original Dispatch.

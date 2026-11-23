@@ -1296,30 +1296,62 @@ def return_coordinator(db, number, rec):
             db.execute("UPDATE starts SET receipt=? WHERE issue=?", (json.dumps(rec), number))
 
 
+def remote_start_dispatch(run, task, host):
+    cursor = []
+    seen = set()
+    while True:
+        inventory = runtime("orchestration", "worker-list", "--run", run, "--include-remote",
+                            "--full", "--limit", "100", *cursor)
+        for worker in inventory["workers"]:
+            if worker.get("taskId") == task and worker.get("host") == host:
+                return worker["dispatchId"]
+        page = inventory["page"]
+        if not page["hasMore"]:
+            return None
+        next_cursor = page["nextCursor"]
+        if not next_cursor or next_cursor in seen:
+            raise OrcaError("incomplete Orca worker inventory")
+        seen.add(next_cursor)
+        cursor = ["--cursor", next_cursor]
+
+
+def record_remote_review(db, number, rec, worker_rpc):
+    run = rec["run"]
+    if review_state(db, run, number):
+        return
+    tree = worker_rpc("worktree", "show", "--worktree", "id:" + rec["worktree"])["worktree"]
+    if tree["id"] != rec["worktree"]:
+        raise OrcaError(f"#{number} reserved: worker worktree changed")
+    _, model, effort, advisor = rec["route"]
+    agent = f"coder {model} {effort}" + ("+advisor" if advisor else "") + " @" + rec["label"]
+    save_review(db, run, number,
+                dict(coder=rec["dispatch"], expected=rec["dispatch"], coder_terminal=rec["terminal"],
+                     path=tree["path"], model=model, agent=agent, history=[], stage="Coding"))
+
+
 def reconcile_start(db, number, rec, actor):
-    task = rec["task"]
+    task, run = rec["task"], rec["run"]
+    host = rec.get("host", "local")
+    worker_rpc = runtime
+    if host != "local":
+        import account_usage
+        worker_rpc = lambda *args: account_usage.host_orca(host, *args)
     if rec.get("dispatch"):
-        # A full start receipt confirms the launch consumed the worker's selection; no Dispatch lookup is needed.
         return_coordinator(db, number, rec)
     try:
-        lookup = runtime("orchestration", "dispatch-show", "--task", task, "--full")
-        dispatch_id = (lookup.get("dispatch") or {}).get("id")
+        if host == "local":
+            lookup = runtime("orchestration", "dispatch-show", "--task", task, "--full")
+            dispatch_id = (lookup.get("dispatch") or {}).get("id")
+        else:
+            dispatch_id = rec.get("dispatch") or remote_start_dispatch(run, task, host)
         if not dispatch_id:
             raise OrcaError("no Dispatch is visible")
-        host = rec.get("host", "local")
-        show = runtime("orchestration", "worker-show", "--dispatch", dispatch_id, "--full")
-        home = show["dispatch"]
-        if host != "local":
-            import account_usage
-            if home["id"] != dispatch_id or home["taskId"] != task or home["runId"] != rec["run"]:
-                raise OrcaError("coordinator Dispatch identity changed")
-            # The home server can return only a mirror with null worktree and terminal.
-            show = account_usage.host_orca(host, "orchestration", "worker-show", "--dispatch", dispatch_id, "--full")
+        show = worker_rpc("orchestration", "worker-show", "--dispatch", dispatch_id, "--full")
     except (OrcaError, OSError, ValueError, subprocess.TimeoutExpired) as e:
-        raise OrcaError(f"#{number} reserved: inspect Task {task} in Run {rec['run']}: {e}") from e
+        raise OrcaError(f"#{number} reserved: inspect Task {task} in Run {run}: {e}") from e
     dispatch = show["dispatch"]
     worker = show.get("worker") or {}
-    if (dispatch["id"] != dispatch_id or home["taskId"] != task or home["runId"] != rec["run"]
+    if (dispatch["id"] != dispatch_id or dispatch["taskId"] != task or dispatch["runId"] != run
             or worker.get("worktreeId") != rec["worktree"]):
         raise OrcaError(f"#{number} reserved: unverified worker for Task {task}")
     terminal = dispatch.get("assigneeHandle")
@@ -1329,19 +1361,25 @@ def reconcile_start(db, number, rec, actor):
         raise OrcaError(f"#{number} reserved: assignee changed for Dispatch {dispatch_id}")
     # The verified attempt has consumed the worker's selection; the coordinator's comes back before anything else can fail.
     return_coordinator(db, number, rec)
+    if host != "local" and not rec.get("dispatch") and terminal:
+        with db:
+            db.execute("UPDATE starts SET receipt=? WHERE issue=?",
+                       (json.dumps(dict(rec, terminal=terminal, dispatch=dispatch_id)), number))
+    rec = dict(rec, terminal=terminal, dispatch=dispatch_id)
     resource = (show.get("projection") or {}).get("resource") or {}
     released_failure = worker["state"] == "failed" and resource.get("terminalState") == "released"
     if released_failure or dispatch.get("status") == "completed":
         if terminal and (show.get("terminal") or {}).get("handle") == terminal and not released_failure:
             post_overlap_note(db, number, rec)
-            record_hold(dict(rec, terminal=terminal))
+            record_hold(rec)
+        if host != "local" and terminal and not released_failure:
+            record_remote_review(db, number, rec, worker_rpc)
         log("already settled", {"issue": number, "task": task, "dispatch": dispatch_id, "state": worker["state"]})
         with db:
             db.execute("UPDATE starts SET receipt='done' WHERE issue=?", (number,))
         return
     if not terminal:
         raise OrcaError(f"#{number} reserved: inspect {dispatch_id}, worker state {worker['state']}")
-    rec = dict(rec, terminal=terminal, dispatch=dispatch_id)
     if rec["route"][0] == "codex":
         observed_terminal = show.get("terminal") or {}
         observation = show.get("observation") or {}
@@ -1350,10 +1388,7 @@ def reconcile_start(db, number, rec, actor):
         if observed_terminal:
             if observed_terminal.get("handle") != terminal:
                 raise OrcaError(f"#{number} reserved: worker terminal identity changed")
-            import account_usage
-            host = rec.get("host", "local")
-            read = runtime if host == "local" else lambda *args: account_usage.host_orca(host, *args)
-            tail = read("terminal", "read", "--terminal", terminal, "--screen")["terminal"]["tail"]
+            tail = worker_rpc("terminal", "read", "--terminal", terminal, "--screen")["terminal"]["tail"]
             prompt = codex_prompt(tail)
         if not observed_terminal and "agentWait" not in observation:
             raise OrcaError(f"#{number} reserved: no Codex startup observation for {dispatch_id}")
@@ -1379,6 +1414,8 @@ def reconcile_start(db, number, rec, actor):
     if worker["state"] != "ready":
         raise OrcaError(f"#{number} reserved: inspect {dispatch_id}, worker state {worker['state']}")
     post_overlap_note(db, number, rec)
+    if host != "local":
+        record_remote_review(db, number, rec, worker_rpc)
     record_start(db, number, rec)
     log("started", {"issue": number, "dispatch": dispatch_id})
 
@@ -1990,6 +2027,8 @@ def close_workers(run):
     while True:
         inventory = runtime("orchestration", "worker-list", "--run", run, "--full", "--limit", "100", *cursor)
         for worker in inventory["workers"]:
+            if worker.get("host") not in (None, "local"):
+                continue
             if worker["runId"] != run:
                 raise OrcaError("worker-list returned a different Run")
             if worker["projection"]["host"]["kind"] == "local":

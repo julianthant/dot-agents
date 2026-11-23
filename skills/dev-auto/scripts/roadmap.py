@@ -116,11 +116,12 @@ def render():
         state = json.loads(STATE.read_text())
     except (OSError, ValueError):
         state = {}
-    changed, now = changes(state) | set(state.get("pending", [])), time.time()
+    changed, now = changes(state), time.time()
+    fresh = "issues" in changed or state.get("refresh_owed", False)  # a refused refresh is retried, alone
     try:
-        snap, state["pending"] = tick.snapshot("issues" in changed), []  # unchanged, it still refetches once a minute
+        snap, state["refresh_owed"] = tick.snapshot(fresh), False  # unchanged, it still refetches once a minute
     except REFUSED:
-        snap, state["pending"] = json.loads(tick.SNAPSHOT.read_text()), sorted(changed & {"issues"})
+        snap, state["refresh_owed"] = json.loads(tick.SNAPSHOT.read_text()), fresh
     if changed or "pipeline" not in state or not 0 <= now - state.get("built", 0) < tick.SNAPSHOT_SECONDS:
         state.update(pipeline(), built=now)
     STATE.parent.mkdir(parents=True, exist_ok=True)

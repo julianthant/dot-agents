@@ -156,18 +156,21 @@ class Roadmap(unittest.TestCase):
 
     def test_a_refused_refresh_stays_pending_until_it_succeeds(self):
         self.warm()
+        built = []
+        rebuild = patch.object(roadmap, "pipeline", side_effect=lambda: built.append(1) or GITHUB)
         calls, snapshot = self.fetches(fail=True)
-        with snapshot, patch.object(roadmap, "pipeline", return_value=GITHUB):
+        with snapshot, rebuild:
             self.issues((1, "2026-11-23T13:05:00Z"))
             rows = roadmap.render()["issues"]
             self.replies.clear()
             roadmap.render()  # every poll 304: the failed refresh is still owed
         self.assertEqual((calls, len(rows)), ([True, True], 2))
         calls, snapshot = self.fetches()
-        with snapshot, patch.object(roadmap, "pipeline", return_value=GITHUB):
+        with snapshot, rebuild:
             roadmap.render()
             roadmap.render()
         self.assertEqual(calls, [True, False])
+        self.assertEqual(len(built), 1)  # only the real change rebuilt the pipeline; retries reuse the cache
 
     def test_pr_or_run_changes_and_the_minute_rebuild_the_pipeline_only(self):
         built = []

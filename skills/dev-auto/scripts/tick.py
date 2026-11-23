@@ -889,11 +889,13 @@ def launch(db, repo_path, t, acct, args, holds_path):
                 runtime("orchestration", "task-update", *actor, "--id", task, "--status", "failed", "--result", "cancelled")
             except (OSError, OrcaError, ValueError, subprocess.TimeoutExpired) as cancel_error:
                 left = f"; inspect uncancelled Task {task} ({cancel_error})"
+        tree = f"rolled back worktree {wt['path']}"
         try:
             remove_prelaunch_tree(repo_path, wt, existing_refs, settings_change)
         except (OSError, OrcaError, subprocess.TimeoutExpired) as cleanup_error:
             log("prelaunch cleanup", {"issue": number, "worktree": wt["path"], "reason": str(cleanup_error)})
-        raise OrcaError(f"#{number}: {e}{left}; prepared worktree {wt['path']}") from e
+            tree = f"inspect prepared worktree {wt['path']}"
+        raise OrcaError(f"#{number}: {e}{left}; {tree}") from e
     try:
         started = runtime("orchestration", "worker-start", *actor, "--task", task, "--worktree", "path:" + str(path),
                           "--agent", route[0], "--model", route[1], "--effort", route[2], "--keep-open", "--full")
@@ -1373,7 +1375,6 @@ def review_step(db, run, actor, ticket, initial, messages):
                          "--agent", route[0], "--model", route[1], "--effort", route[2],
                          "--task-title", state["review_title"], "--spec", spec, "--full")
         dispatch, terminal = start_identity(result)
-        restore_coordinator(prior)
         state["hold"]["terminal"] = terminal
         assign_reviewer(state, dispatch, terminal, state["hold"])
         state.pop("review_title")
@@ -1392,6 +1393,8 @@ def review_step(db, run, actor, ticket, initial, messages):
     state.update(stage=stage, publish=True)
     save_review(db, run, number, state)
     publish_review(db, run, ticket, state)
+    if account:
+        restore_coordinator(prior)
 
 
 def review_tick(args, db):

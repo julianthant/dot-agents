@@ -5,7 +5,7 @@ description: >-
   the review loop that clears a local commit before any push. The reviewer is a second session of
   the kind the ticket's Reviewer line names; coder and reviewer each run in their own Orca terminal
   in the ticket's worktree. Not for a one-off review of a diff (review) or for opening and landing
-  the PR (ship).
+  the PR (ship-pr).
 metadata:
   exposed: "true"
 ---
@@ -14,7 +14,7 @@ metadata:
 
 One coder, one reviewer, one ticket. The reviewer is a second session of the kind the ticket's
 `Reviewer` line names, in its own terminal in the ticket's worktree; never a third agent on the
-ticket. The coder runs `ship`; its `review` step, and `interrogate` on hard work, is this loop.
+ticket. The coder runs `ship-pr`; its `review` step, and `interrogate` on hard work, is this loop.
 
 ## Rules
 
@@ -37,7 +37,7 @@ Coder:
    end your turn. The supervisor wakes you when a verdict lands.
 2. On `REVIEW VERDICT: FIX`, fix each finding or answer it on the ticket with evidence, then go
    back to step 1.
-3. On `REVIEW VERDICT: PUSH <sha>`, run `done-check`, then merge exactly that SHA into the feature branch as `ship`'s PR rules say. With `Feature branch: none`, record the PR title and body on the ticket and complete it with `finish_work`; the orchestrator pushes and opens the PR, so do not wait for it.
+3. On `REVIEW VERDICT: PUSH <sha>`, run `done-check`, then merge exactly that SHA into the feature branch as `ship-pr`'s PR rules say. With `Feature branch: none`, record the PR title and body on the ticket and complete it with `finish_work`; the orchestrator pushes and opens the PR, so do not wait for it.
 
 Reviewer:
 

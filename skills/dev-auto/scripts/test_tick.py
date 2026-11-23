@@ -865,6 +865,16 @@ with patch.object(tick, "tickets", return_value=[ticket]), patch.object(tick, "s
     assert step.call_args.args[-1] == [recorded] and step.call_args.args[-2]["expected"] == "coder"
     assert cli.call_args_list[0].args == ("orchestration", "inbox", "--terminal", "run:run", "--limit", "10000", "--full")
 
+# An explicit coder that reports to another Run fails loudly instead of exiting quietly.
+args = SimpleNamespace(issue=41, coder="ctx_elsewhere", run=None, anchor=None)
+with patch.object(tick, "tickets", return_value=[ticket]), patch.object(tick, "supervisor", return_value=([], "run")), \
+        patch.object(tick, "review_step") as step, patch.object(tick, "runtime") as cli:
+    cli.side_effect = [{"messages": [recorded]}, {"tasks": []},
+                       {"dispatch": {"id": "ctx_elsewhere", "runId": "run_other", "taskId": "task"}}]
+    with check.assertRaisesRegex(tick.OrcaError, "ctx_elsewhere belongs to Run run_other, not the bound Run run"):
+        tick.review_tick(args, sqlite3.connect(":memory:"))
+    step.assert_not_called()
+
 # A partial Project write resumes on restart without a second follow-up.
 ticket, state = review_fixture()
 db = sqlite3.connect(":memory:")

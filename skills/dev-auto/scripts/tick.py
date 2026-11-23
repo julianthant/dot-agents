@@ -1426,9 +1426,15 @@ def review_tick(args, db):
                     dispatch = runtime("orchestration", "dispatch-show", "--task", ids[0], "--full")["dispatch"]["id"]
                 else:
                     raise OrcaError("multiple coder Tasks; select the intended Dispatch with --issue and --coder")
-                if not review_mail(messages, dispatch):
+                if not review_mail(messages, dispatch) and not args.coder:
                     continue
                 show = runtime("orchestration", "worker-show", "--dispatch", dispatch, "--full")
+                if args.coder and show["dispatch"]["runId"] != run:
+                    raise OrcaError(f"coder Dispatch {dispatch} belongs to Run {show['dispatch']['runId']}, "
+                                    f"not the bound Run {run}")
+                if not review_mail(messages, dispatch):
+                    log("review", {"issue": number, "waiting": f"no succeeded report from {dispatch}"})
+                    continue
                 worker = show["worker"]
                 if (show["dispatch"]["id"] != dispatch or show["dispatch"]["runId"] != run or
                         (not args.coder and show["dispatch"]["taskId"] != ids[0])):

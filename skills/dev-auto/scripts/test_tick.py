@@ -636,6 +636,9 @@ check.assertEqual(tick.owned_paths("Owned paths: Edit `scripts/dev.py` and `docs
                   ["scripts/dev.py", "docs/how.md", "config/app.json"])
 check.assertEqual(tick.owned_paths("Owned paths: src, docs, scripts/setup.py."), ["src", "docs", "scripts/setup.py"])
 check.assertIn(".github/workflows", tick.owned_paths("Owned paths: Development/checks workflows, CI plan and focused tests."))
+# Bug 7: prose "test"/"tests" is no path, or every ticket overlaps the whole tests tree.
+check.assertEqual(tick.owned_paths("Owned paths: `src/a.ts` and its tests; focused test updates."), ["src/a.ts"])
+check.assertEqual(tick.owned_paths("Owned paths: src/a.ts, tests"), ["src/a.ts", "tests"])  # a listed path still counts
 
 with TemporaryDirectory() as tmp:
     import tomllib

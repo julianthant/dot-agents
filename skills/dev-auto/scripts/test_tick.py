@@ -847,9 +847,10 @@ RM_OPEN = [rm_issue(10, "OPEN", "2026-11-23T09:00:00Z", "area / older", cards=[r
         rm_issue(12, "OPEN", "2026-11-23T09:30:00Z", "feature", kind="Feature", kids=3, done=1)]
 RM_CLOSED = [rm_issue(3, "CLOSED", "2026-11-22T08:00:00Z", "done one", reason="COMPLETED", cards=[rm_card("Done", None, None, "Tick")]),
           rm_issue(4, "CLOSED", "2026-11-22T07:00:00Z", "dropped", reason="NOT_PLANNED", kind=None)]
-RM_ROLL = [{"conclusion": "SUCCESS"}, {"status": "IN_PROGRESS", "conclusion": ""}]
-RM_PR = lambda n, roll: {"number": n, "title": f"pr {n}", "headRefName": f"task/a/{n}", "autoMergeRequest": None if n % 2 else {},
-                         "statusCheckRollup": roll, "isDraft": False, "closingIssuesReferences": [{"number": 11}], "updatedAt": "2026-11-23T09:00:00Z"}
+RM_PR = lambda n, state: {"number": n, "title": f"pr {n}", "headRefName": f"task/a/{n}", "autoMergeRequest": None if n % 2 else {},
+                          "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": state}}}]}, "isDraft": False,
+                          "closingIssuesReferences": {"nodes": [{"number": 11, "repository": {"nameWithOwner": "julianthant/hr-relay"}}]},
+                          "updatedAt": "2026-11-23T09:00:00Z"}
 def rm_answer(args):
     """The recorded gh reply for one command line, for both the old and the moved script."""
     a = " ".join(args)
@@ -857,8 +858,9 @@ def rm_answer(args):
         return {"id": "proj"}
     if args[:2] == ["project", "field-list"]:
         return {"fields": [{"name": "Status", "options": [{"name": "Todo"}]}, {"name": "Area", "options": [{"name": "Tick"}, {"name": "Roadmap"}]}]}
-    if args[:2] == ["pr", "list"]:
-        return [RM_PR(21, RM_ROLL), RM_PR(22, [{"conclusion": "FAILURE"}])] if "development" in args else [RM_PR(30, [{"conclusion": "SUCCESS"}])]
+    if args[:2] == ["api", "graphql"]:
+        return {"data": {"relay": {"dev": {"nodes": [RM_PR(21, "PENDING"), RM_PR(22, "FAILURE")]},
+                                   "staging": {"nodes": [RM_PR(30, "SUCCESS")]}}, "agents": {"task": {"nodes": []}}}}
     if args[:2] == ["release", "list"]:
         return [{"tagName": "v1.2.0", "publishedAt": "2026-11-20T12:00:00Z"}]
     if "search/issues" in args:

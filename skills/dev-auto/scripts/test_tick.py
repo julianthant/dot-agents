@@ -337,9 +337,13 @@ with TemporaryDirectory() as tmp:
     cancel_fails = False
     active, selects = ["coord"], []  # the coordinator bot's Codex account
     restore_fails = [False]
+    task_fails = [False]
     def recovery_runtime(*argv):
         verb = argv[:2]
         operations.append(verb)
+        if verb == ("orchestration", "task-create") and task_fails[0]:
+            task_fails[0] = False
+            raise tick.OrcaError("task store down")
         if verb == ("account", "select"):
             if restore_fails[0] and argv[-1] == "coord":
                 restore_fails[0] = False
@@ -427,6 +431,17 @@ with TemporaryDirectory() as tmp:
             check.assertEqual(db.execute("SELECT count(*) FROM starts").fetchone(), (0,))
             check.assertEqual((selects[-1], active), ("coord", ["coord"]))
             check.assertNotIn(("orchestration", "dispatch-show"), operations)
+            # Task creation and the restore both fail: the restore was owed before the selection, so the next fill
+            # gives the coordinator its account back without a Task or Dispatch.
+            task_fails[0] = restore_fails[0] = True
+            with check.assertRaisesRegex(tick.OrcaError, "task store down; restore the coordinator's Codex account coord"):
+                tick.launch(db, root, codex_ticket, account, args, holds)
+            check.assertEqual(active, ["seat"])
+            check.assertEqual(json.loads(db.execute("SELECT receipt FROM starts").fetchone()[0]),
+                              {"not_applied": True, "coordinator": "coord"})
+            tick.fill_tick(args, db)
+            check.assertEqual(db.execute("SELECT count(*) FROM starts").fetchone(), (0,))
+            check.assertEqual((selects[-1], active), ("coord", ["coord"]))
             operations.clear()
             refused = False
             with check.assertRaisesRegex(tick.OrcaError, "fixture-task"):
@@ -563,6 +578,39 @@ with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory
     start.assert_called_once()
     check.assertEqual(picker.call_args.kwargs["holds"][0]["account"], "held")
     check.assertEqual(db.execute("SELECT issue FROM starts").fetchall(), [(40,)])
+
+# A Codex start whose reply was lost still owes the coordinator's account: no other Codex selection in the
+# same pass can record the worker's seat as the coordinator's. A Claude start does not touch that account.
+with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory:") as db:
+    root = Path(tmp)
+    first = dict(ticket, number=60, branch="task/a/first", paths=["src/first"], route=base["route"])
+    second = dict(ticket, number=61, branch="task/a/second", paths=["src/second"], route=base["route"])
+    claude = dict(ticket, number=62, branch="task/a/claude", paths=["src/claude"])
+    args = SimpleNamespace(repo_path=root, dry_run=False, issue=None, holds=root / "holds.json")
+    def lost(db, repo, t, acct, args, holds):
+        if t["number"] == 60:
+            tick.reserve(db, 60, dict(task="t60", run="own", coordinator="coord"))
+            raise tick.OrcaError("timed out")
+    stack.enter_context(patch.object(tick, "command", git))
+    stack.enter_context(patch.object(tick, "tickets", side_effect=lambda: [dict(t) for t in (first, second, claude)]))
+    stack.enter_context(patch.object(tick, "inventory", return_value=set()))
+    stack.enter_context(patch.object(pick.account_usage, "load_config", return_value={}))
+    stack.enter_context(patch.object(pick, "pick", return_value=(account, [])))
+    start = stack.enter_context(patch.object(tick, "launch", side_effect=lost))
+    output = stack.enter_context(redirect_stdout(io.StringIO()))
+    tick.fill_tick(args, db)
+    check.assertEqual([c.args[2]["number"] for c in start.call_args_list], [60, 62])
+    check.assertIn("coordinator restore still owed by ['starts:60']", output.getvalue())
+
+# A full start receipt confirms the launch: the coordinator is restored even when dispatch-show is unavailable.
+with sqlite3.connect(":memory:") as db, patch.object(tick, "restore_coordinator") as restore, \
+        patch.object(tick, "runtime", side_effect=tick.OrcaError("Orca busy")):
+    rec = dict(task="t", run="run", dispatch="d", terminal="term", coordinator="coord")
+    tick.reserve(db, 63, rec)
+    with check.assertRaisesRegex(tick.OrcaError, "Orca busy"):
+        tick.reconcile_start(db, 63, dict(rec), [])
+    restore.assert_called_once_with("coord")
+    check.assertNotIn("coordinator", json.loads(db.execute("SELECT receipt FROM starts").fetchone()[0]))
 
 # Release is its own operation and only clears the inspected pending issue, giving the coordinator its account back.
 with TemporaryDirectory() as tmp, patch.object(Path, "home", return_value=Path(tmp)), patch.object(tick, "fill_tick") as fill, \
@@ -804,6 +852,21 @@ with patch.object(tick, "green_report", return_value=sha), patch.object(tick, "w
                        full_start("reader", "pane"), {}, {"codex": {"activeAccountId": "coord"}}]
     tick.review_step(sqlite3.connect(":memory:"), "run", [], ticket, state, [recorded])
     assert [c.args[-1] for c in cli.call_args_list if c.args[:2] == ("account", "select")] == ["seat", "coord"]
+
+# A watch restart still owes the coordinator's account: the Codex reviewer waits, and the report is read again later.
+ticket, state = review_fixture()
+ticket["body"] = "Reviewer: codex / gpt-6.2-astra / medium"
+db = sqlite3.connect(":memory:")
+db.execute("CREATE TABLE watch (run TEXT, terminal TEXT, state TEXT, PRIMARY KEY(run,terminal))")
+db.execute("INSERT INTO watch VALUES ('run','pane',?)", (json.dumps({"coordinator": "coord"}),))
+with patch.object(tick, "green_report", return_value=sha), patch.object(tick, "review_account") as seat_pick, \
+        patch.object(tick, "review_card") as card, patch.object(tick, "runtime") as cli, redirect_stdout(io.StringIO()) as out:
+    tick.review_step(db, "run", [], ticket, state, [recorded])
+    cli.assert_not_called()
+    seat_pick.assert_not_called()
+    card.assert_not_called()
+    assert "coordinator restore still owed by ['watch:pane']" in out.getvalue()
+    assert not db.execute("SELECT * FROM review_mail").fetchall()
 
 # The coordinator gets its account back even when the reviewer's card write fails, or when a lost start is adopted.
 for lose_start in (False, True):
@@ -1696,6 +1759,17 @@ with TemporaryDirectory() as tmp:
     selects = [e[-1] for e in f.events if e[:2] == ("account", "select")]
     assert selects == ["coord", "x2", "coord"] and f.active == "coord", selects
     assert ("orchestration", "worker-start") in calls and len(f.notes) == 1
+
+# A fill start still owes the coordinator's account: the restart waits on its seat instead of recording that seat.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    tick.reserve(f.db, 70, {"not_applied": True, "coordinator": "coord"})
+    calls = f.tick()
+    assert ("account", "select") not in calls and ("orchestration", "worker-start") not in calls
+    assert "waiting for coordinator restore" in f.lines[0] and "starts:70" in f.lines[0]
+    f.db.execute("DELETE FROM starts")
+    calls = f.tick(1)
+    assert ("orchestration", "worker-start") in calls and f.active == "coord"
 
 # A replacement crashes before its resume note and account restore land: its successor inherits both.
 with TemporaryDirectory() as tmp:

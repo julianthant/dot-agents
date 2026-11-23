@@ -677,6 +677,10 @@ def fill_tick(args, db):
     count = 0
     for ticket, acct in fill_plan(issues, seat, args.issue):
         route, n = ticket["route"], ticket["number"]
+        owed = route[0] == "codex" and db and owed_restores(db)
+        if owed:
+            log("skip", {"issue": n, "reason": f"coordinator restore still owed by {sorted(owed)}"})
+            continue
         log("would start" if args.dry_run else "start", dict(issue=n, repo=repo, branch=ticket["branch"],
             base=ticket["base"], agent=route[0], model=route[1], effort=route[2], advisor=route[3], account=acct["label"]))
         if not args.dry_run:
@@ -840,6 +844,23 @@ def codex_active(route):
     return runtime("account", "list")["codex"]["activeAccountId"] if route[0] == "codex" else None
 
 
+def owed_restores(db):
+    """Coordinator Codex accounts that fill, review or watch records still owe. While one is owed the active
+    Codex account may be a worker seat, so another Codex selection would record that seat as the coordinator's."""
+    owed = {}
+    for table, key, value in (("starts", "issue", "receipt"), ("reviews", "issue", "state"), ("watch", "terminal", "state")):
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE name=?", (table,)).fetchone():
+            continue
+        for k, raw in db.execute(f"SELECT {key},{value} FROM {table}"):
+            try:
+                rec = json.loads(raw or "null")
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and rec.get("coordinator"):
+                owed[table + ":" + str(k)] = rec["coordinator"]
+    return owed
+
+
 def restore_coordinator(prior):
     """After a confirmed Codex start, give the coordinator bot its account back, or a fresher one."""
     import pick
@@ -865,6 +886,7 @@ def launch(db, repo_path, t, acct, args, holds_path):
                  "--branch", branch, "--base-branch", t["base"], "--no-parent", "--setup", "skip")["worktree"]
     path = Path(wt["path"])
     settings_change = task = prior = None
+    reserved = False
     try:
         actual_branch = command("git", "-C", str(path), "branch", "--show-current").strip()
         if wt["branch"].removeprefix("refs/heads/") != branch or actual_branch != branch:
@@ -873,6 +895,9 @@ def launch(db, repo_path, t, acct, args, holds_path):
             raise OrcaError("created worktree has a different base commit")
         settings_change = worker_settings(path, route)
         prior = codex_active(route)
+        # Owed before the selection: if this start fails and its restore too, the next fill restores it.
+        reserve(db, number, dict(not_applied=True, coordinator=prior))
+        reserved = True
         runtime("account", "select", "--agent", route[0], "--account", acct["id"])
         task = runtime("orchestration", "task-create", *actor, "--task-title", f"#{number} coder",
                        "--spec", spec, "--full")["task"]["id"]
@@ -883,7 +908,8 @@ def launch(db, repo_path, t, acct, args, holds_path):
                    route=route, project=project, item=t["item"], fields=fields, time=int(time.time()),
                    holds=str(holds_path), waiting_field=waiting_field, coordinator=prior)
         # The fill lock covers preparation. A durable Task identity precedes the only start call.
-        reserve(db, number, rec)
+        with db:
+            db.execute("UPDATE starts SET receipt=? WHERE issue=?", (json.dumps(rec), number))
     except Exception as e:
         left = ""
         if task:
@@ -899,8 +925,15 @@ def launch(db, repo_path, t, acct, args, holds_path):
             tree = f"inspect prepared worktree {wt['path']}"
         try:
             restore_coordinator(prior)
+            if reserved:
+                with db:
+                    db.execute("DELETE FROM starts WHERE issue=?", (number,))
         except (OSError, OrcaError, ValueError, KeyError, subprocess.TimeoutExpired) as restore_error:
             left += f"; restore the coordinator's Codex account {prior} ({restore_error})"
+            if reserved:
+                with db:
+                    db.execute("UPDATE starts SET receipt=? WHERE issue=?",
+                               (json.dumps(dict(not_applied=True, coordinator=prior)), number))
         raise OrcaError(f"#{number}: {e}{left}; {tree}") from e
     try:
         started = runtime("orchestration", "worker-start", *actor, "--task", task, "--worktree", "path:" + str(path),
@@ -940,8 +973,19 @@ def codex_prompt(tail):
     return None
 
 
+def return_coordinator(db, number, rec):
+    if rec.get("coordinator"):
+        restore_coordinator(rec["coordinator"])
+        rec.pop("coordinator")
+        with db:
+            db.execute("UPDATE starts SET receipt=? WHERE issue=?", (json.dumps(rec), number))
+
+
 def reconcile_start(db, number, rec, actor):
     task = rec["task"]
+    if rec.get("dispatch"):
+        # A full start receipt confirms the launch consumed the worker's selection; no Dispatch lookup is needed.
+        return_coordinator(db, number, rec)
     try:
         lookup = runtime("orchestration", "dispatch-show", "--task", task, "--full")
         dispatch_id = (lookup.get("dispatch") or {}).get("id")
@@ -961,11 +1005,7 @@ def reconcile_start(db, number, rec, actor):
     if rec.get("terminal") and rec["terminal"] != terminal:
         raise OrcaError(f"#{number} reserved: assignee changed for Dispatch {dispatch_id}")
     # The verified attempt has consumed the worker's selection; the coordinator's comes back before anything else can fail.
-    if rec.get("coordinator"):
-        restore_coordinator(rec["coordinator"])
-        rec.pop("coordinator")
-        with db:
-            db.execute("UPDATE starts SET receipt=? WHERE issue=?", (json.dumps(rec), number))
+    return_coordinator(db, number, rec)
     resource = (show.get("projection") or {}).get("resource") or {}
     released_failure = worker["state"] == "failed" and resource.get("terminalState") == "released"
     if released_failure or dispatch.get("status") == "completed":
@@ -1391,6 +1431,10 @@ def review_step(db, run, actor, ticket, initial, messages):
                               and re.search(r"(?i)\bTier:\s*UI,?\s+multi-step\b", ticket["body"]))
                 if route[1] == state["model"] and not ui_advisor:
                     raise OrcaError("reviewer must use a different model from the coder")
+                owed = route[0] == "codex" and set(owed_restores(db)) - {f"reviews:{number}"}
+                if owed:
+                    log("review", {"issue": number, "waiting": f"coordinator restore still owed by {sorted(owed)}"})
+                    return
                 account = review_account(route)
                 worker_settings(Path(state["path"]), route)
                 prior = state.get("coordinator") or codex_active(route)
@@ -1965,6 +2009,10 @@ def watch_pass(args, db, actions, errors):
         account, reasons = pick.pick(seats, *route, "local", now)
         if account is None:
             actions.append({"issue": number, "dispatch": dispatch, "waiting for seat": reasons})
+            return
+        owed = route[0] == "codex" and set(owed_restores(db)) - {"watch:" + terminal}
+        if owed:
+            actions.append({"issue": number, "dispatch": dispatch, "waiting for coordinator restore": sorted(owed)})
             return
         # An unconfirmed restore from an earlier start is still the coordinator's account.
         prior = state.get("coordinator") or codex_active(route)

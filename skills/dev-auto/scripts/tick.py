@@ -2141,9 +2141,8 @@ def watch_pass(args, db, actions, errors):
         return "Reviewing" if "review" in title else "Coding"
 
     def followup_route(show, ticket, title):
-        """A follow-up Dispatch records no model: use the ticket's Coder line, else the Dispatch it follows."""
-        if "review" not in title and ticket and ticket.get("route"):
-            return tuple(ticket["route"][:3])
+        """A follow-up Dispatch records no model: its original's route, or the Coder line once that proves a coder."""
+        coder = ticket and ticket.get("route") and tuple(ticket["route"][:3])
         d = show["dispatch"]
         for _ in range(10):
             if not d.get("followUpOf"):
@@ -2152,8 +2151,12 @@ def watch_pass(args, db, actions, errors):
             effective = (((prev.get("worker") or {}).get("startOptions") or {}).get("launch") or {}).get("effective") or {}
             route = tuple(effective.get(k) for k in ("agent", "model", "effort"))
             if None not in route:
-                return route
+                # A resume Task is titled "#N: resume"; the original's own Task says which role it is.
+                original = (tasks.get(prev["dispatch"].get("taskId")) or {}).get("task_title") or ""
+                return route if "review" in original or not coder else coder
             d = prev["dispatch"]
+        if "review" not in title and coder:
+            return coder
         raise OrcaError(f"no agent, model and effort recorded for Dispatch {show['dispatch']['id']} or its originals")
 
     def restart(w, show, state, why, crash):

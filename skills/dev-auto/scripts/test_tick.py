@@ -1272,7 +1272,7 @@ with patch.object(tick, "runtime", side_effect=ancestry), patch.object(tick, "gr
     assert sha in verify.call_args.args[1]
 
 def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncertain=False, remote_race=False,
-                  release_unknown=False, ticks=1, card_fails=False, send_lost=False, rewritten=False):
+                  release_unknown=False, ticks=1, card_fails=False, send_lost=False, rewritten=False, legacy=False):
     root = Path(tmp)
     path = str(root / "task-tree")
     branch = "task/dev-auto/example"
@@ -1367,7 +1367,9 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
         if args[:2] == ("orchestration", "send"):
             if send_lost and not mailbox:
                 # Orca may rewrite the body in transit; the subject arrives as sent.
-                mailbox.append({"subject": args[args.index("--subject") + 1],
+                subject = args[args.index("--subject") + 1]
+                # A notice sent before the upgrade carried no digest in its subject.
+                mailbox.append({"subject": subject.rpartition(" (")[0] if legacy else subject,
                                 "body": "[redacted]" if rewritten else args[args.index("--body") + 1]})
                 raise tick.OrcaError("timed out")  # Orca accepted it; the reply is lost
             return {}
@@ -1408,7 +1410,8 @@ for scenario in ({}, {"merged": False}, {"dirty": True}, {"refused": True},
                  {"release_uncertain": True}, {"remote_race": True}, {"release_unknown": True},
                  {"release_uncertain": True, "ticks": 2}, {"release_uncertain": True, "ticks": 3, "card_fails": True},
                  {"release_uncertain": True, "ticks": 3, "send_lost": True},
-                 {"release_uncertain": True, "ticks": 3, "send_lost": True, "rewritten": True}):
+                 {"release_uncertain": True, "ticks": 3, "send_lost": True, "rewritten": True},
+                 {"release_uncertain": True, "ticks": 3, "send_lost": True, "legacy": True}):
     with TemporaryDirectory() as tmp:
         close_fixture(tmp, **scenario)
 
@@ -1479,6 +1482,7 @@ class Fleet:
         self.notes = []
         self.followups = []  # Tasks Orca created for mail to a settled Dispatch
         self.note_lost = False  # the settled-worker send applies, but its reply is lost
+        self.follow_retried = False  # Orca retried the follow-up Task; its newest attempt has no followUpOf
         self.tickets_error = None
         self.db = sqlite3.connect(":memory:")
 
@@ -1507,7 +1511,11 @@ class Fleet:
                         ] if self.dispatch == "ctx_restart" else []
             return {"workers": [*before, row, old, retried, *replaced], "page": {"hasMore": False, "nextCursor": None}}
         if verb == ("orchestration", "dispatch-show") and args[3] == "task_follow":
-            return {"dispatch": {"id": "ctx_follow", "status": "dispatched", "taskId": None, "assigneeHandle": None}}
+            current = "ctx_follow_retry" if self.follow_retried else "ctx_follow"
+            return {"dispatch": {"id": current, "status": "dispatched", "taskId": None, "assigneeHandle": None}}
+        if verb == ("orchestration", "worker-show") and args[3] == "ctx_follow_retry":
+            return {"dispatch": {"id": "ctx_follow_retry", "runId": "run", "taskId": "task_follow",
+                                 "retryOfDispatchId": "ctx_follow", "followUpOf": None}}
         if verb == ("orchestration", "worker-show") and args[3] == "ctx_follow":
             return {"dispatch": {"id": "ctx_follow", "runId": "run", "taskId": "task_follow", "followUpOf": "ctx_restart"}}
         if verb == ("orchestration", "dispatch-show"):
@@ -1723,40 +1731,55 @@ with TemporaryDirectory() as tmp:
     assert not f.db.execute("SELECT * FROM watch").fetchall() and len(f.notes) == 1
 
 # The settled-worker send applies but its reply is lost: the next tick adopts the follow-up Orca started instead of
-# sending again. With no review state yet, the follow-up is recorded for review's first discovery.
-with TemporaryDirectory() as tmp:
-    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
-    f.note_error = tick.OrcaError("mailbox busy")
-    with check.assertRaises(tick.OrcaError):
-        f.tick()
-    f.status, f.state, f.liveness = "completed", "succeeded", "exited"
-    f.note_error, f.note_lost = None, True
-    with check.assertRaisesRegex(tick.OrcaError, "watch error"):
+# sending again, even after Orca retried that Task. With no review state yet, the follow-up is recorded for review's
+# first discovery.
+for retried, current in ((False, "ctx_follow"), (True, "ctx_follow_retry")):
+    with TemporaryDirectory() as tmp:
+        f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+        f.follow_retried = retried
+        f.note_error = tick.OrcaError("mailbox busy")
+        with check.assertRaises(tick.OrcaError):
+            f.tick()
+        f.status, f.state, f.liveness = "completed", "succeeded", "exited"
+        f.note_error, f.note_lost = None, True
+        with check.assertRaisesRegex(tick.OrcaError, "watch error"):
+            f.tick(1)
+        assert len(f.followups) == 1 and json.loads(dict(f.db.execute("SELECT terminal,state FROM watch"))["term_restart"])["note"]["sending"]
         f.tick(1)
-    assert len(f.followups) == 1 and json.loads(dict(f.db.execute("SELECT terminal,state FROM watch"))["term_restart"])["note"]["sending"]
-    f.tick(1)
-    assert len(f.followups) == 1 and len(f.notes) == 1 and "followed up" in f.lines[0]
-    assert f.db.execute("SELECT run,issue,dispatch FROM followups").fetchall() == [("run", 553, "ctx_follow")]
-    assert f.cards[-1] == ("Coding", "coder gpt-6.2-astra medium @x2")
+        assert len(f.followups) == 1 and len(f.notes) == 1 and "followed up" in f.lines[0]
+        assert f.db.execute("SELECT run,issue,dispatch FROM followups").fetchall() == [("run", 553, current)]
+        assert f.cards[-1] == ("Coding", "coder gpt-6.2-astra medium @x2")
 
-# Review's first discovery reads the recorded follow-up's report, not the predecessor's.
-args = SimpleNamespace(issue=41, coder=None, run=None, anchor=None)
-ticket, state = review_fixture()
-ticket.update(agent=state["agent"], stage="Coding")
-db = sqlite3.connect(":memory:")
-db.execute("CREATE TABLE followups (run TEXT, issue INTEGER, dispatch TEXT, PRIMARY KEY(run,issue))")
-db.execute("INSERT INTO followups VALUES ('run', 41, 'follow')")
-followed_report = report("follow", f"I pushed {sha}.", msg_id="follow-report")
-with patch.object(tick, "tickets", return_value=[ticket]), patch.object(tick, "supervisor", return_value=([], "run")), \
-        patch.object(tick, "command", return_value="https://github.com/julianthant/hr-relay.git\n"), \
-        patch.object(tick, "review_step") as step, patch.object(tick, "runtime") as cli:
-    cli.side_effect = [{"messages": [followed_report]}, {"tasks": [{"title": "#41 coder", "id": "task"}]},
-                       {"dispatch": {"id": "coder"}},
-                       {"dispatch": {"id": "follow", "runId": "run", "taskId": "task_follow", "followUpOf": "coder"},
-                        "worker": {"worktreeId": "tree", "startOptions": {"launch": {"effective": {"model": "gpt-6.2-sol"}}}}},
-                       {"worktree": {"id": "tree", "path": "/fixture", "branch": "refs/heads/task/ui/header"}}]
-    tick.review_tick(args, db)
-    assert step.call_args.args[-2]["expected"] == "follow" and step.call_args.args[-1] == [followed_report]
+# Review's first discovery reads the recorded follow-up's report, not the predecessor's, and follows a retry of
+# the follow-up Task to its current attempt.
+for current in ("follow", "follow_retry"):
+    args = SimpleNamespace(issue=41, coder=None, run=None, anchor=None)
+    ticket, state = review_fixture()
+    ticket.update(agent=state["agent"], stage="Coding")
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE followups (run TEXT, issue INTEGER, dispatch TEXT, PRIMARY KEY(run,issue))")
+    db.execute("INSERT INTO followups VALUES ('run', 41, 'follow')")
+    followed_report = report(current, f"I pushed {sha}.", msg_id="follow-report")
+    attempts = {"coder": {"id": "coder", "runId": "run", "taskId": "task"},
+                "follow": {"id": "follow", "runId": "run", "taskId": "task_follow", "followUpOf": "coder"},
+                "follow_retry": {"id": "follow_retry", "runId": "run", "taskId": "task_follow", "retryOfDispatchId": "follow"}}
+    def discovery(*argv, current=current, attempts=attempts, followed_report=followed_report):
+        if argv[:2] == ("orchestration", "inbox"):
+            return {"messages": [followed_report]}
+        if argv[:2] == ("orchestration", "task-list"):
+            return {"tasks": [{"title": "#41 coder", "id": "task"}]}
+        if argv[:2] == ("orchestration", "dispatch-show"):
+            return {"dispatch": {"id": {"task": "coder", "task_follow": current}[argv[3]]}}
+        if argv[:2] == ("orchestration", "worker-show"):
+            return {"dispatch": attempts[argv[3]],
+                    "worker": {"worktreeId": "tree", "startOptions": {"launch": {"effective": {"model": "gpt-6.2-sol"}}}}}
+        assert argv[:2] == ("worktree", "show"), argv
+        return {"worktree": {"id": "tree", "path": "/fixture", "branch": "refs/heads/task/ui/header"}}
+    with patch.object(tick, "tickets", return_value=[ticket]), patch.object(tick, "supervisor", return_value=([], "run")), \
+            patch.object(tick, "command", return_value="https://github.com/julianthant/hr-relay.git\n"), \
+            patch.object(tick, "review_step") as step, patch.object(tick, "runtime", discovery):
+        tick.review_tick(args, db)
+        assert step.call_args.args[-2]["expected"] == current and step.call_args.args[-1] == [followed_report]
 
 # A replacement that reports while its resume note is undelivered waits; review acts once delivery is confirmed.
 ticket, state = review_fixture()

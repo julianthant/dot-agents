@@ -1544,7 +1544,10 @@ def review_tick(args, db):
                         row = db.execute("SELECT dispatch FROM followups WHERE run=? AND issue=?", (run, number)).fetchone()
                         # Watch sent a resume note to the settled coder: its follow-up Dispatch is the current coder.
                         if row:
-                            followed, first, dispatch = row[0], dispatch, row[0]
+                            # Its Task may have retried since: read the current attempt, validated below.
+                            task = runtime("orchestration", "worker-show", "--dispatch", row[0], "--full")["dispatch"]["taskId"]
+                            current = runtime("orchestration", "dispatch-show", "--task", task, "--full")["dispatch"]["id"]
+                            followed, first, dispatch = row[0], dispatch, current
                 else:
                     raise OrcaError("multiple coder Tasks; select the intended Dispatch with --issue and --coder")
                 if not review_mail(messages, dispatch):
@@ -1555,7 +1558,7 @@ def review_tick(args, db):
                 worker = show["worker"]
                 if (show["dispatch"]["id"] != dispatch or show["dispatch"]["runId"] != run or
                         (not args.coder and show["dispatch"]["taskId"] != ids[0]
-                         and not (followed and in_coder_chain(show["dispatch"].get("followUpOf"), first, run)))):
+                         and not (followed and in_coder_chain(dispatch, first, run)))):
                     raise OrcaError("coder Dispatch identity changed")
                 tree = runtime("worktree", "show", "--worktree", "id:" + worker["worktreeId"])["worktree"]
                 remote = command("git", "-C", tree["path"], "remote", "get-url", "origin").strip()
@@ -1850,7 +1853,9 @@ def close_tick(args, db):
             if not notice[1]:
                 # A send whose reply was lost may have landed: look for it before sending again.
                 landed = not fresh and any(
-                    m.get("subject") == subject for m in
+                    m.get("subject") == subject
+                    # A notice recorded before subjects carried the digest went out under the old subject.
+                    or (m.get("subject") == f"#{number}: Needs you after close" and m.get("body") == str(e)) for m in
                     runtime("orchestration", "inbox", "--terminal", "run:" + run, "--limit", "10000", "--full")["messages"])
                 if not landed:
                     runtime("orchestration", "send", *actor, "--to", "run:" + run, "--type", "status",
@@ -2127,7 +2132,9 @@ def watch_pass(args, db, actions, errors):
             if not new:
                 continue
             attempt = runtime("orchestration", "worker-show", "--dispatch", new, "--full")["dispatch"]
-            if attempt["id"] == new and attempt["runId"] == run and attempt.get("followUpOf") == note["to"]:
+            # The Task's current attempt may be a retry of the follow-up; its lineage must still reach the note's target.
+            if (attempt["id"] == new and attempt["runId"] == run and attempt["taskId"] == task["id"] and new != note["to"]
+                    and in_coder_chain(attempt.get("retryOfDispatchId") or attempt.get("followUpOf"), note["to"], run)):
                 return {"delivery": "follow_up", "followUpOf": note["to"], "dispatchId": new}
         return None
 

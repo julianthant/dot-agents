@@ -1562,10 +1562,14 @@ with TemporaryDirectory() as tmp:
         f.tick()
     assert f.active == "x2" and len(f.notes) == 1 and f.cards[-1][0] == "Coding"
     assert json.loads(dict(f.db.execute("SELECT terminal,state FROM watch"))["term_restart"])["coordinator"] == "coord"
+    f.status, f.state, f.liveness = "completed", "succeeded", "exited"  # the replacement settles first
+    with check.assertRaises(tick.OrcaError):
+        f.tick(1)
     f.select_error = None
     f.tick(1)
     assert f.active == "coord" and len(f.notes) == 1
-    assert "coordinator" not in json.loads(dict(f.db.execute("SELECT terminal,state FROM watch"))["term_restart"])
+    f.tick(1)
+    assert not f.db.execute("SELECT * FROM watch").fetchall()
 
 
 class FailingWatchInsert:

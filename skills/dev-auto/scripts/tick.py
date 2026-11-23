@@ -2101,8 +2101,9 @@ def watch_pass(args, db, actions, errors):
                     continue
                 if w["dispatchStatus"] != "failed" or reported or stopped:
                     restore_prompt(ticket, state, title)  # answered, then finished before this tick
-                    # Finished, reported or stopped; an undelivered resume note or card target is kept until sent.
-                    save(terminal, state if state.get("note") or state.get("card") else None)
+                    # Finished, reported or stopped; an unconfirmed restore, resume note or card target is kept.
+                    keep = state.get("coordinator") or state.get("note") or state.get("card")
+                    save(terminal, state if keep else None)
                     continue
                 exited = True
             if exited:

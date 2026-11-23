@@ -587,7 +587,7 @@ with TemporaryDirectory() as temp, ExitStack() as stack:
               patch.object(tick, "inventory", side_effect=scan), redirect_stdout(io.StringIO()) as output):
             tick.fill_tick(args, None)
         start.assert_called_once()
-        assert start.call_args.args[1] == root and start.call_args.args[3] == account
+        assert start.call_args.args[1] == root.resolve() and start.call_args.args[3] == account
         assert host in output.getvalue() and "unavailable" in output.getvalue()
 
 

@@ -925,6 +925,7 @@ def fill_tick(args, db, *, issues=None, emit=log):
                 continue
             candidate = next(fill_plan(current, lambda r, extra: seat(r, extra, latest, pending),
                                        n, owed), None)
+            # A failed WSL usage refresh can hide its seat while the Mac can still take other tickets.
             if host != "local" and candidate and candidate[2] == "no seat":
                 decisions[n] = "no seat"
                 emit("skip", {"issue": n, "host": host, "reason": "no seat"})

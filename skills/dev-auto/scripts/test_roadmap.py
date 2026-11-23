@@ -55,6 +55,7 @@ class Roadmap(unittest.TestCase):
                                              "open": [issue(1, "Queued"), issue(2, None)], "closed": []}))
         tick.PROJECT_CACHE.write_text(json.dumps({"id": "proj", "fields": FIELDS}))
         self.replies, self.sent = {}, []
+        self.prs = None
         # Any GitHub read outside the conditional polls fails the test unless it expects one.
         self.reads = []
         for target, name in ((tick, "command"), (roadmap, "gh")):
@@ -67,11 +68,16 @@ class Roadmap(unittest.TestCase):
         p = patch.object(roadmap, "readiness", return_value={})
         p.start()
         self.addCleanup(p.stop)
+        p = patch.object(roadmap, "pull_requests", side_effect=lambda: self.prs)
+        p.start()
+        self.addCleanup(p.stop)
 
     def answer(self, a):
         raise AssertionError(f"unexpected GitHub read {a}")
 
     def gh_api(self, argv, **kw):
+        if argv[0] == "git":
+            return subprocess.CompletedProcess(argv, 0, getattr(self, "heads", ""), "")
         self.sent.append(argv)
         name = next((k for k, url in roadmap.POLLS.items() if argv[-1].startswith(url.split("?")[0] + "?")), argv[-1])
         reply = self.replies.get(name) or R304.format(tag=name)
@@ -159,7 +165,7 @@ class Roadmap(unittest.TestCase):
         self.assertEqual(roadmap.render()["tick"], status)
         self.assertEqual(self.reads, [])
 
-    def live_rows(self, worker, *, task_status="dispatched", stage="Coding", sha=None):
+    def local_worker(self, worker, *, stage="Coding", sha=None):
         self.warm()
         with sqlite3.connect(tick.SNAPSHOT.with_name("starts.sqlite")) as db:
             db.execute("CREATE TABLE reviews (run TEXT, issue INTEGER, state TEXT)")
@@ -175,10 +181,13 @@ class Roadmap(unittest.TestCase):
             if args[:2] == ("orchestration", "worker-list"):
                 return {"workers": [worker], "page": {"hasMore": False}}
             if args[:2] == ("orchestration", "task-list"):
-                return {"tasks": [{"id": "task_coder", "task_title": "#1 coder", "status": task_status}]}
+                return {"tasks": [{"id": "task_coder", "task_title": "#1 coder", "dispatch_id": "ctx_coder"}]}
             raise AssertionError(args)
 
-        with patch.object(tick, "runtime", side_effect=orca):
+        return patch.object(tick, "runtime", side_effect=orca)
+
+    def live_rows(self, worker):
+        with self.local_worker(worker):
             return [r["now"] for r in roadmap.render()["issues"]]
 
     def test_a_stopped_worker_overrides_a_coding_card(self):
@@ -192,14 +201,9 @@ class Roadmap(unittest.TestCase):
         self.assertEqual(live["who"], [{"role": "coder", "model": "gpt-6.2-sol", "host": "WSL"}])
 
     def test_prompt_and_operator_question_need_you_without_changing_stage(self):
-        for worker, task_status in (
-            ({"projection": {"stage": {"activity": "waiting_for_user"},
-                              "attention": {"categories": ["permission_prompt"], "requiresAction": True}}},
-             "dispatched"),
-            ({}, "waiting_for_input"),
-        ):
-            with self.subTest(task_status=task_status):
-                live, _ = self.live_rows(worker, task_status=task_status)
+        for reason in ("approval", "input"):
+            with self.subTest(reason=reason):
+                live, _ = self.live_rows({"projection": {"attention": {"categories": [reason], "requiresAction": True}}})
                 self.assertEqual((live["stage"], live["status"]), (0, "needs you"))
                 tick.SNAPSHOT.with_name("starts.sqlite").unlink()
 
@@ -210,6 +214,20 @@ class Roadmap(unittest.TestCase):
         roadmap.STATE.write_text(json.dumps(state))
         live = roadmap.render()["issues"][1]["now"]
         self.assertEqual((live["stage"], live["status"], live["who"]), (3, "PR checks failing", []))
+
+    def test_task_ci_uses_only_the_pushed_head_and_updates_on_the_existing_run_poll(self):
+        self.heads = "new refs/heads/task/lane/1\n"
+        run = {"head_branch": "task/lane/1", "head_sha": "old", "event": "push",
+               "status": "completed", "conclusion": "success"}
+        self.runs(run)
+        with self.local_worker({"dispatchStatus": "completed", "workerState": "succeeded"}, stage="Reviewing", sha="old"):
+            live = roadmap.render()["issues"][0]["now"]
+            self.assertEqual((live["stage"], live["status"]), (1, "waiting for CI"))
+            self.runs(dict(run, head_sha="new", conclusion="failure"), run)
+            live = roadmap.render()["issues"][0]["now"]
+            self.assertEqual((live["stage"], live["status"], live["warning"]), (1, "CI failed", True))
+            self.replies.clear()
+            self.assertEqual(roadmap.render()["issues"][0]["now"], live)
 
     def test_a_close_time_edit_reaches_the_cached_closed_card(self):
         snap = json.loads(tick.SNAPSHOT.read_text())
@@ -232,7 +250,7 @@ class Roadmap(unittest.TestCase):
         self.warm()
         roadmap.render()
         roadmap.render()
-        self.assertEqual(len(self.sent), 6)
+        self.assertEqual(len(self.sent), 4)
         for argv in self.sent:
             self.assertIn("-H", argv)
             self.assertTrue(argv[argv.index("-H") + 1].startswith("If-None-Match: "))
@@ -264,7 +282,7 @@ class Roadmap(unittest.TestCase):
         self.assertEqual(calls, [False, False])  # the overlap repeats a known update: nothing changed
         self.assertNotIn("-H", self.sent[0])  # only the first poll of the new window is unconditional
         self.assertNotIn(f"since={SINCE}", self.sent[0][-1])
-        self.assertIn('If-None-Match: W/"moved"', self.sent[3])
+        self.assertIn('If-None-Match: W/"moved"', self.sent[2])
         self.assertEqual(self.reads, [])
 
     def test_a_refused_refresh_stays_pending_until_it_succeeds(self):
@@ -309,10 +327,10 @@ class Roadmap(unittest.TestCase):
             roadmap.render()
             self.assertEqual(rebuild.call_count, 1)
             self.replies.clear()
-            self.replies["pulls"] = R200.format(tag="p2", body="[]")
+            self.prs = {"devPrs": [{"n": 7, "head": "task/example", "issues": [], "checks": "running"}]}
             roadmap.render()
             self.assertEqual(rebuild.call_count, 2)
-            self.replies.clear()
+            self.prs["devPrs"][0]["checks"] = "failing"
             roadmap.render()
             self.assertEqual(rebuild.call_count, 2)
             self.warm(built=time.time() - 61)
@@ -343,8 +361,8 @@ class Roadmap(unittest.TestCase):
         self.assertEqual(first["pipeline"]["devAheadOfMain"], 9)
         self.assertEqual(first["milestones"], ["Staging cut"])
         self.assertEqual((second["pipeline"], second["milestones"]), (first["pipeline"], first["milestones"]))
-        self.assertEqual([a[-1] for a in self.sent[3:]], [f"repos/{roadmap.REPO}/{path}" for path in endpoints])
-        self.assertTrue(all('If-None-Match: W/"cached"' in a for a in self.sent[3:]))
+        self.assertEqual([a[-1] for a in self.sent[2:]], [f"repos/{roadmap.REPO}/{path}" for path in endpoints])
+        self.assertTrue(all('If-None-Match: W/"cached"' in a for a in self.sent[2:]))
 
 
 if __name__ == "__main__":

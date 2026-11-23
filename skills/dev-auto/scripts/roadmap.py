@@ -3,12 +3,12 @@ and the newest closed ones, and the release pipeline.
 
   roadmap.py > data.json   (launchd runs it every 15 seconds)
 
-Issues come from tick.py's shared snapshot, which the tick also writes its own card edits into. Each run polls
-issues, PRs and development full runs with REST conditional requests (a 304 costs no quota). A run change
-updates its card from the poll, while an issue or PR change, or a minute passing, refreshes the pipeline.
+Issues come from tick.py's shared snapshot. Each rebuild polls issues and Development runs conditionally,
+reads PR check rollups in one batch and joins current workers to the tick's local review records.
 """
 import datetime
 from argparse import Namespace
+from contextlib import closing
 import json
 from pathlib import Path
 import re
@@ -20,7 +20,25 @@ import time
 import tick
 
 REPO = "julianthant/hr-relay"
-PRF = "number,title,headRefName,autoMergeRequest,statusCheckRollup,isDraft,closingIssuesReferences,updatedAt"
+RUN = "run_c95eee175345"
+PR_FIELDS = """
+  nodes {
+    number title headRefName autoMergeRequest { enabledAt } isDraft updatedAt
+    closingIssuesReferences(first: 20) { nodes { number repository { nameWithOwner } } }
+    commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+  }
+"""
+PR_QUERY = """
+query {
+  relay: repository(owner: "julianthant", name: "hr-relay") {
+    dev: pullRequests(first: 50, baseRefName: "development", states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {%s}
+    staging: pullRequests(first: 5, baseRefName: "staging", states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {%s}
+  }
+  agents: repository(owner: "julianthant", name: "dot-agents") {
+    task: pullRequests(first: 50, baseRefName: "main", states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {%s}
+  }
+}
+""" % (PR_FIELDS, PR_FIELDS, PR_FIELDS)
 
 
 def gh(*a):
@@ -48,11 +66,24 @@ def row(n):
         status=v("status"), agent=v("stage"), area=v("area"))
 
 
-def checks(roll):
-    st = [(c.get("conclusion") or c.get("status") or "").upper() for c in roll or []]
-    if any(x in ("FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED") for x in st):
-        return "failing"
-    return "running" if any(x in ("IN_PROGRESS", "QUEUED", "PENDING", "") for x in st) else "green"
+def pull_requests():
+    result = ghq("api", "graphql", "-f", f"query={PR_QUERY}")
+    if not result or result.get("errors"):
+        return None
+
+    def pr(p):
+        commit = p["commits"]["nodes"]
+        rollup = (commit[0]["commit"]["statusCheckRollup"] or {}) if commit else {}
+        checks = {"SUCCESS": "green", "ERROR": "failing", "FAILURE": "failing"}.get(rollup.get("state"), "running")
+        return dict(n=p["number"], t=p["title"], head=p["headRefName"], auto=p["autoMergeRequest"] is not None,
+                    draft=p["isDraft"], checks=checks, updated=p["updatedAt"],
+                    issues=[i["number"] for i in p["closingIssuesReferences"]["nodes"]
+                            if i and i["repository"]["nameWithOwner"] == REPO])
+
+    data = result["data"]
+    return {"devPrs": [pr(p) for p in data["relay"]["dev"]["nodes"]],
+            "stagingPr": [pr(p) for p in data["relay"]["staging"]["nodes"]],
+            "agentPrs": [pr(p) for p in data["agents"]["task"]["nodes"] if p["headRefName"].startswith("task/")]}
 
 
 REFUSED = (tick.OrcaError, OSError, ValueError, KeyError, subprocess.TimeoutExpired)
@@ -68,8 +99,7 @@ def last_snapshot(fresh=False):
 
 STATE = tick.SNAPSHOT.with_name("roadmap.json")
 POLLS = {"issues": f"repos/{REPO}/issues?state=all&sort=updated&direction=desc&per_page=100&since={{since}}",
-         "pulls": f"repos/{REPO}/pulls?state=all&sort=updated&direction=desc&per_page=10",
-         "runs": f"repos/{REPO}/actions/workflows/{tick.FULL_RUN_WORKFLOW}/runs?branch={tick.FULL_RUN_BRANCH}&per_page=10"}
+         "runs": f"repos/{REPO}/actions/workflows/{tick.FULL_RUN_WORKFLOW}/runs?per_page=100"}
 
 
 def poll(url, etag):
@@ -86,7 +116,7 @@ ANCHOR_SECONDS = 600  # the issue poll's since= moves this rarely, so its ETag s
 
 
 def changes(state):
-    """Changes to issues and PRs, and the newest full run from a changed Actions response.
+    """Changes to issues, and full and task runs from the same Actions response.
 
     Issues compare (number, updated_at) after since=, so two updates in the same second still differ, and a
     moved since= overlaps the old window by a minute, so its first unconditional reply compares cleanly too."""
@@ -107,14 +137,18 @@ def changes(state):
                 state["seen"] = seen
                 if seen != before:
                     changed.add(name)
-            elif name == "runs":
-                run = next((r for r in json.loads(body)["workflow_runs"] if r["head_branch"] == tick.FULL_RUN_BRANCH
+            else:
+                runs = json.loads(body)["workflow_runs"]
+                latest = {}
+                for r in runs:
+                    if r["event"] == "push" and r["head_branch"].startswith("task/"):
+                        latest.setdefault(r["head_branch"], {k: r[k] for k in ("head_sha", "status", "conclusion")})
+                state["task_runs"] = {**state.get("task_runs", {}), **latest}
+                run = next((r for r in runs if r["head_branch"] == tick.FULL_RUN_BRANCH
                             and r["event"] in ("schedule", "workflow_dispatch")), None)
                 if run:
                     full_run = dict(status=run["status"], conclusion=run["conclusion"], createdAt=run["created_at"],
                                     headSha=run["head_sha"], url=run["html_url"])
-            else:
-                changed.add(name)
             tags[name] = tag
         except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
             pass  # an unreadable poll counts as unchanged; the once-a-minute refresh still runs
@@ -128,6 +162,13 @@ def render():
     except (OSError, ValueError):
         state = {}
     changed, full_run = changes(state)
+    prs = pull_requests()
+    if prs is not None:
+        # Check-only changes update each row without rebuilding the release counters.
+        old = state.get("pipeline", {})
+        identity = lambda rows: [(p["n"], p.get("updated")) for p in rows]
+        if any(identity(prs.get(k, [])) != identity(old.get(k, [])) for k in ("devPrs", "stagingPr")):
+            changed.add("pulls")
     now = time.time()
     fresh = "issues" in changed or state.get("refresh_owed", False)  # a refused refresh is retried, alone
     try:
@@ -136,6 +177,8 @@ def render():
         snap, state["refresh_owed"] = json.loads(tick.SNAPSHOT.read_text()), fresh
     if changed or "pipeline" not in state or not 0 <= now - state.get("built", 0) < tick.SNAPSHOT_SECONDS:
         state.update(pipeline(state), built=now)
+    if prs is not None:
+        state["pipeline"].update(prs)
     if full_run is not None:
         state["pipeline"] = {**state["pipeline"], "fullRun": full_run}
     STATE.parent.mkdir(parents=True, exist_ok=True)
@@ -147,7 +190,7 @@ def render():
     except REFUSED as e:
         print(f"roadmap readiness: {e}", file=sys.stderr)
         decisions = {}
-    return build(snap, state, decisions)
+    return build(snap, state, decisions, now_rows(snap, state))
 
 
 def readiness(snap):
@@ -165,10 +208,153 @@ def readiness(snap):
     return decisions
 
 
-def build(snap, github=None, decisions=None):
+def live_workers(numbers):
+    path = tick.SNAPSHOT.with_name("starts.sqlite")
+    if not path.is_file():
+        return {}, {}
+    reviews = {}
+    try:
+        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=1)) as db:
+            if db.execute("SELECT 1 FROM sqlite_master WHERE name='reviews'").fetchone():
+                reviews = {n: json.loads(s) for n, s in db.execute("SELECT issue,state FROM reviews WHERE run=?", (RUN,))
+                           if n in numbers}
+    except (sqlite3.Error, ValueError) as e:
+        print(f"roadmap reviews: {e}", file=sys.stderr)
+
+    try:
+        workers = {w["dispatchId"]: w for w in tick.fleet_workers(RUN)}
+    except REFUSED as e:
+        print(f"roadmap workers: {e}", file=sys.stderr)
+        return reviews, {}
+
+    # Fleet summaries identify paired workers but omit the activity and attention projection.
+    for host in {tick.worker_host(w) for w in workers.values() if w.get("dispatchStatus") == "dispatched"
+                 and not w.get("projection")} - {"local"}:
+        try:
+            remote = tick.runtime("orchestration", "worker-list", "--run", RUN, "--on", host, "--full", "--limit", "100")
+            for w in remote["workers"]:
+                if w["dispatchId"] in workers:
+                    workers[w["dispatchId"]]["projection"] = w.get("projection")
+        except REFUSED as e:
+            print(f"roadmap paired workers: {e}", file=sys.stderr)
+
+    current = {}
+    try:
+        tasks = tick.runtime("orchestration", "task-list", "--run", RUN, "--full")["tasks"]
+        for t in tasks:
+            w = workers.get(t.get("dispatch_id"))
+            if not w or w.get("dispatchStatus") != "dispatched":
+                continue
+            title = t.get("task_title") or ""
+            match = re.search(r"#(\d+)", title) or re.search(r"hr-relay ?#(\d+)", t.get("spec") or "")
+            if match and (n := int(match[1])) in numbers:
+                role = "reviewer" if re.match(r"^#\d+ reviewer\b", title) else "coder"
+                current.setdefault((n, role), w)
+    except REFUSED as e:
+        print(f"roadmap tasks: {e}", file=sys.stderr)
+
+    for n, s in reviews.items():
+        for role, dispatch in (("coder", s.get("coder")), ("reviewer", (s.get("reviewer") or {}).get("dispatch"))):
+            w = workers.get(dispatch)
+            if w and (w.get("dispatchStatus") == "dispatched" or (n, role) not in current):
+                current[n, role] = w
+    return reviews, current
+
+
+def worker_status(worker):
+    projection = worker.get("projection") or {}
+    if worker.get("workerState") in ("failed", "stopped", "abandoned") or worker.get("dispatchStatus") == "failed":
+        return "stopped"
+    if worker.get("dispatchStatus") == "completed":
+        return "finished"
+    if projection.get("liveness", {}).get("verdict") == "exited":
+        return "stopped"
+    attention = (projection.get("attention") or {}).get("categories", [])
+    activity = (projection.get("stage") or {}).get("activity")
+    if {"input", "approval"}.intersection(attention) or activity == "waiting":
+        return "needs you"
+    return "working" if activity == "working" else "worker state unavailable"
+
+
+def branch_heads(tickets):
+    heads = {}
+    for name in {t["repo"] for t in tickets if t["branch"]}:
+        try:
+            refs = subprocess.run(["git", "ls-remote", "--heads", f"https://github.com/julianthant/{name}.git", "refs/heads/task/*"],
+                                  check=True, capture_output=True, text=True, timeout=4).stdout
+            for line in refs.splitlines():
+                sha, ref = line.split()
+                heads[name, ref.removeprefix("refs/heads/")] = sha
+        except (OSError, ValueError, subprocess.SubprocessError) as e:
+            print(f"roadmap {name} task heads: {e}", file=sys.stderr)
+    return heads
+
+
+def now_rows(snap, state):
+    tickets = [t for t in tick.tickets(rows=snap["open"]) if t["kind"] in ("Task", "Bug")]
+    reviews, workers = live_workers({t["number"] for t in tickets})
+    heads = branch_heads(tickets)
+    pipeline = state["pipeline"]
+    pr_groups = {"hr-relay": pipeline.get("devPrs", []), "dot-agents": pipeline.get("agentPrs", [])}
+    rows = {}
+    for t in tickets:
+        n, repo, branch = t["number"], t["repo"], t["branch"]
+        review = reviews.get(n, {})
+        reviewed, phase = review.get("sha"), review.get("stage")
+        pr = next((p for p in pr_groups[repo] if n in p["issues"] or p["head"] == branch), None)
+        coder, reviewer = workers.get((n, "coder")), workers.get((n, "reviewer"))
+        head = heads.get((repo, branch))
+        if not (pr or review or coder or reviewer or head):
+            continue
+
+        active = lambda w: w and w.get("dispatchStatus") == "dispatched"
+        named = ("reviewer", "coder") if phase == "Reviewing" else ("coder", "reviewer")
+        candidates = [(role, workers[n, role]) for role in named if (n, role) in workers]
+        current = [pair for pair in candidates if active(pair[1])] or candidates[:1]
+        who = []
+        for role, worker in current:
+            projection = worker.get("projection") or {}
+            host = tick.worker_host(worker)
+            who.append(dict(role=role, host={"local": "Mac", "Juzzark-WSL": "WSL"}.get(host, host),
+                            model=(projection.get("provider") or {}).get("model") or (review.get("model") if role == "coder" else None)))
+        statuses = [worker_status(worker) for _, worker in current]
+        status = "needs you" if phase == "Needs you" or "needs you" in statuses else next(iter(statuses), "no worker")
+        warning = status in ("stopped", "worker state unavailable")
+
+        run = state.get("task_runs", {}).get(branch) if repo == "hr-relay" else None
+        if pr:
+            stage = 3
+            if pr["checks"] == "failing":
+                warning = True
+                status = "PR checks failing" if status not in ("needs you", "stopped") else status + " · PR checks failing"
+            elif status in ("finished", "no worker"):
+                status = "PR checks running" if pr["checks"] == "running" else "PR checks green"
+        elif head and head == reviewed and phase == "Merging":
+            stage = 3
+            if status in ("finished", "no worker"):
+                status = "waiting for PR"
+        elif head and run and run["head_sha"] == head and run["status"] == "completed" and run["conclusion"] == "success":
+            stage = 0 if phase == "Fixing" and reviewed == head else 2
+            if stage == 2 and status in ("finished", "no worker"):
+                status = "waiting for review"
+        elif head and not (phase == "Fixing" and reviewed == head and status == "working"):
+            stage = 1
+            if run and run["head_sha"] == head and run["status"] == "completed":
+                warning = True
+                status = "CI failed" if status not in ("stopped", "needs you") else status + " · CI failed"
+            elif status in ("finished", "no worker"):
+                status = "CI running" if run and run["head_sha"] == head else "waiting for CI"
+        else:
+            stage = 0
+        rows[n] = dict(stage=stage, status=status, who=who, warning=warning, pr={**pr, "repo": repo} if pr else None)
+    return rows
+
+
+def build(snap, github=None, decisions=None, live=None):
     issues = sorted(snap["open"], key=lambda n: n["updatedAt"], reverse=True) + snap["closed"]
     rows = [row(n) for n in issues]
     for r in rows:
+        r["now"] = (live or {}).get(r["n"])
         if decisions is not None and r["open"] and r["type"] in ("Task", "Bug"):
             reason = decisions.get(r["n"], "readiness unavailable")
             r.update(ready=reason is None, holdReason=reason)
@@ -204,12 +390,7 @@ def cached_rest(cache, endpoint, select, default=None):
 
 def pipeline(state=None):
     """The release pipeline and the open milestones, read from GitHub."""
-    dev_prs = [dict(n=p["number"], t=p["title"], head=p["headRefName"], auto=p["autoMergeRequest"] is not None,
-                    draft=p["isDraft"], checks=checks(p["statusCheckRollup"]),
-                    issues=[i["number"] for i in p["closingIssuesReferences"]], updated=p["updatedAt"])
-               for p in ghq("pr", "list", "--repo", REPO, "--base", "development", "--state", "open", "--limit", "50",
-                            "--json", PRF) or []]
-    stg = ghq("pr", "list", "--repo", REPO, "--base", "staging", "--state", "open", "--limit", "5", "--json", PRF) or []
+    previous = state.get("pipeline", {}) if state is not None else pull_requests() or {}
     def api(path, select, default=None):
         endpoint = f"repos/{REPO}/{path}"
         if state is not None:
@@ -238,9 +419,9 @@ def pipeline(state=None):
     merged = ghq("api", "-X", "GET", "search/issues", "-f", "per_page=1", "-f",
                  f"q=repo:{REPO} is:pr is:merged base:development merged:>{(since or '2026-01-01')[:10]}")
     cuts = api("git/matching-refs/heads/cut/", lambda rows: [r["ref"].removeprefix("refs/heads/") for r in rows], [])
-    stages = dict(devPrs=dev_prs, mergedSinceRelease=(merged or {}).get("total_count", 0),
+    stages = dict(devPrs=previous.get("devPrs", []), stagingPr=previous.get("stagingPr", []),
+                    agentPrs=previous.get("agentPrs", []), mergedSinceRelease=(merged or {}).get("total_count", 0),
                     devAheadOfStaging=compare("staging"), devAheadOfMain=compare("main"),
-                    stagingPr=[dict(n=p["number"], head=p["headRefName"], checks=checks(p["statusCheckRollup"])) for p in stg],
                     release=release, cuts=cuts, fullRun=full_run)
     milestones = api("milestones?state=open&per_page=50", lambda rows: [m["title"] for m in rows], [])
     return {"pipeline": stages, "milestones": milestones}

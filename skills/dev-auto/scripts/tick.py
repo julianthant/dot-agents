@@ -833,6 +833,22 @@ def start_identity(receipt):
     return receipt["dispatchId"], terminals[0]
 
 
+def codex_active(route):
+    """The Codex account the coordinator bot runs on, read before a Codex worker start selects its own."""
+    return runtime("account", "list")["codex"]["activeAccountId"] if route[0] == "codex" else None
+
+
+def restore_coordinator(prior):
+    """After a confirmed Codex start, give the coordinator bot its account back, or a fresher one."""
+    import pick
+    if not prior:
+        return
+    target = (pick.coordinator(pick.account_usage.load_config(), "local", time.time(), prior) or {}).get("id") or prior
+    runtime("account", "select", "--agent", "codex", "--account", target)
+    if runtime("account", "list")["codex"]["activeAccountId"] != target:
+        raise OrcaError("coordinator account selection changed")
+
+
 def launch(db, repo_path, t, acct, args, holds_path):
     project, fields, waiting_field = project_fields()
     number, route = t["number"], t["route"]
@@ -854,6 +870,7 @@ def launch(db, repo_path, t, acct, args, holds_path):
         if command("git", "-C", str(path), "rev-parse", "HEAD").strip() != t["sha"]:
             raise OrcaError("created worktree has a different base commit")
         settings_change = worker_settings(path, route)
+        prior = codex_active(route)
         runtime("account", "select", "--agent", route[0], "--account", acct["id"])
         task = runtime("orchestration", "task-create", *actor, "--task-title", f"#{number} coder",
                        "--spec", spec, "--full")["task"]["id"]
@@ -890,6 +907,7 @@ def launch(db, repo_path, t, acct, args, holds_path):
     except (OrcaError, OSError, ValueError, subprocess.TimeoutExpired) as e:
         log("start receipt unavailable", {"issue": number, "task": task, "reason": str(e)})
     reconcile_start(db, number, rec, actor)
+    restore_coordinator(prior)
 
 
 def codex_prompt(tail):
@@ -1321,6 +1339,7 @@ def review_step(db, run, actor, ticket, initial, messages):
                     raise OrcaError("reviewer must use a different model from the coder")
                 account = review_account(route)
                 worker_settings(Path(state["path"]), route)
+                prior = codex_active(route)
                 runtime("account", "select", "--agent", route[0], "--account", account["id"])
                 if runtime("account", "list")[route[0]]["activeAccountId"] != account["id"]:
                     raise OrcaError("reviewer account selection changed")
@@ -1354,6 +1373,7 @@ def review_step(db, run, actor, ticket, initial, messages):
                          "--agent", route[0], "--model", route[1], "--effort", route[2],
                          "--task-title", state["review_title"], "--spec", spec, "--full")
         dispatch, terminal = start_identity(result)
+        restore_coordinator(prior)
         state["hold"]["terminal"] = terminal
         assign_reviewer(state, dispatch, terminal, state["hold"])
         state.pop("review_title")
@@ -1841,6 +1861,7 @@ def watch_pass(args, db, actions, errors):
         if account is None:
             actions.append({"issue": number, "dispatch": dispatch, "waiting for seat": reasons})
             return
+        prior = codex_active(route)
         runtime("account", "select", "--agent", route[0], "--account", account["id"])
         if runtime("account", "list")[route[0]]["activeAccountId"] != account["id"]:
             raise OrcaError("selected account changed before restart")
@@ -1856,7 +1877,7 @@ def watch_pass(args, db, actions, errors):
         # Everything adoption needs if the start response is lost.
         state["pending"].update(starting=True, dispatch=dispatch, task=task_id, number=number, title=title,
                                 worktree=show["worker"]["worktreeId"], route=route, account=account["id"],
-                                label=account["label"], note=note)
+                                label=account["label"], note=note, coordinator=prior)
         save(terminal, state)
         # The same Task keeps its title, dependencies and retry lineage for the review tick.
         started = runtime("orchestration", "worker-start", *actor, "--task", task_id, "--retry-of", dispatch,
@@ -1910,6 +1931,7 @@ def watch_pass(args, db, actions, errors):
         if ticket:
             stage(ticket, phase(ticket, state, p["title"]), card_agent(ticket["agent"], "review" in p["title"], p["label"]))
         actions.append({"issue": number, "restarted": p["dispatch"], "as": new, "why": p["why"], "account": p["label"]})
+        restore_coordinator(p.get("coordinator"))
         send_note(handle, row)
 
     def send_note(handle, row):

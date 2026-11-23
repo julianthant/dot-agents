@@ -610,6 +610,8 @@ for interrupted in ("clean", "committed", "untracked", "preexisting"):
                 check.assertNotIn("--force", argv)
                 git_at(repo, "worktree", "remove", str(checkout))
                 return {"removed": True}
+            if verb == ("account", "list"):
+                return {"codex": {"activeAccountId": "coord"}}
             if verb == ("account", "select"):
                 if interrupted == "committed":
                     git_at(checkout, "commit", "--allow-empty", "-m", "someone's new commit")
@@ -731,6 +733,34 @@ with patch.object(tick, "green_report", side_effect=[None, sha]), patch.object(t
     tick.review_step(db, "run", [], ticket, state, [report("fix", sha, msg_id="green")])
     assert card.call_args.args[1:] == ("Merging", state["agent"])
     assert all(call.args[1] == "send" for call in cli.call_args_list)
+
+# A Codex reviewer start gives the coordinator bot its Codex account back once the start is confirmed.
+ticket, state = review_fixture()
+ticket["body"] = "Reviewer: codex / gpt-6.2-astra / medium"
+with patch.object(tick, "green_report", return_value=sha), patch.object(tick, "worker_settings"), \
+        patch.object(tick, "review_account", return_value={"id": "seat", "label": "review"}), \
+        patch.object(tick, "record_hold"), patch.object(tick, "review_card"), \
+        patch.object(pick, "coordinator", return_value=None), patch.object(pick.account_usage, "load_config", return_value={}), \
+        patch.object(tick, "runtime") as cli:
+    cli.side_effect = [{"codex": {"activeAccountId": "coord"}}, {}, {"codex": {"activeAccountId": "seat"}},
+                       full_start("reader", "pane"), {}, {"codex": {"activeAccountId": "coord"}}]
+    tick.review_step(sqlite3.connect(":memory:"), "run", [], ticket, state, [recorded])
+    assert [c.args[-1] for c in cli.call_args_list if c.args[:2] == ("account", "select")] == ["seat", "coord"]
+
+# The coordinator moves to pick.coordinator's choice when its own account is past handoff; a race is reported.
+for fresh, listed in ((None, "coord"), ({"id": "fresh"}, "fresh"), (None, "other")):
+    with patch.object(pick, "coordinator", return_value=fresh) as choose, \
+            patch.object(pick.account_usage, "load_config", return_value={}), \
+            patch.object(tick, "runtime", side_effect=[{}, {"codex": {"activeAccountId": listed}}]) as cli:
+        if listed == "other":
+            with check.assertRaisesRegex(tick.OrcaError, "coordinator account"):
+                tick.restore_coordinator("coord")
+        else:
+            tick.restore_coordinator("coord")
+        assert choose.call_args.args[3] == "coord"
+        assert cli.call_args_list[0].args == ("account", "select", "--agent", "codex", "--account",
+                                              (fresh or {}).get("id") or "coord")
+tick.restore_coordinator(None)  # a Claude start never touches the Codex account
 
 # A coder report refreshes the card's seat from the reporting terminal's hold.
 ticket, state = review_fixture()
@@ -1140,6 +1170,7 @@ class Fleet:
         self.start_error = None
         self.lose_start = False  # Orca starts the retry, but the response is lost
         self.note_error = None
+        self.active, self.fresh = "coord", None  # the coordinator bot's Codex account; pick.coordinator's choice
         self.events, self.cards, self.now = [], [], 1_795_389_500
         self.ticket = dict(number=553, item="card", agent=f"coder {model} medium @jzaw", stage="Coding")
         self.title = "#553 coder"
@@ -1228,6 +1259,7 @@ class Fleet:
                 patch.object(tick, "tickets", side_effect=self.tickets_error, return_value=[self.ticket]), patch.object(tick, "review_card", record), \
                 patch.object(pick, "main", return_value=0), patch.object(pick, "due", return_value=[]), \
                 patch.object(pick, "pick", seat), patch.object(pick.account_usage, "load_config", return_value=cfg), \
+                patch.object(pick, "coordinator", return_value=self.fresh and {"id": self.fresh}), \
                 patch.object(tick.time, "time", return_value=self.now), redirect_stdout(out):
             try:
                 tick.watch_tick(SimpleNamespace(holds=self.holds), self.db)
@@ -1260,7 +1292,9 @@ with TemporaryDirectory() as tmp:
     calls = f.tick(1)
     assert ("orchestration", "worker-start") in calls and ("orchestration", "worker-stop") not in calls
     assert len(f.notes) == 1 and "/wt/.handoff-553.md" in f.notes[0] and "Stopping at the usage limit." in f.notes[0]
-    assert f.active == "x2" and f.cards[-1] == ("Coding", "coder gpt-6.2-astra medium @x2")
+    selects = [e[-1] for e in f.events if e[:2] == ("account", "select")]
+    assert selects == ["x2", "coord"] and f.active == "coord"  # the coordinator gets its account back
+    assert f.cards[-1] == ("Coding", "coder gpt-6.2-astra medium @x2")
     holds = json.loads(f.holds.read_text())
     assert "term_coder" not in holds and holds["term_restart"]["account"] == "x2"
     review = tick.review_state(f.db, "run", 553)

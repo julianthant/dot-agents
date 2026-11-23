@@ -2027,11 +2027,14 @@ def close_workers(run):
     while True:
         inventory = runtime("orchestration", "worker-list", "--run", run, "--full", "--limit", "100", *cursor)
         for worker in inventory["workers"]:
-            if worker.get("host") not in (None, "local"):
+            if worker.get("server") or worker.get("host") not in (None, "local"):
                 continue
             if worker["runId"] != run:
                 raise OrcaError("worker-list returned a different Run")
-            if worker["projection"]["host"]["kind"] == "local":
+            host = (worker.get("projection") or {}).get("host") or {}
+            if not host.get("kind"):
+                raise OrcaError("worker-list row has no projected host")
+            if host["kind"] == "local":
                 yield worker
         page = inventory["page"]
         if not page["hasMore"]:
@@ -2157,7 +2160,7 @@ def close_tick(args, db):
     actor, run = supervisor(args)
     roster = {}
     for worker in close_workers(run):
-        workspace = worker["projection"].get("workspace")
+        workspace = (worker.get("projection") or {}).get("workspace")
         if workspace:
             roster.setdefault(workspace["id"], []).append(worker)
     trees = runtime("worktree", "list", "--repo", "path:" + str(repo), "--limit", "10000")

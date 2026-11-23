@@ -1518,7 +1518,17 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
                                                 ("ctx_review", "term_reviewer", True),
                                                 ("ctx_initial", "term_coder", False))]
     if remote_worker:
-        workers.insert(1, dict(dispatchId="ctx_wsl", taskId="task_wsl", host="Juzzark-WSL", state="ready"))
+        workers.insert(1, {
+            "agentTerminalHandle": "term_wsl",
+            "dispatchId": "ctx_wsl",
+            "dispatchStatus": "dispatched",
+            "resource": None,
+            "runId": "run",
+            "server": {"environmentId": "env_wsl", "name": "Juzzark-WSL", "asOf": "2026-11-23T18:00:00Z"},
+            "taskId": "task_wsl",
+            "terminalState": "active",
+            "workerState": "ready",
+        })
     events = []
     tree = dict(id=worktree, path=path, branch=ref, isMainWorktree=False)
     present = True

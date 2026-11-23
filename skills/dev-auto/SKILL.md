@@ -171,7 +171,13 @@ so launchd uses the holds beside it. The installer validates the anchor and
 installs `com.relay.dev-auto` in the current user's GUI domain.
 launchd starts the job at load and every minute. Each invocation holds the
 same lock as the standalone commands and runs watch, review, close and fill
-against the existing Run and local state. Existing dispatches keep their hold
+against the existing Run and local state. After those, a `full-run` step runs
+`gh workflow run development.yml --ref development` in julianthant/hr-relay at
+most once every 20 minutes (stamp in `~/.local/state/dev-auto/full-run.json`),
+and skips while a full run is queued or running, because GitHub never fires
+that schedule. The workflow's decide job judges whether CI is idle and the head
+untested. The tick dispatches nothing else: staging, production and release
+workflows stay operator-only. Existing dispatches keep their hold
 records and Project cards. A detached anchor fails the tick before any fleet
 action. Rebind the Run from a plain shell and reinstall with the new anchor.
 

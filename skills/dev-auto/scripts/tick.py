@@ -1535,10 +1535,16 @@ def review_tick(args, db):
                     continue
                 if not ticket["item"] or (not args.issue and ticket["stage"] not in ("Coding", "CI running")):
                     continue
+                followed = None
                 if args.coder:
                     dispatch = args.coder
                 elif len(ids) == 1:
                     dispatch = runtime("orchestration", "dispatch-show", "--task", ids[0], "--full")["dispatch"]["id"]
+                    if db.execute("SELECT 1 FROM sqlite_master WHERE name='followups'").fetchone():
+                        row = db.execute("SELECT dispatch FROM followups WHERE run=? AND issue=?", (run, number)).fetchone()
+                        # Watch sent a resume note to the settled coder: its follow-up Dispatch is the current coder.
+                        if row:
+                            followed, first, dispatch = row[0], dispatch, row[0]
                 else:
                     raise OrcaError("multiple coder Tasks; select the intended Dispatch with --issue and --coder")
                 if not review_mail(messages, dispatch):
@@ -1548,7 +1554,8 @@ def review_tick(args, db):
                 show = runtime("orchestration", "worker-show", "--dispatch", dispatch, "--full")
                 worker = show["worker"]
                 if (show["dispatch"]["id"] != dispatch or show["dispatch"]["runId"] != run or
-                        (not args.coder and show["dispatch"]["taskId"] != ids[0])):
+                        (not args.coder and show["dispatch"]["taskId"] != ids[0]
+                         and not (followed and in_coder_chain(show["dispatch"].get("followUpOf"), first, run)))):
                     raise OrcaError("coder Dispatch identity changed")
                 tree = runtime("worktree", "show", "--worktree", "id:" + worker["worktreeId"])["worktree"]
                 remote = command("git", "-C", tree["path"], "remote", "get-url", "origin").strip()
@@ -2111,6 +2118,19 @@ def watch_pass(args, db, actions, errors):
         actions.append({"issue": number, "restarted": p["dispatch"], "as": new, "why": p["why"], "account": p["label"]})
         send_note(handle, row)
 
+    def sent_followup(note):
+        """The follow-up Orca started for an earlier send of this note, as its receipt; None if there is none."""
+        for task in tasks.values():
+            if task.get("task_title") != note["subject"] or task.get("spec") != note["body"]:
+                continue
+            new = (runtime("orchestration", "dispatch-show", "--task", task["id"], "--full").get("dispatch") or {}).get("id")
+            if not new:
+                continue
+            attempt = runtime("orchestration", "worker-show", "--dispatch", new, "--full")["dispatch"]
+            if attempt["id"] == new and attempt["runId"] == run and attempt.get("followUpOf") == note["to"]:
+                return {"delivery": "follow_up", "followUpOf": note["to"], "dispatchId": new}
+        return None
+
     def send_note(handle, row):
         """Retried each tick until confirmed: the coordinator's account, the resume note, then the card."""
         failure = None
@@ -2123,8 +2143,13 @@ def watch_pass(args, db, actions, errors):
                 failure = e  # the note and card go on; the restore is retried next tick
         if row.get("note"):
             note = row["note"]
-            receipt = runtime("orchestration", "send", *actor, "--to", "dispatch:" + note["to"],
-                              "--subject", note["subject"], "--body", note["body"])
+            # A send whose reply was lost may have started a follow-up already; adopt it rather than start another.
+            receipt = note.get("sending") and sent_followup(note)
+            if not receipt:
+                note["sending"] = True
+                save(handle, row)
+                receipt = runtime("orchestration", "send", *actor, "--to", "dispatch:" + note["to"],
+                                  "--subject", note["subject"], "--body", note["body"])
             row.pop("note")
             found = re.match(r"#(\d+):", note["subject"])
             number = int(found[1]) if found else None
@@ -2144,6 +2169,11 @@ def watch_pass(args, db, actions, errors):
             with db:
                 if review:
                     db.execute("INSERT OR REPLACE INTO reviews VALUES (?,?,?)", (run, number, json.dumps(review)))
+                elif receipt.get("delivery") in ("follow_up", "reopened", "started_fresh") and number is not None:
+                    # No review yet: its first discovery reads the follow-up's report, not the predecessor's.
+                    db.execute("CREATE TABLE IF NOT EXISTS followups (run TEXT, issue INTEGER, dispatch TEXT,"
+                               " PRIMARY KEY(run,issue))")
+                    db.execute("INSERT OR REPLACE INTO followups VALUES (?,?,?)", (run, number, new))
                 db.execute("INSERT OR REPLACE INTO watch VALUES (?,?,?)", (run, handle, json.dumps(row)))
             saved[handle] = json.dumps(row)
             actions.append({"note": receipt.get("delivery"), "to": note["to"]})

@@ -1477,6 +1477,8 @@ class Fleet:
         self.ticket = dict(number=553, item="card", agent=f"coder {model} medium @jzaw", stage="Coding")
         self.title = "#553 coder"
         self.notes = []
+        self.followups = []  # Tasks Orca created for mail to a settled Dispatch
+        self.note_lost = False  # the settled-worker send applies, but its reply is lost
         self.tickets_error = None
         self.db = sqlite3.connect(":memory:")
 
@@ -1485,7 +1487,8 @@ class Fleet:
         verb = args[:2]
         if verb == ("orchestration", "task-list"):
             return {"tasks": [{"id": "task_coder", "run_id": "run", "task_title": self.title,
-                               "spec": "/goal Implement julianthant/hr-relay#553 and report a green SHA."}]}
+                               "spec": "/goal Implement julianthant/hr-relay#553 and report a green SHA."},
+                              *self.followups]}
         if verb == ("orchestration", "worker-list"):
             row = dict(dispatchId=self.dispatch, taskId="task_coder", runId="run", workerState=self.state,
                        dispatchStatus=self.status, agentTerminalHandle=self.terminal,
@@ -1503,6 +1506,10 @@ class Fleet:
                              agentTerminalHandle="term_coder", resource={"ownerDispatchId": "ctx_coder"})
                         ] if self.dispatch == "ctx_restart" else []
             return {"workers": [*before, row, old, retried, *replaced], "page": {"hasMore": False, "nextCursor": None}}
+        if verb == ("orchestration", "dispatch-show") and args[3] == "task_follow":
+            return {"dispatch": {"id": "ctx_follow", "status": "dispatched", "taskId": None, "assigneeHandle": None}}
+        if verb == ("orchestration", "worker-show") and args[3] == "ctx_follow":
+            return {"dispatch": {"id": "ctx_follow", "runId": "run", "taskId": "task_follow", "followUpOf": "ctx_restart"}}
         if verb == ("orchestration", "dispatch-show"):
             # Recorded shape: only the newest Dispatch's id and status.
             return {"dispatch": {"id": self.dispatch, "status": self.status, "taskId": None, "assigneeHandle": None}}
@@ -1552,7 +1559,12 @@ class Fleet:
                     raise self.note_error
                 self.notes.append(args[args.index("--body") + 1])
                 if self.status != "dispatched":
-                    # Mail to a settled Dispatch starts a follow-up Dispatch of the same Task.
+                    # Mail to a settled Dispatch starts a follow-up Task and Dispatch.
+                    self.followups.append({"id": "task_follow", "run_id": "run", "spec": args[args.index("--body") + 1],
+                                           "task_title": args[args.index("--subject") + 1]})
+                    if self.note_lost:
+                        self.note_lost = False
+                        raise tick.OrcaError("timed out")
                     return {"delivery": "follow_up", "followUpOf": "ctx_restart", "dispatchId": "ctx_follow"}
             return {"delivery": "queued"}
         raise AssertionError(args)
@@ -1709,6 +1721,42 @@ with TemporaryDirectory() as tmp:
     assert (review["coder"], review["expected"]) == ("ctx_follow", "ctx_follow") and "followed up" in f.lines[0]
     f.tick(1)
     assert not f.db.execute("SELECT * FROM watch").fetchall() and len(f.notes) == 1
+
+# The settled-worker send applies but its reply is lost: the next tick adopts the follow-up Orca started instead of
+# sending again. With no review state yet, the follow-up is recorded for review's first discovery.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    f.note_error = tick.OrcaError("mailbox busy")
+    with check.assertRaises(tick.OrcaError):
+        f.tick()
+    f.status, f.state, f.liveness = "completed", "succeeded", "exited"
+    f.note_error, f.note_lost = None, True
+    with check.assertRaisesRegex(tick.OrcaError, "watch error"):
+        f.tick(1)
+    assert len(f.followups) == 1 and json.loads(dict(f.db.execute("SELECT terminal,state FROM watch"))["term_restart"])["note"]["sending"]
+    f.tick(1)
+    assert len(f.followups) == 1 and len(f.notes) == 1 and "followed up" in f.lines[0]
+    assert f.db.execute("SELECT run,issue,dispatch FROM followups").fetchall() == [("run", 553, "ctx_follow")]
+    assert f.cards[-1] == ("Coding", "coder gpt-6.2-astra medium @x2")
+
+# Review's first discovery reads the recorded follow-up's report, not the predecessor's.
+args = SimpleNamespace(issue=41, coder=None, run=None, anchor=None)
+ticket, state = review_fixture()
+ticket.update(agent=state["agent"], stage="Coding")
+db = sqlite3.connect(":memory:")
+db.execute("CREATE TABLE followups (run TEXT, issue INTEGER, dispatch TEXT, PRIMARY KEY(run,issue))")
+db.execute("INSERT INTO followups VALUES ('run', 41, 'follow')")
+followed_report = report("follow", f"I pushed {sha}.", msg_id="follow-report")
+with patch.object(tick, "tickets", return_value=[ticket]), patch.object(tick, "supervisor", return_value=([], "run")), \
+        patch.object(tick, "command", return_value="https://github.com/julianthant/hr-relay.git\n"), \
+        patch.object(tick, "review_step") as step, patch.object(tick, "runtime") as cli:
+    cli.side_effect = [{"messages": [followed_report]}, {"tasks": [{"title": "#41 coder", "id": "task"}]},
+                       {"dispatch": {"id": "coder"}},
+                       {"dispatch": {"id": "follow", "runId": "run", "taskId": "task_follow", "followUpOf": "coder"},
+                        "worker": {"worktreeId": "tree", "startOptions": {"launch": {"effective": {"model": "gpt-6.2-sol"}}}}},
+                       {"worktree": {"id": "tree", "path": "/fixture", "branch": "refs/heads/task/ui/header"}}]
+    tick.review_tick(args, db)
+    assert step.call_args.args[-2]["expected"] == "follow" and step.call_args.args[-1] == [followed_report]
 
 # A replacement that reports while its resume note is undelivered waits; review acts once delivery is confirmed.
 ticket, state = review_fixture()

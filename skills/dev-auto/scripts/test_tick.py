@@ -1653,6 +1653,8 @@ class Fleet:
         self.seats = ["jzaw", "x2"]  # the limited account is first in accounts.toml order
         self.superseded = False
         self.task_status = "dispatched"
+        self.effort = "medium" if model else None  # a follow-up Dispatch records no model or effort
+        self.follow_of = None  # the Dispatch this one follows up
         self.started_retry = None  # whether the restart passed --retry-of
         self.start_error = None
         self.lose_start = False  # Orca starts the retry, but the response is lost
@@ -1709,16 +1711,19 @@ class Fleet:
         if verb == ("orchestration", "dispatch-show"):
             # Recorded shape: only the newest Dispatch's id and status.
             return {"dispatch": {"id": self.dispatch, "status": self.status, "taskId": None, "assigneeHandle": None}}
+        if verb == ("orchestration", "worker-show") and args[3] == "ctx_orig":
+            return {"dispatch": {"id": "ctx_orig", "followUpOf": None}, "worker": {"startOptions": {"launch": {
+                "effective": {"agent": "codex", "model": "gpt-6.2-sol", "effort": "xhigh"}}}}}
         if verb == ("orchestration", "worker-show"):
             assert args[3] == self.dispatch, args
             retry = "ctx_coder" if self.dispatch == "ctx_restart" and self.started_retry is not False else None
             return {"dispatch": {"id": self.dispatch, "runId": "run", "taskId": "task_coder", "status": self.status,
                                  "assigneeHandle": self.terminal, "lastFailure": self.failure,
-                                 "retryOfDispatchId": retry, "followUpOf": None},
+                                 "retryOfDispatchId": retry, "followUpOf": self.follow_of},
                     "worker": {"state": self.state, "worktreeId": "repo::/wt", "dispatchId": self.dispatch,
                                "effects": [{"kind": "terminal", "role": "agent", "action": "created", "id": self.terminal}],
                                "startOptions": {"launch": {"effective": {"agent": self.agent, "model": self.model,
-                                                                         "effort": "medium"}}}},
+                                                                         "effort": self.effort}}}},
                     "projection": {"liveness": {"verdict": self.liveness}},
                     "terminal": {"handle": self.terminal, "agentWait": self.wait}, "observation": {"agentWait": self.wait}}
         if verb == ("terminal", "read"):
@@ -2193,6 +2198,15 @@ with TemporaryDirectory() as tmp:
     assert f.cards[-1][0] == "Needs you"
     f.tick(1)
     assert f.sent() == []
+
+# Bug 6: a follow-up Dispatch records no model; its restart takes the Coder line, or a reviewer's original Dispatch.
+for title, follow_of, want in (("#553 coder", None, ("gpt-6.2-astra", "medium")), ("#553 reviewer", "ctx_orig", ("gpt-6.2-sol", "xhigh"))):
+    with TemporaryDirectory() as tmp:
+        f = Fleet(tmp, "codex", None, CODEX_AT_LIMIT)
+        f.title, f.follow_of, f.ticket["route"] = title, follow_of, ("codex", "gpt-6.2-astra", "medium", None)
+        f.tick()
+        start = next(e for e in f.events if e[:2] == ("orchestration", "worker-start"))
+        assert (start[start.index("--model") + 1], start[start.index("--effort") + 1]) == want, start
 
 # Bug 1: after an Orca restart the crashed worker's Task is ready again; it starts without --retry-of and is adopted.
 with TemporaryDirectory() as tmp:

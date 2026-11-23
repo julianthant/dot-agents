@@ -1020,7 +1020,8 @@ with patch.object(tick, "runtime", side_effect=ancestry), patch.object(tick, "gr
         tick.review_step(sqlite3.connect(":memory:"), "run", [], ticket, state, [new, old])
     assert sha in verify.call_args.args[1]
 
-def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncertain=False, remote_race=False):
+def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncertain=False, remote_race=False,
+                  release_unknown=False, ticks=1):
     root = Path(tmp)
     path = str(root / "task-tree")
     branch = "task/dev-auto/example"
@@ -1095,6 +1096,9 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
         if args[:2] == ("orchestration", "worker-release"):
             if release_uncertain and args[3] == "ctx_review":
                 return {"state": "release_pending"}
+            if release_unknown and args[3] == "ctx_review":
+                # After a restart the recorded handle no longer resolves; the CLI exits 1 for release_unknown.
+                raise tick.OrcaError('orca orchestration failed: {"ok": true, "result": {"state": "release_unknown"}}')
             return {"ctx_merge": {"state": "released", "reason": "closed_agent_terminal"},
                     "ctx_review": {"state": "already_released"},
                     "ctx_initial": {"state": "retained", "reason": "ownership_transferred"}}[args[3]]
@@ -1116,8 +1120,9 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
                          ("stage", "coding"), ("agent", None)], ("stage", "needs"))), \
             patch.object(tick, "runtime", side_effect=orca), patch.object(tick, "command", side_effect=cli), \
             redirect_stdout(io.StringIO()) as output:
-        tick.close_tick(args, db)
-    assert [event[3] for event in events if event[:2] == REL] == ["ctx_merge", "ctx_review", "ctx_initial"]
+        for _ in range(ticks):
+            tick.close_tick(args, db)
+    assert [event[3] for event in events if event[:2] == REL] == ["ctx_merge", "ctx_review", "ctx_initial"] * ticks
     expected_holds = {"term_other", "term_reviewer"} if release_uncertain else {"term_other"}
     assert set(json.loads(holds.read_text())) == expected_holds
     edits = [event[-3:] for event in events if event[:3] == ("gh", "project", "item-edit")]
@@ -1130,13 +1135,14 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
         assert edits == [("stage", "--single-select-option-id", "needs")]
         assert "Needs you" in output.getvalue()
         sends = [event for event in events if event[:2] == ("orchestration", "send")]
-        assert sends and all("--type" in e and e[e.index("--type") + 1] == "status"
+        assert len(sends) == 1 and all("--type" in e and e[e.index("--type") + 1] == "status"
                              and e[e.index("--to") + 1] == "run:run" for e in sends), sends
         assert any(event[:2] == RM for event in events) == refused
 
 
 for scenario in ({}, {"merged": False}, {"dirty": True}, {"refused": True},
-                 {"release_uncertain": True}, {"remote_race": True}):
+                 {"release_uncertain": True}, {"remote_race": True}, {"release_unknown": True},
+                 {"release_uncertain": True, "ticks": 2}):
     with TemporaryDirectory() as tmp:
         close_fixture(tmp, **scenario)
 

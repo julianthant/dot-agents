@@ -1567,7 +1567,13 @@ def release_close_workers(workers, workspace, run, paths):
                 if receipt and any(e.get("kind") == "terminal" and e.get("role") == "agent" for e in receipt["effects"]):
                     if start_identity(receipt) != (dispatch, terminal):
                         raise OrcaError("Dispatch terminal changed")
-            result = runtime("orchestration", "worker-release", "--dispatch", dispatch, "--full")
+            try:
+                result = runtime("orchestration", "worker-release", "--dispatch", dispatch, "--full")
+            except OrcaError as e:
+                # The CLI exits 1 for release_unknown: a recorded handle that no longer resolves.
+                if "release_unknown" not in str(e):
+                    raise
+                result = {"state": "release_unknown"}
             releases.append((worker, terminal, result))
         except (OrcaError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as e:
             errors.append(f"{dispatch}: {e}")
@@ -1578,7 +1584,9 @@ def release_close_workers(workers, workspace, run, paths):
     dropped = set()
     for worker, terminal, result in releases:
         state = result.get("state")
-        if terminal not in live and (state in RELEASED or
+        settled = worker["dispatchStatus"] in ("completed", "failed")
+        # A settled worker whose handle is gone is released once its worktree has no agent terminal (checked below).
+        if terminal not in live and (state in RELEASED or (state == "release_unknown" and settled) or
                 (state == "retained" and worker["dispatchStatus"] == "completed"
                  and (terminal or result.get("reason") == "ownership_transferred"))):
             if terminal:
@@ -1663,6 +1671,7 @@ def close_tick(args, db):
     project, (_, (stage, _), (agent, _)), (_, needs_you) = project_fields()
     # Retry the same workspace if a partial close already removed the checkout.
     db.execute("CREATE TABLE IF NOT EXISTS closing (run TEXT, issue INTEGER, workspace TEXT, PRIMARY KEY(run,issue))")
+    db.execute("CREATE TABLE IF NOT EXISTS close_notice (run TEXT, issue INTEGER, reason TEXT, PRIMARY KEY(run,issue))")
     for issue, card, branch in candidates:
         number = issue["number"]
         review = review_state(db, run, number) or {}
@@ -1704,13 +1713,17 @@ def close_tick(args, db):
             command(*edit, stage, "--clear")
             with db:
                 db.execute("DELETE FROM closing WHERE run=? AND issue=?", (run, number))
+                db.execute("DELETE FROM close_notice WHERE run=? AND issue=?", (run, number))
             log("closed", {"issue": number, "branch": branch, "head": sha})
         except (OrcaError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as e:
             log("Needs you", {"issue": number, "reason": str(e)})
-            if args.issue or (card["stage"] or {}).get("name") != "Needs you":
+            # One message per blocked state: a retry that fails the same way stays quiet.
+            if db.execute("SELECT reason FROM close_notice WHERE run=? AND issue=?", (run, number)).fetchone() != (str(e),):
                 runtime("orchestration", "send", *actor, "--to", "run:" + run, "--type", "status",
                         "--subject", f"#{number}: Needs you after close", "--body", str(e))
                 command(*edit, stage, "--single-select-option-id", needs_you)
+                with db:
+                    db.execute("INSERT OR REPLACE INTO close_notice VALUES (?,?,?)", (run, number, str(e)))
 
 
 def close(args):

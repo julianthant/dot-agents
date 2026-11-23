@@ -15,6 +15,7 @@ Coordinator verbs refuse a sender with no stable Orca pane, so the script opens 
 
 from pathlib import Path
 import argparse
+import hashlib
 import sqlite3
 import tempfile
 import tomllib
@@ -1828,7 +1829,9 @@ def close_tick(args, db):
         except (OrcaError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as e:
             log("Needs you", {"issue": number, "reason": str(e)})
             # One message per blocked state, recorded before sending; its card write is retried on its own.
-            subject = f"#{number}: Needs you after close"
+            # Orca may rewrite a body in transit, so the subject alone names the blocked state.
+            digest = hashlib.sha256(str(e).encode()).hexdigest()[:12]
+            subject = f"#{number}: Needs you after close ({digest})"
             notice = db.execute("SELECT reason,sent,carded FROM close_notice WHERE run=? AND issue=?",
                                 (run, number)).fetchone()
             fresh = not notice or notice[0] != str(e)
@@ -1839,7 +1842,7 @@ def close_tick(args, db):
             if not notice[1]:
                 # A send whose reply was lost may have landed: look for it before sending again.
                 landed = not fresh and any(
-                    m.get("subject") == subject and m.get("body") == str(e) for m in
+                    m.get("subject") == subject for m in
                     runtime("orchestration", "inbox", "--terminal", "run:" + run, "--limit", "10000", "--full")["messages"])
                 if not landed:
                     runtime("orchestration", "send", *actor, "--to", "run:" + run, "--type", "status",
@@ -1925,7 +1928,6 @@ def watch_tick(args, db):
 
 def watch_pass(args, db, actions, errors):
     import contextlib
-    import hashlib
     import io
     import pick
     actor, run = supervisor(args)

@@ -1268,7 +1268,7 @@ with patch.object(tick, "runtime", side_effect=ancestry), patch.object(tick, "gr
     assert sha in verify.call_args.args[1]
 
 def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncertain=False, remote_race=False,
-                  release_unknown=False, ticks=1, card_fails=False, send_lost=False):
+                  release_unknown=False, ticks=1, card_fails=False, send_lost=False, rewritten=False):
     root = Path(tmp)
     path = str(root / "task-tree")
     branch = "task/dev-auto/example"
@@ -1362,7 +1362,9 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
             return {"removed": True}
         if args[:2] == ("orchestration", "send"):
             if send_lost and not mailbox:
-                mailbox.append({"subject": args[args.index("--subject") + 1], "body": args[args.index("--body") + 1]})
+                # Orca may rewrite the body in transit; the subject arrives as sent.
+                mailbox.append({"subject": args[args.index("--subject") + 1],
+                                "body": "[redacted]" if rewritten else args[args.index("--body") + 1]})
                 raise tick.OrcaError("timed out")  # Orca accepted it; the reply is lost
             return {}
         if args[:2] == ("orchestration", "inbox"):
@@ -1401,7 +1403,8 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
 for scenario in ({}, {"merged": False}, {"dirty": True}, {"refused": True},
                  {"release_uncertain": True}, {"remote_race": True}, {"release_unknown": True},
                  {"release_uncertain": True, "ticks": 2}, {"release_uncertain": True, "ticks": 3, "card_fails": True},
-                 {"release_uncertain": True, "ticks": 3, "send_lost": True}):
+                 {"release_uncertain": True, "ticks": 3, "send_lost": True},
+                 {"release_uncertain": True, "ticks": 3, "send_lost": True, "rewritten": True}):
     with TemporaryDirectory() as tmp:
         close_fixture(tmp, **scenario)
 

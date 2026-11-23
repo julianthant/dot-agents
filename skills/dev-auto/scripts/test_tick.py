@@ -1481,9 +1481,10 @@ class Fleet:
         self.title = "#553 coder"
         self.notes = []
         self.followups = []  # Tasks Orca created for mail to a settled Dispatch
-        self.note_lost = False  # the settled-worker send applies, but its reply is lost
+        self.note_lost = False  # the send to the replacement applies, but its reply is lost
         self.follow_retried = False  # Orca retried the follow-up Task; its newest attempt has no followUpOf
         self.tickets_error = None
+        self.receipts = {}  # Orca's recorded receipts by request id
         self.db = sqlite3.connect(":memory:")
 
     def orca(self, *args):
@@ -1565,15 +1566,22 @@ class Fleet:
             if args[args.index("--to") + 1] == "dispatch:ctx_restart":
                 if self.note_error:
                     raise self.note_error
+                request = args[args.index("--retry-request") + 1] if "--retry-request" in args else None
+                if request in self.receipts:
+                    return self.receipts[request]  # Orca replays an applied request
                 self.notes.append(args[args.index("--body") + 1])
+                receipt = {"delivery": "queued"}
                 if self.status != "dispatched":
                     # Mail to a settled Dispatch starts a follow-up Task and Dispatch.
                     self.followups.append({"id": "task_follow", "run_id": "run", "spec": args[args.index("--body") + 1],
                                            "task_title": args[args.index("--subject") + 1]})
-                    if self.note_lost:
-                        self.note_lost = False
-                        raise tick.OrcaError("timed out")
-                    return {"delivery": "follow_up", "followUpOf": "ctx_restart", "dispatchId": "ctx_follow"}
+                    receipt = {"delivery": "follow_up", "followUpOf": "ctx_restart", "dispatchId": "ctx_follow"}
+                if request:
+                    self.receipts[request] = receipt
+                if self.note_lost:
+                    self.note_lost = False
+                    raise tick.OrcaError("timed out")
+                return receipt
             return {"delivery": "queued"}
         raise AssertionError(args)
 
@@ -1749,6 +1757,30 @@ for retried, current in ((False, "ctx_follow"), (True, "ctx_follow_retry")):
         assert len(f.followups) == 1 and len(f.notes) == 1 and "followed up" in f.lines[0]
         assert f.db.execute("SELECT run,issue,dispatch FROM followups").fetchall() == [("run", 553, current)]
         assert f.cards[-1] == ("Coding", "coder gpt-6.2-astra medium @x2")
+
+# Orca queues the note for the live replacement, the reply is lost, and the replacement settles before the next
+# tick: the retry replays the first send under its saved request instead of starting a follow-up.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    tick.review_state(f.db, "run", 553)
+    tick.save_review(f.db, "run", 553, {"coder": "ctx_coder", "expected": "ctx_coder", "coder_terminal": "term_coder"})
+    f.note_lost = True
+    with check.assertRaisesRegex(tick.OrcaError, "watch error"):
+        f.tick()
+    assert len(f.notes) == 1 and f.dispatch == "ctx_restart" and f.cards[-1][0] == "Handed off"
+    assert tick.resume_pending(f.db, "run", 553, {"ctx_restart"})
+    request = json.loads(dict(f.db.execute("SELECT terminal,state FROM watch"))["term_restart"])["note"].get("request")
+    f.status, f.state, f.liveness = "completed", "succeeded", "exited"
+    f.tick(1)
+    assert len(f.notes) == 1 and not f.followups
+    assert "followed up" not in f.lines[0]
+    review = tick.review_state(f.db, "run", 553)
+    assert (review["coder"], review["expected"]) == ("ctx_restart", "ctx_restart")
+    assert f.cards[-1] == ("Coding", "coder gpt-6.2-astra medium @x2")
+    sends = [e for e in f.events if e[:2] == ("orchestration", "send") and "dispatch:ctx_restart" in e]
+    assert [e[e.index("--retry-request") + 1] for e in sends] == [request]
+    f.tick(1)
+    assert len(f.notes) == 1 and not f.db.execute("SELECT * FROM watch").fetchall()
 
 # Review's first discovery reads the recorded follow-up's report, not the predecessor's, and follows a retry of
 # the follow-up Task to its current attempt.

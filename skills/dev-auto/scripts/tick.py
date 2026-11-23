@@ -25,6 +25,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 
 ORCA = os.environ.get("ORCA_CLI_COMMAND") or "orca"
 # An agent's own limit message opens its line (from the retired dev_auto.py tick): Claude's
@@ -2153,10 +2154,13 @@ def watch_pass(args, db, actions, errors):
             # A send whose reply was lost may have started a follow-up already; adopt it rather than start another.
             receipt = note.get("sending") and sent_followup(note)
             if not receipt:
+                # Saved before the call, so a retry replays Orca's receipt whatever the first delivery was.
+                note.setdefault("request", str(uuid.uuid4()))
                 note["sending"] = True
                 save(handle, row)
                 receipt = runtime("orchestration", "send", *actor, "--to", "dispatch:" + note["to"],
-                                  "--subject", note["subject"], "--body", note["body"])
+                                  "--subject", note["subject"], "--body", note["body"],
+                                  "--retry-request", note["request"])
             row.pop("note")
             found = re.match(r"#(\d+):", note["subject"])
             number = int(found[1]) if found else None

@@ -245,7 +245,6 @@ def live_workers(numbers):
             t = tasks.get(w.get("taskId"))
             if not t:
                 continue
-            w["taskStatus"] = t.get("status")
             if w.get("dispatchStatus") != "dispatched" and worker_status(w) != "stopped":
                 continue
             title = t.get("task_title") or ""
@@ -263,6 +262,18 @@ def live_workers(numbers):
             w = workers.get(dispatch)
             if w and (w.get("dispatchStatus") == "dispatched" or (n, role) not in current):
                 current[n, role] = w
+
+    active = {f"dispatch:{w['dispatchId']}": w for w in current.values() if w.get("dispatchStatus") == "dispatched"}
+    if active:
+        try:
+            mail = tick.runtime("orchestration", "inbox", "--run", RUN, "--limit", "500", "--full")["messages"]
+            replies = {(m.get("thread_id"), m.get("to_handle")) for m in mail if m["type"] == "status"}
+            for m in mail:
+                sender = m.get("from_handle")
+                if m["type"] == "question" and sender in active and (m.get("thread_id"), sender) not in replies:
+                    active[sender]["operatorQuestion"] = True
+        except REFUSED as e:
+            print(f"roadmap worker questions: {e}", file=sys.stderr)
     return reviews, current
 
 
@@ -276,7 +287,7 @@ def worker_status(worker):
         return "stopped"
     attention = (projection.get("attention") or {}).get("categories", [])
     activity = (projection.get("stage") or {}).get("activity")
-    if {"input", "approval"}.intersection(attention) or activity == "waiting" or worker.get("taskStatus") == "waiting_for_input":
+    if {"input", "approval"}.intersection(attention) or activity == "waiting" or worker.get("operatorQuestion"):
         return "needs you"
     return "working" if activity == "working" else "worker state unavailable"
 

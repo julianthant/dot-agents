@@ -165,7 +165,7 @@ class Roadmap(unittest.TestCase):
         self.assertEqual(roadmap.render()["tick"], status)
         self.assertEqual(self.reads, [])
 
-    def local_worker(self, worker, *, stage="Coding", sha=None, task_status="dispatched", tracked=True):
+    def local_worker(self, worker, *, stage="Coding", sha=None, mail=(), tracked=True):
         self.warm()
         with closing(sqlite3.connect(tick.SNAPSHOT.with_name("starts.sqlite"))) as db, db:
             db.execute("CREATE TABLE reviews (run TEXT, issue INTEGER, state TEXT)")
@@ -183,15 +183,17 @@ class Roadmap(unittest.TestCase):
                 if "--on" in args:
                     self.assertEqual(args[args.index("--on") + 1], "Juzzark-WSL")
                     return {"workers": [{**worker, "projection": {"stage": {"activity": "working"}}}]}
-                return {"workers": [worker], "page": {"hasMore": False}}
+                return {"workers": [dict(worker)], "page": {"hasMore": False}}
             if args[:2] == ("orchestration", "task-list"):
-                return {"tasks": [{"id": "task_coder", "task_title": "#1 coder", "status": task_status}]}
+                return {"tasks": [{"id": "task_coder", "task_title": "#1 coder", "status": "dispatched"}]}
+            if args[:2] == ("orchestration", "inbox"):
+                return {"messages": mail}
             raise AssertionError(args)
 
         return patch.object(tick, "runtime", side_effect=orca)
 
-    def live_rows(self, worker, **options):
-        with self.local_worker(worker, **options):
+    def live_rows(self, worker):
+        with self.local_worker(worker):
             return [r["now"] for r in roadmap.render()["issues"]]
 
     def test_a_stopped_worker_overrides_a_coding_card(self):
@@ -205,15 +207,17 @@ class Roadmap(unittest.TestCase):
         self.assertEqual(live["who"], [{"role": "coder", "model": "gpt-6.2-sol", "host": "WSL"}])
 
     def test_prompt_and_operator_question_need_you_without_changing_stage(self):
-        for reason, worker, options in (
-            ("approval", {"projection": {"attention": {"categories": ["approval"]}}}, {}),
-            ("input", {"projection": {"attention": {"categories": ["input"]}}}, {}),
-            ("manual question", {}, {"task_status": "waiting_for_input", "tracked": False}),
-        ):
+        for reason in ("approval", "input"):
             with self.subTest(reason=reason):
-                live, _ = self.live_rows(worker, **options)
+                live, _ = self.live_rows({"projection": {"attention": {"categories": [reason]}}})
                 self.assertEqual((live["stage"], live["status"]), (0, "needs you"))
                 tick.SNAPSHOT.with_name("starts.sqlite").unlink()
+        mail = [{"type": "question", "thread_id": "q1", "from_handle": "dispatch:ctx_coder", "read": 1}]
+        with self.local_worker({}, mail=mail, tracked=False):
+            live = roadmap.render()["issues"][0]["now"]
+            self.assertEqual((live["stage"], live["status"]), (0, "needs you"))
+            mail.append({"type": "status", "thread_id": "q1", "to_handle": "dispatch:ctx_coder"})
+            self.assertEqual(roadmap.render()["issues"][0]["now"]["status"], "working")
 
     def test_a_red_pr_without_a_worker_still_warns_at_the_pr_stage(self):
         self.warm()

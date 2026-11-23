@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from contextlib import redirect_stdout
 from io import StringIO
 import subprocess
@@ -157,6 +158,58 @@ class Roadmap(unittest.TestCase):
         tick.SNAPSHOT.with_name("tick.json").write_text(json.dumps(status))
         self.assertEqual(roadmap.render()["tick"], status)
         self.assertEqual(self.reads, [])
+
+    def live_rows(self, worker, *, task_status="dispatched", stage="Coding", sha=None):
+        self.warm()
+        with sqlite3.connect(tick.SNAPSHOT.with_name("starts.sqlite")) as db:
+            db.execute("CREATE TABLE reviews (run TEXT, issue INTEGER, state TEXT)")
+            db.execute("INSERT INTO reviews VALUES (?, ?, ?)", ("run_c95eee175345", 1, json.dumps(
+                {"coder": "ctx_coder", "expected": "ctx_coder", "stage": stage,
+                 "sha": sha, "model": "gpt-6.2-sol"})))
+        worker = {"dispatchId": "ctx_coder", "taskId": "task_coder",
+                  "dispatchStatus": "dispatched", "workerState": "ready",
+                  "projection": {"stage": {"activity": "working"}, "liveness": {"verdict": "live"}},
+                  **worker}
+
+        def orca(*args):
+            if args[:2] == ("orchestration", "worker-list"):
+                return {"workers": [worker], "page": {"hasMore": False}}
+            if args[:2] == ("orchestration", "task-list"):
+                return {"tasks": [{"id": "task_coder", "task_title": "#1 coder", "status": task_status}]}
+            raise AssertionError(args)
+
+        with patch.object(tick, "runtime", side_effect=orca):
+            return [r["now"] for r in roadmap.render()["issues"]]
+
+    def test_a_stopped_worker_overrides_a_coding_card(self):
+        live, other = self.live_rows({"dispatchStatus": "failed", "workerState": "stopped"})
+        self.assertEqual((live["stage"], live["status"], live["who"][0]["host"]), (0, "stopped", "Mac"))
+        self.assertIsNone(other)
+
+    def test_a_working_wsl_worker_names_its_host(self):
+        live, _ = self.live_rows({"server": {"name": "Juzzark-WSL"}})
+        self.assertEqual(live["status"], "working")
+        self.assertEqual(live["who"], [{"role": "coder", "model": "gpt-6.2-sol", "host": "WSL"}])
+
+    def test_prompt_and_operator_question_need_you_without_changing_stage(self):
+        for worker, task_status in (
+            ({"projection": {"stage": {"activity": "waiting_for_user"},
+                              "attention": {"categories": ["permission_prompt"], "requiresAction": True}}},
+             "dispatched"),
+            ({}, "waiting_for_input"),
+        ):
+            with self.subTest(task_status=task_status):
+                live, _ = self.live_rows(worker, task_status=task_status)
+                self.assertEqual((live["stage"], live["status"]), (0, "needs you"))
+                tick.SNAPSHOT.with_name("starts.sqlite").unlink()
+
+    def test_a_red_pr_without_a_worker_still_warns_at_the_pr_stage(self):
+        self.warm()
+        state = json.loads(roadmap.STATE.read_text())
+        state["pipeline"]["devPrs"] = [{"n": 637, "head": "task/other", "checks": "failing", "issues": [2]}]
+        roadmap.STATE.write_text(json.dumps(state))
+        live = roadmap.render()["issues"][1]["now"]
+        self.assertEqual((live["stage"], live["status"], live["who"]), (3, "PR checks failing", []))
 
     def test_a_close_time_edit_reaches_the_cached_closed_card(self):
         snap = json.loads(tick.SNAPSHOT.read_text())

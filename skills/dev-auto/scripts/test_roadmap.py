@@ -84,6 +84,9 @@ class Roadmap(unittest.TestCase):
     def issues(self, *pairs, tag="i"):
         self.replies["issues"] = R200.format(tag=tag, body=json.dumps([{"number": n, "updated_at": u} for n, u in pairs]))
 
+    def runs(self, *runs):
+        self.replies["runs"] = R200.format(tag="r2", body=json.dumps({"workflow_runs": runs}))
+
     def fetches(self, fail=False):
         """Patch the snapshot read to record each fresh flag, failing as a refused refetch when asked."""
         calls = []
@@ -229,19 +232,38 @@ class Roadmap(unittest.TestCase):
         self.assertEqual(calls, [True, False])
         self.assertEqual(len(built), 1)  # only the real change rebuilt the pipeline; retries reuse the cache
 
-    def test_pr_or_run_changes_and_the_minute_rebuild_the_pipeline_only(self):
-        built = []
-        with patch.object(roadmap, "pipeline", side_effect=lambda: built.append(1) or GITHUB):
+    def test_runs_update_the_full_run_without_rebuilding_the_pipeline(self):
+        self.warm()
+        full = {"head_branch": "development", "event": "workflow_dispatch", "status": "in_progress",
+                "conclusion": None, "created_at": SINCE, "head_sha": "abc", "html_url": "https://example.com/run"}
+        self.runs(dict(full, event="push", head_sha="other"), full)
+        expected = {"status": "in_progress", "conclusion": None, "createdAt": SINCE,
+                    "headSha": "abc", "url": "https://example.com/run"}
+        with patch.object(roadmap, "pipeline", return_value=GITHUB) as rebuild:
+            self.assertEqual(roadmap.render()["pipeline"].get("fullRun"), expected)
+            self.replies.clear()
+            self.assertEqual(roadmap.render()["pipeline"].get("fullRun"), expected)
+            self.runs(dict(full, event="push", head_sha="other"))
+            self.assertEqual(roadmap.render()["pipeline"].get("fullRun"), expected)
+        rebuild.assert_not_called()
+        self.assertEqual(self.reads, [])
+
+    def test_issue_and_pr_changes_and_the_minute_rebuild_the_pipeline(self):
+        with patch.object(roadmap, "pipeline", return_value=GITHUB) as rebuild:
             self.warm()
-            self.replies["runs"] = R200.format(tag="r2", body="{}")
+            self.issues((1, "2026-11-23T13:05:00Z"))
             roadmap.render()
-            self.assertEqual(len(built), 1)
+            self.assertEqual(rebuild.call_count, 1)
+            self.replies.clear()
+            self.replies["pulls"] = R200.format(tag="p2", body="[]")
+            roadmap.render()
+            self.assertEqual(rebuild.call_count, 2)
             self.replies.clear()
             roadmap.render()
-            self.assertEqual(len(built), 1)
+            self.assertEqual(rebuild.call_count, 2)
             self.warm(built=time.time() - 61)
             roadmap.render()
-            self.assertEqual(len(built), 2)
+            self.assertEqual(rebuild.call_count, 3)
         self.assertEqual(self.reads, [])  # the issue snapshot stayed within its minute throughout
 
 

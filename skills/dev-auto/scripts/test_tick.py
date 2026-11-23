@@ -853,20 +853,24 @@ with patch.object(tick, "green_report", return_value=sha), patch.object(tick, "w
     tick.review_step(sqlite3.connect(":memory:"), "run", [], ticket, state, [recorded])
     assert [c.args[-1] for c in cli.call_args_list if c.args[:2] == ("account", "select")] == ["seat", "coord"]
 
-# A watch restart still owes the coordinator's account: the Codex reviewer waits, and the report is read again later.
-ticket, state = review_fixture()
-ticket["body"] = "Reviewer: codex / gpt-6.2-astra / medium"
-db = sqlite3.connect(":memory:")
-db.execute("CREATE TABLE watch (run TEXT, terminal TEXT, state TEXT, PRIMARY KEY(run,terminal))")
-db.execute("INSERT INTO watch VALUES ('run','pane',?)", (json.dumps({"coordinator": "coord"}),))
-with patch.object(tick, "green_report", return_value=sha), patch.object(tick, "review_account") as seat_pick, \
-        patch.object(tick, "review_card") as card, patch.object(tick, "runtime") as cli, redirect_stdout(io.StringIO()) as out:
-    tick.review_step(db, "run", [], ticket, state, [recorded])
-    cli.assert_not_called()
-    seat_pick.assert_not_called()
-    card.assert_not_called()
-    assert "coordinator restore still owed by ['watch:pane']" in out.getvalue()
-    assert not db.execute("SELECT * FROM review_mail").fetchall()
+# A watch restart, or a reviewer of the same issue in another Run, still owes the coordinator's account:
+# the Codex reviewer waits, and the report is read again later.
+for table, owner, key in (("watch", "pane", "watch:run:pane"), ("reviews", 41, "reviews:other:41")):
+    ticket, state = review_fixture()
+    ticket["body"] = "Reviewer: codex / gpt-6.2-astra / medium"
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE watch (run TEXT, terminal TEXT, state TEXT, PRIMARY KEY(run,terminal))")
+    tick.review_state(db, "run", 41)
+    db.execute(f"INSERT INTO {table} VALUES (?,?,?)",
+               ("run" if table == "watch" else "other", owner, json.dumps({"coordinator": "coord"})))
+    with patch.object(tick, "green_report", return_value=sha), patch.object(tick, "review_account") as seat_pick, \
+            patch.object(tick, "review_card") as card, patch.object(tick, "runtime") as cli, redirect_stdout(io.StringIO()) as out:
+        tick.review_step(db, "run", [], ticket, state, [recorded])
+        cli.assert_not_called()
+        seat_pick.assert_not_called()
+        card.assert_not_called()
+        assert f"coordinator restore still owed by ['{key}']" in out.getvalue(), out.getvalue()
+        assert not db.execute("SELECT * FROM review_mail").fetchall()
 
 # The coordinator gets its account back even when the reviewer's card write fails, or when a lost start is adopted.
 for lose_start in (False, True):

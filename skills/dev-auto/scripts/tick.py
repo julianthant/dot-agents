@@ -849,7 +849,8 @@ def owed_restores(db):
     """Coordinator Codex accounts that fill, review or watch records still owe. While one is owed the active
     Codex account may be a worker seat, so another Codex selection would record that seat as the coordinator's."""
     owed = {}
-    for table, key, value in (("starts", "issue", "receipt"), ("reviews", "issue", "state"), ("watch", "terminal", "state")):
+    for table, key, value in (("starts", "issue", "receipt"), ("reviews", "run || ':' || issue", "state"),
+                              ("watch", "run || ':' || terminal", "state")):
         if not db.execute("SELECT 1 FROM sqlite_master WHERE name=?", (table,)).fetchone():
             continue
         for k, raw in db.execute(f"SELECT {key},{value} FROM {table}"):
@@ -1432,7 +1433,7 @@ def review_step(db, run, actor, ticket, initial, messages):
                               and re.search(r"(?i)\bTier:\s*UI,?\s+multi-step\b", ticket["body"]))
                 if route[1] == state["model"] and not ui_advisor:
                     raise OrcaError("reviewer must use a different model from the coder")
-                owed = route[0] == "codex" and set(owed_restores(db)) - {f"reviews:{number}"}
+                owed = route[0] == "codex" and set(owed_restores(db)) - {f"reviews:{run}:{number}"}
                 if owed:
                     log("review", {"issue": number, "waiting": f"coordinator restore still owed by {sorted(owed)}"})
                     return
@@ -2012,7 +2013,7 @@ def watch_pass(args, db, actions, errors):
         if account is None:
             actions.append({"issue": number, "dispatch": dispatch, "waiting for seat": reasons})
             return
-        owed = route[0] == "codex" and set(owed_restores(db)) - {"watch:" + terminal}
+        owed = route[0] == "codex" and set(owed_restores(db)) - {f"watch:{run}:{terminal}"}
         if owed:
             actions.append({"issue": number, "dispatch": dispatch, "waiting for coordinator restore": sorted(owed)})
             return

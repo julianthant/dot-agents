@@ -428,7 +428,7 @@ def owned_paths(body):
     # These ownership descriptions in hr-relay use directory names and named config files.
     if "dot-agents" in section(body, "Branch"):
         return list(dict.fromkeys(paths)) or ["*"]
-    for phrase, path in ((r"backend storage", "src/backend/storage"), (r"tests?", "tests"),
+    for phrase, path in ((r"backend storage", "src/backend/storage"),
                          (r"documentation", "docs"), (r"workflows", ".github/workflows"),
                          (r"CI plan", "scripts/test/ci-plan.ts"), (r"smoke config", "playwright.smoke.config.ts")):
         if re.search(r"(?<![\w/.-])" + phrase + r"(?![\w/.-])", value, re.I):

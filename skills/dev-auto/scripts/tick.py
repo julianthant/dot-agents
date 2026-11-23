@@ -396,9 +396,11 @@ class StartNotApplied(OrcaError):
 def command(*args):
     result = subprocess.run(args, capture_output=True, text=True, timeout=900 if "worker-start" in args else 90)
     if args[:3] == ("gh", "project", "item-edit"):
-        stale_snapshot()
         if result.returncode:
+            stale_snapshot()
             PROJECT_CACHE.unlink(missing_ok=True)  # a failed edit may mean renamed ids: refetch them next time
+        else:
+            write_through(args)
     if result.returncode:
         if args[1:3] == ("orchestration", "worker-start"):
             try:
@@ -509,8 +511,8 @@ def snapshot(fresh=False):
         return new
 
 
-def stale_snapshot():
-    """After a Project write, the next reader refetches open issues but keeps the closed list."""
+def edit_snapshot(change):
+    """Replace the snapshot with change(snapshot) under its lock; no snapshot yet means nothing to change."""
     import fcntl
     if not SNAPSHOT.exists():
         return
@@ -521,8 +523,39 @@ def stale_snapshot():
         except (OSError, ValueError):
             return
         tmp = SNAPSHOT.with_suffix(".tmp")
-        tmp.write_text(json.dumps({**old, "fetched": 0}))
+        tmp.write_text(json.dumps(change(old)))
         tmp.replace(SNAPSHOT)
+
+
+def stale_snapshot():
+    """After a Project write, the next reader refetches open issues but keeps the closed list."""
+    edit_snapshot(lambda old: {**old, "fetched": 0})
+
+
+CARD_KEYS = {"Status": "status", "Agent": "agent", "Agent state": "stage", "Area": "area"}
+
+
+def write_through(args):
+    """Copy a successful card edit into the snapshot, so the roadmap shows it without reading GitHub."""
+    a = dict(zip(args, args[1:]))
+    try:
+        field = next(f for f in json.loads(PROJECT_CACHE.read_text())["fields"].values() if f["id"] == a["--field-id"])
+        key = CARD_KEYS[field["name"]]
+        if "--clear" in args:
+            value = None
+        elif "--text" in a:
+            value = {"text": a["--text"]}
+        else:
+            value = {"name": next(o["name"] for o in field["options"] if o["id"] == a["--single-select-option-id"])}
+    except (OSError, ValueError, KeyError, StopIteration):
+        return stale_snapshot()
+
+    def change(old):
+        cards = [c for i in old.get("open", []) for c in i["projectItems"]["nodes"] if c["id"] == a["--id"]]
+        for c in cards:
+            c[key] = value
+        return old if cards else {**old, "fetched": 0}
+    edit_snapshot(change)
 
 
 def tickets(fresh=False):

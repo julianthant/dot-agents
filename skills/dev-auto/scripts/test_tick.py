@@ -863,7 +863,7 @@ with patch.object(roadmap, "gh", lambda *a: rm_answer(list(a))), \
         patch.object(tick, "command", lambda *a: json.dumps(rm_answer(list(a[1:])))):
     built = roadmap.build({"open": RM_OPEN, "closed": RM_CLOSED})  # open issues in creation order, as the snapshot keeps them
 built.pop("generated")
-check.assertEqual(built, ROADMAP_BEFORE)
+check.assertEqual(built, {**ROADMAP_BEFORE, "tick": None})
 
 # Bug 8: field-list costs about 100 points, so the Project's ids are cached and refetched only on a miss or a failed edit.
 with TemporaryDirectory() as tmp:

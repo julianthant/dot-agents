@@ -732,6 +732,16 @@ with patch.object(tick, "green_report", side_effect=[None, sha]), patch.object(t
     assert card.call_args.args[1:] == ("Merging", state["agent"])
     assert all(call.args[1] == "send" for call in cli.call_args_list)
 
+# A coder report refreshes the card's seat from the reporting terminal's hold.
+ticket, state = review_fixture()
+state["coder_terminal"] = "pane-c"
+with TemporaryDirectory() as tmp, patch.object(pick, "HOLDS", Path(tmp) / "holds.json"), \
+        patch.object(tick, "green_report", return_value=None), patch.object(tick, "review_card") as card, \
+        patch.object(tick, "runtime", return_value={"delivery": "follow_up", "followUpOf": "coder", "dispatchId": "fix"}):
+    pick.HOLDS.write_text(json.dumps({"pane-c": {"label": "fresh", "host": "local"}}))
+    tick.review_step(sqlite3.connect(":memory:"), "run", [], ticket, state, [recorded])
+    assert card.call_args.args[1:] == ("Fixing", "coder gpt-6.2-sol medium @fresh")
+
 # Third FIX sends all findings to the owning Run, once, and retires the ticket.
 ticket, state = review_fixture()
 for i in range(3):
@@ -1199,7 +1209,8 @@ class Fleet:
 with TemporaryDirectory() as tmp:
     f = Fleet(tmp)
     tick.review_state(f.db, "run", 553)
-    tick.save_review(f.db, "run", 553, {"coder": "ctx_coder", "expected": "ctx_coder", "coder_terminal": "term_coder"})
+    tick.save_review(f.db, "run", 553, {"coder": "ctx_coder", "expected": "ctx_coder", "coder_terminal": "term_coder",
+                                        "agent": "coder gpt-6.2-astra medium @x1"})
     f.tick()
     assert f.sent() == [("dispatch:ctx_coder", "#553: hand off now")] and f.cards == [("Handed off", f.ticket["agent"])]
     assert "handoff" in f.lines[0]
@@ -1218,6 +1229,7 @@ with TemporaryDirectory() as tmp:
     assert "term_coder" not in holds and holds["term_restart"]["account"] == "x2"
     review = tick.review_state(f.db, "run", 553)
     assert (review["coder"], review["coder_terminal"]) == ("ctx_restart", "term_restart")
+    assert review["agent"] == "coder gpt-6.2-astra medium @x2"  # review publishes keep the new seat
     # Review discovery still finds exactly one "#553 coder" Task, whose newest Dispatch is the retry.
     assert [t["id"] for t in f.orca("orchestration", "task-list")["tasks"] if t["task_title"] == "#553 coder"] == ["task_coder"]
 

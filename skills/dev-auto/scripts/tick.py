@@ -1265,6 +1265,8 @@ def review_step(db, run, actor, ticket, initial, messages):
     else:
         return
 
+    if state["stage"] != "Reviewing":
+        state["agent"] = held_label(state["agent"], message.get("from_handle") or state.get("coder_terminal"))
     body = message["body"]
     stage = "Fixing"
     instructions = GREEN_INSTRUCTIONS
@@ -1400,7 +1402,8 @@ def review_tick(args, db):
                                             + ticket["repo"] + r"(?:\.git)?", remote)):
                     raise OrcaError("coder worktree does not match the issue repository and branch")
                 model = worker["startOptions"]["launch"]["effective"]["model"]
-                agent = (ticket["agent"] or "").split(" · ")[0] or f"coder {model}"
+                agent = held_label((ticket["agent"] or "").split(" · ")[0] or f"coder {model}",
+                                   show["dispatch"].get("assigneeHandle"))
                 state = {"coder": dispatch, "expected": dispatch, "coder_terminal": show["dispatch"].get("assigneeHandle"),
                          "path": tree["path"], "model": model,
                          "agent": agent, "history": [], "stage": "Coding"}
@@ -1707,6 +1710,13 @@ def screen_limit(tail, launch):
     return None
 
 
+def held_label(agent, terminal):
+    """The card text with the coder's seat taken from the terminal's hold, when one is recorded."""
+    import pick
+    label = ((pick.account_usage.load_json(pick.HOLDS) or {}).get(terminal) or {}).get("label")
+    return card_agent(agent, False, label) if label else agent
+
+
 def card_agent(text, reviewer, label):
     parts = (text or "").split(" · ")
     i = 1 if reviewer and len(parts) > 1 else 0
@@ -1835,6 +1845,8 @@ def watch_pass(args, db, actions, errors):
             review = review_state(db, run, number)
             if review and review.get("coder") == dispatch:
                 review.update(coder=new, expected=new, coder_terminal=handle)
+                if review.get("agent"):
+                    review["agent"] = card_agent(review["agent"], False, account["label"])
                 save_review(db, run, number, review)
             elif review and (review.get("reviewer") or {}).get("dispatch") == dispatch:
                 review["reviewer"].update(dispatch=new, terminal=handle)

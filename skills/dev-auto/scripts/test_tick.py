@@ -742,6 +742,26 @@ with TemporaryDirectory() as tmp, patch.object(pick, "HOLDS", Path(tmp) / "holds
     tick.review_step(sqlite3.connect(":memory:"), "run", [], ticket, state, [recorded])
     assert card.call_args.args[1:] == ("Fixing", "coder gpt-6.2-sol medium @fresh")
 
+# A reviewer's failed worker_done needs the operator, unless watch is restarting it from a handoff.
+for handoff in (False, True):
+    ticket, state = review_fixture()
+    state.update(stage="Reviewing", expected="reader", sha=sha, reviewer={"dispatch": "reader", "terminal": "pane-r"})
+    failed = dict(report("reader", "Stopping: cannot read the diff.", msg_id="f1"),
+                  payload=json.dumps({"taskId": "task", "dispatchId": "reader", "outcome": "failed"}))
+    db = sqlite3.connect(":memory:")
+    if handoff:
+        db.execute("CREATE TABLE watch (run TEXT, terminal TEXT, state TEXT, PRIMARY KEY(run,terminal))")
+        db.execute("INSERT INTO watch VALUES ('run','pane-r',?)", (json.dumps({"handoff": 1}),))
+    with patch.object(tick, "review_card") as card, patch.object(tick, "runtime") as cli:
+        for _ in range(2):
+            tick.review_step(db, "run", [], ticket, state, [failed])
+        cli.assert_not_called()
+        if handoff:
+            card.assert_not_called()
+        else:
+            assert card.call_count == 1
+            assert card.call_args.args[1:] == ("Needs you", "coordinator · reviewer failed f1")
+
 # Third FIX sends all findings to the owning Run, once, and retires the ticket.
 ticket, state = review_fixture()
 for i in range(3):

@@ -1031,6 +1031,17 @@ def review_mail(messages, dispatch):
     return sorted(reports, key=lambda m: m["sequence"])
 
 
+def failed_reviews(db, run, state, messages):
+    """The reviewer's failed reports, except while watch restarts it from a handoff."""
+    terminal = (state.get("reviewer") or {}).get("terminal")
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='watch'").fetchone():
+        row = db.execute("SELECT state FROM watch WHERE run=? AND terminal=?", (run, terminal)).fetchone()
+        if row and json.loads(row[0]).get("handoff"):
+            return []
+    return [m for m in messages if m["type"] == "worker_done" and mail_payload(m).get("outcome") == "failed"
+            and mail_payload(m).get("dispatchId") == state["expected"]]
+
+
 def latest_coder_report(state, run, messages):
     reports = review_mail(messages, state["coder"])
     latest = reports[-1] if reports else {}
@@ -1257,7 +1268,8 @@ def review_step(db, run, actor, ticket, initial, messages):
     if state["stage"] in ("Merging", "Needs you"):
         return
     db.execute("CREATE TABLE IF NOT EXISTS review_mail (run TEXT, id TEXT, PRIMARY KEY(run,id))")
-    reports = (review_mail(messages, state["expected"]) if state["stage"] == "Reviewing"
+    reports = (sorted(review_mail(messages, state["expected"]) + failed_reviews(db, run, state, messages),
+                      key=lambda m: m["sequence"]) if state["stage"] == "Reviewing"
                else latest_coder_report(state, run, messages))
     for message in reports:
         if not db.execute("SELECT 1 FROM review_mail WHERE run=? AND id=?", (run, message["id"])).fetchone():
@@ -1276,8 +1288,10 @@ def review_step(db, run, actor, ticket, initial, messages):
         verdict = re.fullmatch(r"REVIEW VERDICT: (PUSH|FIX) ([a-f0-9]{40})", header)
         if not verdict and (not header.startswith("REVIEW VERDICT:") or header.startswith(message["subject"])):
             verdict = re.fullmatch(r"REVIEW VERDICT: (PUSH|FIX) ([a-f0-9]{40})", message["subject"])
-        if not verdict or verdict[2] != state["sha"]:
-            state.update(stage="Needs you", publish=True, card_agent=f"coordinator · invalid verdict {message['id']}")
+        failed = mail_payload(message).get("outcome") == "failed"
+        if failed or not verdict or verdict[2] != state["sha"]:
+            why = "reviewer failed" if failed else "invalid verdict"
+            state.update(stage="Needs you", publish=True, card_agent=f"coordinator · {why} {message['id']}")
             with db:
                 db.execute("INSERT INTO review_mail VALUES (?,?)", (run, message["id"]))
                 save_review(db, run, number, state)

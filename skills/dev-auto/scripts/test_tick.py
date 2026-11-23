@@ -335,11 +335,21 @@ with TemporaryDirectory() as tmp:
     refused = False
     cancels = []
     cancel_fails = False
+    active, selects = ["coord"], []  # the coordinator bot's Codex account
+    restore_fails = [False]
     def recovery_runtime(*argv):
         verb = argv[:2]
         operations.append(verb)
+        if verb == ("account", "select"):
+            if restore_fails[0] and argv[-1] == "coord":
+                restore_fails[0] = False
+                raise tick.OrcaError("account switch refused")
+            selects.append(argv[-1])
+            if not preparation_failed:  # a racing selection holds the account while preparation fails
+                active[0] = argv[-1]
+            return {}
         if verb == ("account", "list"):
-            return {"codex": {"activeAccountId": "other" if preparation_failed else "seat"}}
+            return {"codex": {"activeAccountId": active[0]}}
         if verb == ("orchestration", "task-update"):
             cancels.append(argv)
             if cancel_fails:
@@ -367,9 +377,13 @@ with TemporaryDirectory() as tmp:
         return local(*argv)
 
     recovery_edits = []
+    edit_fails = [False]
     real_command = tick.command
     def recovery_command(*argv):
         if argv[:3] == ("gh", "project", "item-edit"):
+            if edit_fails[0]:
+                edit_fails[0] = False
+                raise tick.OrcaError("Project unavailable")
             recovery_edits.append(argv)
             return ""
         if "--git-path" in argv:
@@ -384,7 +398,7 @@ with TemporaryDirectory() as tmp:
     with (patch.object(tick, "project_fields", return_value=("project", [("field", "coding")], ("field","needs-you"))),
           patch.object(tick, "runtime", recovery_runtime), patch.object(tick, "command", recovery_command),
           patch.object(tick, "tickets", return_value=[]), patch.object(tick, "inventory", return_value=set()),
-          patch.object(pick.account_usage, "load_config", return_value={}),
+          patch.object(pick.account_usage, "load_config", return_value={}), patch.object(pick, "coordinator", return_value=None),
           patch.dict(os.environ, {"ORCA_TERMINAL_HANDLE": "fixture"}), redirect_stdout(io.StringIO()) as output):
         with sqlite3.connect(ledger) as db:
             with check.assertRaisesRegex(tick.OrcaError, f"selected account changed.*worktree {root}"):
@@ -395,19 +409,42 @@ with TemporaryDirectory() as tmp:
             with check.assertRaisesRegex(tick.OrcaError, f"uncancelled Task fixture-task.*worktree {root}"):
                 tick.launch(db, root, codex_ticket, account, args, holds)
             cancel_fails = False
+            # A failed preparation hands the coordinator its account back.
+            check.assertEqual(selects, ["seat", "coord", "seat", "coord"])
             preparation_failed = False
             refused = True
             with check.assertRaisesRegex(tick.OrcaError, "no start effects"):
                 tick.launch(db, root, codex_ticket, account, args, holds)
             check.assertEqual(db.execute("SELECT count(*) FROM starts").fetchone(), (0,))
+            check.assertEqual((selects[-2:], active), (["seat", "coord"], ["coord"]))
+            # The restore fails once after a refused start: the next fill restores it without a Dispatch lookup.
+            restore_fails[0] = True
+            with check.assertRaisesRegex(tick.OrcaError, "account switch refused"):
+                tick.launch(db, root, codex_ticket, account, args, holds)
+            check.assertTrue(json.loads(db.execute("SELECT receipt FROM starts").fetchone()[0])["not_applied"])
+            operations.clear()
+            tick.fill_tick(args, db)
+            check.assertEqual(db.execute("SELECT count(*) FROM starts").fetchone(), (0,))
+            check.assertEqual((selects[-1], active), ("coord", ["coord"]))
+            check.assertNotIn(("orchestration", "dispatch-show"), operations)
             operations.clear()
             refused = False
             with check.assertRaisesRegex(tick.OrcaError, "fixture-task"):
                 tick.launch(db, root, codex_ticket, account, args, holds)
+            # Lost reply, Dispatch not yet visible: the worker's selection stays until its attempt is verified.
+            check.assertEqual(active, ["seat"])
+            check.assertEqual(json.loads(db.execute("SELECT receipt FROM starts").fetchone()[0])["coordinator"], "coord")
         with sqlite3.connect(ledger) as db:
             tick.fill_tick(args, db)
             check.assertIn("no Dispatch", output.getvalue())
+            check.assertEqual(active, ["seat"])
             visible = True
+            edit_fails[0] = True  # the Project write fails; the restoration does not depend on it
+            tick.fill_tick(args, db)
+            check.assertIn("Project unavailable", output.getvalue())
+            check.assertEqual(active, ["coord"])
+            check.assertNotIn("coordinator", json.loads(db.execute("SELECT receipt FROM starts").fetchone()[0]))
+            restored = len(selects)
             tick.fill_tick(args, db)
             check.assertIn("waiting for operator input", output.getvalue())
             check.assertIn('"prompt": "Switch model?"', output.getvalue())
@@ -422,6 +459,7 @@ with TemporaryDirectory() as tmp:
             tick.fill_tick(args, db)
             check.assertEqual(db.execute("SELECT receipt FROM starts").fetchone(), ("done",))
             check.assertEqual([edit[-1] for edit in recovery_edits], ["needs-you", "needs-you", "coding"])
+            check.assertEqual(len(selects), restored)  # restored once
     check.assertEqual(operations.count(("orchestration", "worker-start")), 1)
     check.assertNotIn(("terminal", "send"), operations)
     check.assertNotIn(("orchestration", "approve"), operations)
@@ -526,18 +564,20 @@ with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory
     check.assertEqual(picker.call_args.kwargs["holds"][0]["account"], "held")
     check.assertEqual(db.execute("SELECT issue FROM starts").fetchall(), [(40,)])
 
-# Release is its own operation and only clears the inspected pending issue.
-with TemporaryDirectory() as tmp, patch.object(Path, "home", return_value=Path(tmp)), patch.object(tick, "fill_tick") as fill:
+# Release is its own operation and only clears the inspected pending issue, giving the coordinator its account back.
+with TemporaryDirectory() as tmp, patch.object(Path, "home", return_value=Path(tmp)), patch.object(tick, "fill_tick") as fill, \
+        patch.object(tick, "restore_coordinator") as restore:
     state = Path(tmp) / ".local/state/dev-auto"
     state.mkdir(parents=True)
     with sqlite3.connect(state / "starts.sqlite") as db:
-        tick.reserve(db, 40, {"task": "inspected"})
+        tick.reserve(db, 40, {"task": "inspected", "coordinator": "coord"})
         tick.reserve(db, 41, {"task": "other"})
         db.execute("INSERT INTO starts VALUES(42,'done')")
     with redirect_stdout(io.StringIO()):
         tick.main(["fill", "--release", "40"])
         tick.main(["fill", "--release", "42"])
     fill.assert_not_called()
+    restore.assert_called_once_with("coord")
     with sqlite3.connect(state / "starts.sqlite") as db:
         check.assertEqual(db.execute("SELECT issue FROM starts ORDER BY issue").fetchall(), [(41,), (42,)])
 
@@ -729,6 +769,16 @@ with patch.object(tick, "green_report", return_value=sha), \
     assert card.call_args.args[1] == "Merging"
     assert "auto-merge" in cli.call_args.args[-1] and "Closes #41" in cli.call_args.args[-1]
 
+# Every task PR lands on the repository's trunk, whatever base the ticket recorded (feature branches are gone).
+for repo, trunk in (("hr-relay", "development"), ("dot-agents", "main")):
+    ticket, state = review_fixture()
+    ticket.update(base="origin/feature/dashboard-state-tests", repo=repo, body="Reviewer: none. Tier: UI, simple.")
+    with patch.object(tick, "green_report", return_value=sha), patch.object(tick, "review_card"), \
+            patch.object(tick, "runtime", return_value={"delivery": "follow_up", "followUpOf": "coder", "dispatchId": "land"}) as cli:
+        tick.review_step(sqlite3.connect(":memory:"), "run", [], ticket, state, [recorded])
+    landing = cli.call_args.args[-1]
+    assert f"merge origin/{trunk}," in landing and f"open or update the PR into {trunk}," in landing, landing
+
 # A no-review route can land only on green. A red report receives a new coder dispatch.
 ticket, state = review_fixture()
 ticket["body"] = "Reviewer: none (green CI clears it). Tier: UI, simple."
@@ -755,6 +805,114 @@ with patch.object(tick, "green_report", return_value=sha), patch.object(tick, "w
     tick.review_step(sqlite3.connect(":memory:"), "run", [], ticket, state, [recorded])
     assert [c.args[-1] for c in cli.call_args_list if c.args[:2] == ("account", "select")] == ["seat", "coord"]
 
+# The coordinator gets its account back even when the reviewer's card write fails, or when a lost start is adopted.
+for lose_start in (False, True):
+    ticket, state = review_fixture()
+    ticket["body"] = "Reviewer: codex / gpt-6.2-astra / medium"
+    reviewer_task = {"id": "rtask", "run_id": "run", "task_title": "#41 reviewer report",
+                     "spec": tick.reviewer_spec(ticket, sha, False), "created_at": "2026-11-23 08:00:00"}
+    active, selects = ["coord"], []
+    def codex_review(*args):
+        verb = args[:2]
+        if verb == ("account", "select"):
+            selects.append(args[-1])
+            active[0] = args[-1]
+            return {}
+        if verb == ("account", "list"):
+            return {"codex": {"activeAccountId": active[0]}}
+        if verb == ("orchestration", "worker-start"):
+            if lose_start:
+                raise tick.OrcaError("timed out")
+            return full_start("reader", "pane")
+        if verb == ("orchestration", "task-list"):
+            return {"tasks": [reviewer_task]}
+        if verb == ("orchestration", "dispatch-show"):
+            return {"dispatch": {"id": "reader"}}
+        if verb == ("orchestration", "worker-show"):
+            return {"dispatch": {"id": "reader", "runId": "run", "taskId": "rtask", "assigneeHandle": "pane"},
+                    "worker": {"worktreeId": "tree", "startOptions": {"launch": {"effective": {
+                        "agent": "codex", "model": "gpt-6.2-astra", "effort": "medium"}}}}}
+        if verb == ("worktree", "show"):
+            return {"worktree": {"id": "tree", "path": "/fixture"}}
+        raise AssertionError(args)
+    db = sqlite3.connect(":memory:")
+    mail = [dict(recorded, created_at="2026-11-23T07:59:00Z")]
+    with patch.object(tick, "green_report", return_value=sha), patch.object(tick, "worker_settings"), \
+            patch.object(tick, "review_account", return_value={"id": "seat", "label": "review"}), \
+            patch.object(tick, "record_hold"), patch.object(pick, "coordinator", return_value=None), \
+            patch.object(pick.account_usage, "load_config", return_value={}), \
+            patch.object(tick, "review_card", side_effect=[tick.OrcaError("Project unavailable"), None]) as card, \
+            patch.object(tick, "runtime", side_effect=codex_review):
+        with check.assertRaisesRegex(tick.OrcaError, "timed out" if lose_start else "Project unavailable"):
+            tick.review_step(db, "run", [], ticket, state, mail)
+        if lose_start:
+            assert selects == ["seat"] and tick.review_state(db, "run", 41)["coordinator"] == "coord"
+            with check.assertRaisesRegex(tick.OrcaError, "Project unavailable"):
+                tick.review_step(db, "run", [], ticket, state, mail)  # adopts the started reviewer
+        assert selects == ["seat", "coord"] and active == ["coord"]
+        assert "coordinator" not in tick.review_state(db, "run", 41)
+        tick.review_step(db, "run", [], ticket, state, mail)
+        assert card.call_args.args[1] == "Reviewing" and selects == ["seat", "coord"]
+
+# Orca confirms a reviewer start had no effects: the coordinator is restored and the report is read again.
+ticket, state = review_fixture()
+ticket["body"] = "Reviewer: codex / gpt-6.2-astra / medium"
+active, selects, refuse = ["coord"], [], [True]
+def refused_review(*args):
+    if args[:2] == ("account", "select"):
+        selects.append(args[-1])
+        active[0] = args[-1]
+        return {}
+    if args[:2] == ("account", "list"):
+        return {"codex": {"activeAccountId": active[0]}}
+    assert args[:2] == ("orchestration", "worker-start"), args
+    if refuse[0]:
+        raise tick.StartNotApplied("refused")
+    return full_start("reader", "pane")
+db = sqlite3.connect(":memory:")
+with patch.object(tick, "green_report", return_value=sha), patch.object(tick, "worker_settings"), \
+        patch.object(tick, "review_account", return_value={"id": "seat", "label": "review"}), \
+        patch.object(tick, "record_hold"), patch.object(pick, "coordinator", return_value=None), \
+        patch.object(pick.account_usage, "load_config", return_value={}), patch.object(tick, "review_card") as card, \
+        patch.object(tick, "runtime", side_effect=refused_review):
+    with check.assertRaisesRegex(tick.OrcaError, "no reviewer start effects"):
+        tick.review_step(db, "run", [], ticket, state, [recorded])
+    saved = tick.review_state(db, "run", 41)
+    assert selects == ["seat", "coord"] and active == ["coord"] and "pending" not in saved and "coordinator" not in saved
+    card.assert_not_called()
+    refuse[0] = False
+    tick.review_step(db, "run", [], ticket, state, [recorded])
+    assert card.call_args.args[1] == "Reviewing" and selects == ["seat", "coord", "seat", "coord"]
+
+# The reviewer seat's selection cannot be verified: the owed coordinator account is restored before the next try.
+ticket, state = review_fixture()
+ticket["body"] = "Reviewer: codex / gpt-6.2-astra / medium"
+active, selects, raced = ["coord"], [], [True]
+def racing_review(*args):
+    if args[:2] == ("account", "select"):
+        selects.append(args[-1])
+        active[0] = args[-1]
+        return {}
+    if args[:2] == ("account", "list"):
+        if raced[0] and active[0] == "seat":
+            raced[0] = False
+            return {"codex": {"activeAccountId": "other"}}
+        return {"codex": {"activeAccountId": active[0]}}
+    assert args[:2] == ("orchestration", "worker-start"), args
+    return full_start("reader", "pane")
+db = sqlite3.connect(":memory:")
+with patch.object(tick, "green_report", return_value=sha), patch.object(tick, "worker_settings"), \
+        patch.object(tick, "review_account", return_value={"id": "seat", "label": "review"}), \
+        patch.object(tick, "record_hold"), patch.object(pick, "coordinator", return_value=None), \
+        patch.object(pick.account_usage, "load_config", return_value={}), patch.object(tick, "review_card") as card, \
+        patch.object(tick, "runtime", side_effect=racing_review):
+    with check.assertRaisesRegex(tick.OrcaError, "reviewer account selection changed"):
+        tick.review_step(db, "run", [], ticket, state, [recorded])
+    assert tick.review_state(db, "run", 41)["coordinator"] == "coord"
+    tick.review_step(db, "run", [], ticket, state, [recorded])
+    assert selects == ["seat", "coord", "seat", "coord"] and active == ["coord"]
+    assert card.call_args.args[1] == "Reviewing"
+
 # The coordinator moves to pick.coordinator's choice when its own account is past handoff; a race is reported.
 for fresh, listed in ((None, "coord"), ({"id": "fresh"}, "fresh"), (None, "other")):
     with patch.object(pick, "coordinator", return_value=fresh) as choose, \
@@ -779,6 +937,33 @@ with TemporaryDirectory() as tmp, patch.object(pick, "HOLDS", Path(tmp) / "holds
     pick.HOLDS.write_text(json.dumps({"pane-c": {"label": "fresh", "host": "local"}}))
     tick.review_step(sqlite3.connect(":memory:"), "run", [], ticket, state, [recorded])
     assert card.call_args.args[1:] == ("Fixing", "coder gpt-6.2-sol medium @fresh")
+
+# A manual retry on a new pane, with review state already saved, is recognized by its retry lineage and
+# refreshes the card from its own hold; another Task's report on a third pane is ignored.
+ticket, state = review_fixture()
+state.update(coder_terminal="pane-old")
+retried = dict(report("retry", "red at the old head", msg_id="retry-report"), from_handle="pane-new", sequence=3)
+stranger = dict(report("other", "unrelated", msg_id="other-report"), from_handle="pane-x", sequence=2,
+                payload=json.dumps({"taskId": "other-task", "dispatchId": "other", "outcome": "succeeded"}))
+def lineage(*args):
+    if args[:2] == ("orchestration", "worker-show"):
+        return {"dispatch": {"id": args[3], "runId": "run", "taskId": "task",
+                             "retryOfDispatchId": {"retry": "coder"}.get(args[3]), "followUpOf": None}}
+    assert args[:2] == ("orchestration", "send") and "dispatch:retry" in args, args
+    return {"delivery": "follow_up", "followUpOf": "retry", "dispatchId": "fix"}
+db = sqlite3.connect(":memory:")
+db.execute("CREATE TABLE review_mail (run TEXT, id TEXT, PRIMARY KEY(run,id))")
+db.execute("INSERT INTO review_mail VALUES ('run','report')")
+with TemporaryDirectory() as tmp, patch.object(pick, "HOLDS", Path(tmp) / "holds.json"), \
+        patch.object(tick, "green_report", return_value=None), patch.object(tick, "review_card") as card, \
+        patch.object(tick, "runtime", side_effect=lineage) as cli:
+    pick.HOLDS.write_text(json.dumps({"pane-old": {"label": "old", "host": "local"},
+                                      "pane-new": {"label": "fresh", "host": "local"}}))
+    tick.review_step(db, "run", [], ticket, state, [recorded, stranger, retried])
+    assert card.call_args.args[1:] == ("Fixing", "coder gpt-6.2-sol medium @fresh")
+    saved = tick.review_state(db, "run", 41)
+    assert (saved["coder"], saved["coder_terminal"]) == ("fix", "pane-new")
+    assert not any("other" in call.args for call in cli.call_args_list)
 
 # A reviewer's failed worker_done needs the operator, unless watch is restarting it from a handoff.
 for handoff in (False, True):
@@ -854,6 +1039,25 @@ with patch.object(tick, "tickets", return_value=[ticket]), patch.object(tick, "s
     tick.review_tick(args, sqlite3.connect(":memory:"))
     assert step.call_args.args[-1] == [recorded] and step.call_args.args[-2]["expected"] == "coder"
     assert cli.call_args_list[0].args == ("orchestration", "inbox", "--terminal", "run:run", "--limit", "10000", "--full")
+
+# An explicit coder that reports to another Run fails loudly instead of exiting quietly.
+args = SimpleNamespace(issue=41, coder="ctx_elsewhere", run=None, anchor=None)
+with patch.object(tick, "tickets", return_value=[ticket]), patch.object(tick, "supervisor", return_value=([], "run")), \
+        patch.object(tick, "review_step") as step, patch.object(tick, "runtime") as cli:
+    cli.side_effect = [{"messages": [recorded]}, {"tasks": []},
+                       {"dispatch": {"id": "ctx_elsewhere", "runId": "run_other", "taskId": "task"}}]
+    with check.assertRaisesRegex(tick.OrcaError, "ctx_elsewhere belongs to Run run_other, not the bound Run run"):
+        tick.review_tick(args, sqlite3.connect(":memory:"))
+    step.assert_not_called()
+    # Saved review state does not hide the mismatch.
+    saved_db = sqlite3.connect(":memory:")
+    tick.review_state(saved_db, "run", 41)
+    tick.save_review(saved_db, "run", 41, dict(state))
+    cli.side_effect = [{"messages": [recorded]}, {"tasks": []},
+                       {"dispatch": {"id": "ctx_elsewhere", "runId": "run_other", "taskId": "task"}}]
+    with check.assertRaisesRegex(tick.OrcaError, "ctx_elsewhere belongs to Run run_other"):
+        tick.review_tick(args, saved_db)
+    step.assert_not_called()
 
 # A partial Project write resumes on restart without a second follow-up.
 ticket, state = review_fixture()
@@ -1000,7 +1204,8 @@ with patch.object(tick, "runtime", side_effect=ancestry), patch.object(tick, "gr
         tick.review_step(sqlite3.connect(":memory:"), "run", [], ticket, state, [new, old])
     assert sha in verify.call_args.args[1]
 
-def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncertain=False, remote_race=False):
+def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncertain=False, remote_race=False,
+                  release_unknown=False, ticks=1, card_fails=False, send_lost=False):
     root = Path(tmp)
     path = str(root / "task-tree")
     branch = "task/dev-auto/example"
@@ -1026,6 +1231,7 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
     events = []
     tree = dict(id=worktree, path=path, branch=ref, isMainWorktree=False)
     present = True
+    mailbox = []
     local_ref = sha
     remote_present = remote_race
 
@@ -1036,6 +1242,8 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
             return json.dumps([{"data": {"repository": {"issues": {"nodes": [issue]}}}}])
         if args[0] == "gh":
             assert args[1:3] == ("project", "item-edit")
+            if card_fails and sum(e[:3] == ("gh", "project", "item-edit") for e in events) == 1:
+                raise tick.OrcaError("Project unavailable")
             return ""
         if args[3:5] == ("remote", "get-url"):
             return "https://github.com/julianthant/dot-agents.git\n"
@@ -1075,6 +1283,9 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
         if args[:2] == ("orchestration", "worker-release"):
             if release_uncertain and args[3] == "ctx_review":
                 return {"state": "release_pending"}
+            if release_unknown and args[3] == "ctx_review":
+                # After a restart the recorded handle no longer resolves; the CLI exits 1 for release_unknown.
+                raise tick.OrcaError('orca orchestration failed: {"ok": true, "result": {"state": "release_unknown"}}')
             return {"ctx_merge": {"state": "released", "reason": "closed_agent_terminal"},
                     "ctx_review": {"state": "already_released"},
                     "ctx_initial": {"state": "retained", "reason": "ownership_transferred"}}[args[3]]
@@ -1087,7 +1298,12 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
             present = False
             return {"removed": True}
         if args[:2] == ("orchestration", "send"):
+            if send_lost and not mailbox:
+                mailbox.append({"subject": args[args.index("--subject") + 1], "body": args[args.index("--body") + 1]})
+                raise tick.OrcaError("timed out")  # Orca accepted it; the reply is lost
             return {}
+        if args[:2] == ("orchestration", "inbox"):
+            return {"messages": mailbox}
         raise AssertionError(args)
 
     with sqlite3.connect(":memory:") as db, patch.object(pick, "HOLDS", holds), \
@@ -1096,8 +1312,12 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
                          ("stage", "coding"), ("agent", None)], ("stage", "needs"))), \
             patch.object(tick, "runtime", side_effect=orca), patch.object(tick, "command", side_effect=cli), \
             redirect_stdout(io.StringIO()) as output:
-        tick.close_tick(args, db)
-    assert [event[3] for event in events if event[:2] == REL] == ["ctx_merge", "ctx_review", "ctx_initial"]
+        for _ in range(ticks):
+            try:
+                tick.close_tick(args, db)
+            except tick.OrcaError:
+                assert card_fails or send_lost  # a later tick retries only the unconfirmed step
+    assert [event[3] for event in events if event[:2] == REL] == ["ctx_merge", "ctx_review", "ctx_initial"] * ticks
     expected_holds = {"term_other", "term_reviewer"} if release_uncertain else {"term_other"}
     assert set(json.loads(holds.read_text())) == expected_holds
     edits = [event[-3:] for event in events if event[:3] == ("gh", "project", "item-edit")]
@@ -1107,16 +1327,18 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
         assert any(event[0] == "git" and event[3] == "push" for event in events) == remote_race
     else:
         assert present and local_ref == sha
-        assert edits == [("stage", "--single-select-option-id", "needs")]
+        assert edits == [("stage", "--single-select-option-id", "needs")] * (2 if card_fails else 1)
         assert "Needs you" in output.getvalue()
         sends = [event for event in events if event[:2] == ("orchestration", "send")]
-        assert sends and all("--type" in e and e[e.index("--type") + 1] == "status"
+        assert len(sends) == 1 and all("--type" in e and e[e.index("--type") + 1] == "status"
                              and e[e.index("--to") + 1] == "run:run" for e in sends), sends
         assert any(event[:2] == RM for event in events) == refused
 
 
 for scenario in ({}, {"merged": False}, {"dirty": True}, {"refused": True},
-                 {"release_uncertain": True}, {"remote_race": True}):
+                 {"release_uncertain": True}, {"remote_race": True}, {"release_unknown": True},
+                 {"release_uncertain": True, "ticks": 2}, {"release_uncertain": True, "ticks": 3, "card_fails": True},
+                 {"release_uncertain": True, "ticks": 3, "send_lost": True}):
     with TemporaryDirectory() as tmp:
         close_fixture(tmp, **scenario)
 
@@ -1178,6 +1400,8 @@ class Fleet:
         self.start_error = None
         self.lose_start = False  # Orca starts the retry, but the response is lost
         self.note_error = None
+        self.select_error = None  # selecting the coordinator's account fails
+        self.stop_lost = False  # worker-stop applies, but its reply is lost
         self.active, self.fresh = "coord", None  # the coordinator bot's Codex account; pick.coordinator's choice
         self.events, self.cards, self.now = [], [], 1_795_389_500
         self.ticket = dict(number=553, item="card", agent=f"coder {model} medium @jzaw", stage="Coding")
@@ -1228,8 +1452,13 @@ class Fleet:
             return {"terminal": {"handle": self.terminal, "tail": self.screen, "source": "screen"}}
         if verb == ("orchestration", "worker-stop"):
             self.state, self.status, self.failure = "stopped", "failed", "stopped"
+            if self.stop_lost:
+                self.stop_lost = False
+                raise tick.OrcaError("timed out")
             return {"dispatchId": self.dispatch, "processAction": "closed_agent_terminal"}
         if verb == ("account", "select"):
+            if self.select_error and args[-1] == "coord":
+                raise self.select_error
             self.active = args[-1]
             return {}
         if verb == ("account", "list"):
@@ -1381,6 +1610,111 @@ with TemporaryDirectory() as tmp:
     assert f.cards[-1] == ("Coding", "coder gpt-6.2-astra medium @x2")
     f.tick(1)
     assert len(f.notes) == 1 and f.cards[-1][0] == "Coding"
+
+
+# The replacement settles while its resume note cannot be sent: the note and card target outlive the worker scan.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    f.note_error = tick.OrcaError("mailbox busy")
+    with check.assertRaises(tick.OrcaError):
+        f.tick()
+    assert f.dispatch == "ctx_restart" and f.cards[-1][0] == "Handed off"
+    f.status, f.state, f.liveness = "completed", "succeeded", "exited"
+    with check.assertRaises(tick.OrcaError):
+        f.tick(1)
+    row = json.loads(dict(f.db.execute("SELECT terminal,state FROM watch"))["term_restart"])
+    assert row["note"]["to"] == "ctx_restart" and row["card"]["stage"] == "Coding"
+    f.note_error = None
+    f.tick(1)
+    assert len(f.notes) == 1 and f.cards[-1] == ("Coding", "coder gpt-6.2-astra medium @x2")
+    f.tick(1)
+    assert not f.db.execute("SELECT * FROM watch").fetchall() and len(f.notes) == 1
+
+# A replacement that reports while its resume note is undelivered waits; review acts once delivery is confirmed.
+ticket, state = review_fixture()
+db = sqlite3.connect(":memory:")
+db.execute("CREATE TABLE watch (run TEXT, terminal TEXT, state TEXT, PRIMARY KEY(run,terminal))")
+pending_note = {"note": {"to": "coder", "subject": "#41: resume", "body": "read the handoff"},
+                "card": {"number": 41, "stage": "Coding", "agent": state["agent"]}}
+db.execute("INSERT INTO watch VALUES ('run','pane-new',?)", (json.dumps(pending_note),))
+with patch.object(tick, "green_report", return_value=None) as verify, patch.object(tick, "review_card") as card, \
+        patch.object(tick, "runtime", return_value={"delivery": "follow_up", "followUpOf": "coder", "dispatchId": "fix"}) as cli:
+    tick.review_step(db, "run", [], ticket, state, [recorded])
+    verify.assert_not_called()
+    card.assert_not_called()
+    cli.assert_not_called()
+    pending_note.pop("note")  # delivered; the card target is still being restored
+    db.execute("UPDATE watch SET state=?", (json.dumps(pending_note),))
+    tick.review_step(db, "run", [], ticket, state, [recorded])
+    card.assert_not_called()
+    db.execute("UPDATE watch SET state='{}'")
+    tick.review_step(db, "run", [], ticket, state, [recorded])
+    assert card.call_args.args[1] == "Fixing" and cli.call_count == 1
+
+
+# A failed coordinator restore after a restart is retried from the watch row; the resume note does not wait for it.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    f.select_error = tick.OrcaError("account switch refused")
+    with check.assertRaises(tick.OrcaError):
+        f.tick()
+    assert f.active == "x2" and len(f.notes) == 1 and f.cards[-1][0] == "Coding"
+    assert json.loads(dict(f.db.execute("SELECT terminal,state FROM watch"))["term_restart"])["coordinator"] == "coord"
+    f.status, f.state, f.liveness = "completed", "succeeded", "exited"  # the replacement settles first
+    with check.assertRaises(tick.OrcaError):
+        f.tick(1)
+    f.select_error = None
+    f.tick(1)
+    assert f.active == "coord" and len(f.notes) == 1
+    f.tick(1)
+    assert not f.db.execute("SELECT * FROM watch").fetchall()
+
+
+# Orca confirms a restart had no effects: the coordinator's account is restored, or kept owed, and the restart retried.
+for restore_fails in (False, True):
+    with TemporaryDirectory() as tmp:
+        f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+        f.start_error = tick.StartNotApplied("refused")
+        f.select_error = tick.OrcaError("account switch refused") if restore_fails else None
+        with check.assertRaises(tick.OrcaError):
+            f.tick()
+        row = json.loads(dict(f.db.execute("SELECT terminal,state FROM watch"))["term_coder"])
+        assert not row["pending"].get("starting") and f.notes == []
+        assert (f.active, row.get("coordinator")) == (("x2", "coord") if restore_fails else ("coord", None))
+        f.start_error = f.select_error = None
+        calls = f.tick(1)
+        assert ("orchestration", "worker-start") in calls and f.active == "coord" and len(f.notes) == 1
+
+# The worker-stop reply is lost after the worker seat is selected: the next tick restores the coordinator first.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    f.stop_lost = True
+    with check.assertRaises(tick.OrcaError):
+        f.tick()
+    assert f.active == "x2" and json.loads(dict(f.db.execute("SELECT terminal,state FROM watch"))["term_coder"])["coordinator"] == "coord"
+    calls = f.tick(1)
+    selects = [e[-1] for e in f.events if e[:2] == ("account", "select")]
+    assert selects == ["coord", "x2", "coord"] and f.active == "coord", selects
+    assert ("orchestration", "worker-start") in calls and len(f.notes) == 1
+
+# A replacement crashes before its resume note and account restore land: its successor inherits both.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    f.note_error = tick.OrcaError("mailbox busy")
+    f.select_error = tick.OrcaError("account switch refused")
+    with check.assertRaises(tick.OrcaError):
+        f.tick()
+    assert f.active == "x2" and f.cards[-1][0] == "Handed off"
+    f.liveness = "exited"  # the replacement crashes
+    with check.assertRaises(tick.OrcaError):
+        f.tick(1)
+    row = json.loads(dict(f.db.execute("SELECT terminal,state FROM watch"))["term_restart"])
+    assert row["relaunched"] and row["coordinator"] == "coord" and row["card"]["stage"] == "Coding"
+    assert "Its own resume note, never delivered" in row["note"]["body"]
+    f.note_error = f.select_error = None
+    f.tick(1)
+    assert f.active == "coord" and len(f.notes) == 1 and "never delivered" in f.notes[0]
+    assert f.cards[-1][0] == "Coding"
 
 
 class FailingWatchInsert:

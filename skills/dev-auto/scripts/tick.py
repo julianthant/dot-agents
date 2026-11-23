@@ -282,7 +282,7 @@ def in_coder_chain(dispatch, previous, run):
         attempt = runtime("orchestration", "worker-show", "--dispatch", dispatch, "--full")["dispatch"]
         if attempt["id"] != dispatch or attempt["runId"] != run:
             break
-        dispatch = attempt.get("followUpOf")
+        dispatch = attempt.get("retryOfDispatchId") or attempt.get("followUpOf")
     return False
 
 
@@ -617,7 +617,9 @@ def fill_tick(args, db):
                 rec = json.loads(receipt)
                 if not isinstance(rec, dict):
                     raise ValueError("invalid reservation receipt")
-                if "task" in rec:
+                if rec.get("not_applied"):
+                    drop_unapplied(db, n, rec)
+                elif "task" in rec:
                     actor, run = supervisor(args)
                     if rec["run"] != run:
                         raise OrcaError(f"reconcile from its owning Run {rec['run']}")
@@ -862,7 +864,7 @@ def launch(db, repo_path, t, acct, args, holds_path):
     wt = runtime("worktree", "create", "--repo", "path:" + str(repo_path), "--name", branch[5:].replace("/", "."),
                  "--branch", branch, "--base-branch", t["base"], "--no-parent", "--setup", "skip")["worktree"]
     path = Path(wt["path"])
-    settings_change = task = None
+    settings_change = task = prior = None
     try:
         actual_branch = command("git", "-C", str(path), "branch", "--show-current").strip()
         if wt["branch"].removeprefix("refs/heads/") != branch or actual_branch != branch:
@@ -879,7 +881,7 @@ def launch(db, repo_path, t, acct, args, holds_path):
             raise OrcaError("selected account changed before worker start")
         rec = dict(task=task, run=run, worktree=wt["id"], account=acct["id"], label=acct["label"],
                    route=route, project=project, item=t["item"], fields=fields, time=int(time.time()),
-                   holds=str(holds_path), waiting_field=waiting_field)
+                   holds=str(holds_path), waiting_field=waiting_field, coordinator=prior)
         # The fill lock covers preparation. A durable Task identity precedes the only start call.
         reserve(db, number, rec)
     except Exception as e:
@@ -895,6 +897,10 @@ def launch(db, repo_path, t, acct, args, holds_path):
         except (OSError, OrcaError, subprocess.TimeoutExpired) as cleanup_error:
             log("prelaunch cleanup", {"issue": number, "worktree": wt["path"], "reason": str(cleanup_error)})
             tree = f"inspect prepared worktree {wt['path']}"
+        try:
+            restore_coordinator(prior)
+        except (OSError, OrcaError, ValueError, KeyError, subprocess.TimeoutExpired) as restore_error:
+            left += f"; restore the coordinator's Codex account {prior} ({restore_error})"
         raise OrcaError(f"#{number}: {e}{left}; {tree}") from e
     try:
         started = runtime("orchestration", "worker-start", *actor, "--task", task, "--worktree", "path:" + str(path),
@@ -903,13 +909,21 @@ def launch(db, repo_path, t, acct, args, holds_path):
         with db:
             db.execute("UPDATE starts SET receipt=? WHERE issue=?", (json.dumps(rec), number))
     except StartNotApplied as e:
+        rec["not_applied"] = True
         with db:
-            db.execute("DELETE FROM starts WHERE issue=?", (number,))
+            db.execute("UPDATE starts SET receipt=? WHERE issue=?", (json.dumps(rec), number))
+        drop_unapplied(db, number, rec)
         raise OrcaError(f"#{number}: Orca confirmed no start effects; inspect prepared worktree {path}: {e}") from e
     except (OrcaError, OSError, ValueError, subprocess.TimeoutExpired) as e:
         log("start receipt unavailable", {"issue": number, "task": task, "reason": str(e)})
     reconcile_start(db, number, rec, actor)
-    restore_coordinator(prior)
+
+
+def drop_unapplied(db, number, rec):
+    """A start Orca confirmed never happened: restore the coordinator, then free the reservation."""
+    restore_coordinator(rec.get("coordinator"))
+    with db:
+        db.execute("DELETE FROM starts WHERE issue=?", (number,))
 
 
 def codex_prompt(tail):
@@ -946,6 +960,12 @@ def reconcile_start(db, number, rec, actor):
         raise OrcaError(f"#{number} reserved: Task {task} has a different attempt; inspect {dispatch_id}")
     if rec.get("terminal") and rec["terminal"] != terminal:
         raise OrcaError(f"#{number} reserved: assignee changed for Dispatch {dispatch_id}")
+    # The verified attempt has consumed the worker's selection; the coordinator's comes back before anything else can fail.
+    if rec.get("coordinator"):
+        restore_coordinator(rec["coordinator"])
+        rec.pop("coordinator")
+        with db:
+            db.execute("UPDATE starts SET receipt=? WHERE issue=?", (json.dumps(rec), number))
     resource = (show.get("projection") or {}).get("resource") or {}
     released_failure = worker["state"] == "failed" and resource.get("terminalState") == "released"
     if released_failure or dispatch.get("status") == "completed":
@@ -1016,6 +1036,9 @@ def fill(args):
             if getattr(args, "release", None) is not None:
                 deleted = 0
                 if db.execute("SELECT name FROM sqlite_master WHERE name='starts'").fetchone():
+                    row = db.execute("SELECT receipt FROM starts WHERE issue=?", (args.release,)).fetchone()
+                    if row and row[0] not in (None, "done"):
+                        restore_coordinator(json.loads(row[0]).get("coordinator"))
                     with db:
                         deleted = db.execute("DELETE FROM starts WHERE issue=? AND receipt IS NOT 'done'",
                                              (args.release,)).rowcount
@@ -1062,21 +1085,27 @@ def failed_reviews(db, run, state, messages):
             and mail_payload(m).get("dispatchId") == state["expected"]]
 
 
-def latest_coder_report(state, run, messages):
+def latest_coder_report(state, run, messages, handled=()):
     reports = review_mail(messages, state["coder"])
     latest = reports[-1] if reports else {}
     terminal = latest.get("from_handle") or state.get("coder_terminal")
-    if terminal:
-        for message in sorted(messages, key=lambda m: m["sequence"], reverse=True):
-            if latest and message["sequence"] <= latest["sequence"]:
-                break
-            if message["type"] != "worker_done" or message.get("from_handle") != terminal:
+    task = None
+    for message in sorted(messages, key=lambda m: m["sequence"], reverse=True):
+        if latest and message["sequence"] <= latest["sequence"]:
+            break
+        payload = mail_payload(message) if message["type"] == "worker_done" else {}
+        dispatch = payload.get("dispatchId")
+        if payload.get("outcome") != "succeeded" or dispatch == state["coder"] or message["id"] in handled:
+            continue
+        if not terminal or message.get("from_handle") != terminal:
+            # A manual retry on a new pane keeps the coder's Task.
+            task = task or runtime("orchestration", "worker-show", "--dispatch", state["coder"], "--full")["dispatch"]["taskId"]
+            if payload.get("taskId") != task:
                 continue
-            payload = mail_payload(message)
-            dispatch = payload.get("dispatchId")
-            if payload.get("outcome") == "succeeded" and in_coder_chain(dispatch, state["coder"], run):
-                state["coder"] = state["expected"] = dispatch
-                return [message]
+        if in_coder_chain(dispatch, state["coder"], run):
+            state["coder"] = state["expected"] = dispatch
+            state["coder_terminal"] = message.get("from_handle") or terminal
+            return [message]
     return [latest] if latest else []
 
 
@@ -1265,6 +1294,25 @@ def publish_review(db, run, ticket, state):
     log("review", {"issue": ticket["number"], "stage": state["stage"], "dispatch": state["expected"]})
 
 
+def resume_pending(db, run, number, dispatches):
+    """A watch restart of this ticket whose resume note or card restore has no receipt yet."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='watch'").fetchone():
+        return False
+    for (raw,) in db.execute("SELECT state FROM watch WHERE run=?", (run,)):
+        row = json.loads(raw)
+        if (row.get("note") or {}).get("to") in dispatches or (row.get("card") or {}).get("number") == number:
+            return True
+    return False
+
+
+def review_coordinator(db, run, number, state):
+    """Give the coordinator its Codex account back once the reviewer start is settled, before any card write."""
+    if state.get("coordinator") and not state.get("pending"):
+        restore_coordinator(state["coordinator"])
+        state.pop("coordinator")
+        save_review(db, run, number, state)
+
+
 def review_step(db, run, actor, ticket, initial, messages):
     import pick
     number = ticket["number"]
@@ -1283,14 +1331,18 @@ def review_step(db, run, actor, ticket, initial, messages):
             state.pop("review_title", None)
             state.pop("hold", None)
             save_review(db, run, number, state)
+    review_coordinator(db, run, number, state)
     if state.get("publish"):
         publish_review(db, run, ticket, state)
     if state["stage"] in ("Merging", "Needs you"):
         return
+    if resume_pending(db, run, number, {state["coder"], state["expected"]}):
+        return
     db.execute("CREATE TABLE IF NOT EXISTS review_mail (run TEXT, id TEXT, PRIMARY KEY(run,id))")
     reports = (sorted(review_mail(messages, state["expected"]) + failed_reviews(db, run, state, messages),
                       key=lambda m: m["sequence"]) if state["stage"] == "Reviewing"
-               else latest_coder_report(state, run, messages))
+               else latest_coder_report(state, run, messages,
+                                        {i for (i,) in db.execute("SELECT id FROM review_mail WHERE run=?", (run,))}))
     for message in reports:
         if not db.execute("SELECT 1 FROM review_mail WHERE run=? AND id=?", (run, message["id"])).fetchone():
             break
@@ -1341,7 +1393,11 @@ def review_step(db, run, actor, ticket, initial, messages):
                     raise OrcaError("reviewer must use a different model from the coder")
                 account = review_account(route)
                 worker_settings(Path(state["path"]), route)
-                prior = codex_active(route)
+                prior = state.get("coordinator") or codex_active(route)
+                if prior:
+                    # Owed from here on: the next tick restores it before reading this report again.
+                    state["coordinator"] = prior
+                    save_review(db, run, number, state)
                 runtime("account", "select", "--agent", route[0], "--account", account["id"])
                 if runtime("account", "list")[route[0]]["activeAccountId"] != account["id"]:
                     raise OrcaError("reviewer account selection changed")
@@ -1352,8 +1408,9 @@ def review_step(db, run, actor, ticket, initial, messages):
     dot = ticket["repo"] == "dot-agents"
     if stage == "Merging":
         closes = f"Closes {OWNER}/hr-relay#{number}" if dot else f"Closes #{number}"
-        instructions = (f"Starting at approved {state['sha']}, merge origin/{'main' if dot else 'development'}, "
-                        f"push {ticket['branch']}, open or update the PR into {ticket['base'].removeprefix('origin/')}, "
+        trunk = "main" if dot else "development"
+        instructions = (f"Starting at approved {state['sha']}, merge origin/{trunk}, "
+                        f"push {ticket['branch']}, open or update the PR into {trunk}, "
                         f"end the body with {closes}, mark the PR ready, and enable auto-merge through required checks.")
     if account:
         spec = reviewer_spec(ticket, state["sha"], route[1] == state["model"])
@@ -1371,9 +1428,19 @@ def review_step(db, run, actor, ticket, initial, messages):
         db.execute("INSERT OR REPLACE INTO reviews VALUES (?,?,?)", (run, number, json.dumps(state)))
     state["card_agent"] = state["agent"]
     if account:
-        result = runtime("orchestration", "worker-start", *actor, "--worktree", "path:" + state["path"],
-                         "--agent", route[0], "--model", route[1], "--effort", route[2],
-                         "--task-title", state["review_title"], "--spec", spec, "--full")
+        try:
+            result = runtime("orchestration", "worker-start", *actor, "--worktree", "path:" + state["path"],
+                             "--agent", route[0], "--model", route[1], "--effort", route[2],
+                             "--task-title", state["review_title"], "--spec", spec, "--full")
+        except StartNotApplied as e:
+            # No reviewer exists: drop the reservation so the report is read again, then restore the coordinator.
+            for key in ("pending", "review_title", "hold"):
+                state.pop(key, None)
+            with db:
+                db.execute("DELETE FROM review_mail WHERE run=? AND id=?", (run, message["id"]))
+                db.execute("INSERT OR REPLACE INTO reviews VALUES (?,?,?)", (run, number, json.dumps(state)))
+            review_coordinator(db, run, number, state)
+            raise OrcaError(f"#{number}: Orca confirmed no reviewer start effects: {e}") from e
         dispatch, terminal = start_identity(result)
         state["hold"]["terminal"] = terminal
         assign_reviewer(state, dispatch, terminal, state["hold"])
@@ -1392,9 +1459,8 @@ def review_step(db, run, actor, ticket, initial, messages):
     state.pop("pending")
     state.update(stage=stage, publish=True)
     save_review(db, run, number, state)
+    review_coordinator(db, run, number, state)
     publish_review(db, run, ticket, state)
-    if account:
-        restore_coordinator(prior)
 
 
 def review_tick(args, db):
@@ -1410,6 +1476,10 @@ def review_tick(args, db):
         if args.issue and args.issue != number:
             continue
         try:
+            if args.coder:
+                owner = runtime("orchestration", "worker-show", "--dispatch", args.coder, "--full")["dispatch"]["runId"]
+                if owner != run:
+                    raise OrcaError(f"coder Dispatch {args.coder} belongs to Run {owner}, not the bound Run {run}")
             state = review_state(db, run, number)
             if not state:
                 ids = [t["id"] for t in tasks if t["title"] == f"#{number} coder"]
@@ -1426,6 +1496,8 @@ def review_tick(args, db):
                 else:
                     raise OrcaError("multiple coder Tasks; select the intended Dispatch with --issue and --coder")
                 if not review_mail(messages, dispatch):
+                    if args.coder:
+                        log("review", {"issue": number, "waiting": f"no succeeded report from {dispatch}"})
                     continue
                 show = runtime("orchestration", "worker-show", "--dispatch", dispatch, "--full")
                 worker = show["worker"]
@@ -1560,7 +1632,13 @@ def release_close_workers(workers, workspace, run, paths):
                 if receipt and any(e.get("kind") == "terminal" and e.get("role") == "agent" for e in receipt["effects"]):
                     if start_identity(receipt) != (dispatch, terminal):
                         raise OrcaError("Dispatch terminal changed")
-            result = runtime("orchestration", "worker-release", "--dispatch", dispatch, "--full")
+            try:
+                result = runtime("orchestration", "worker-release", "--dispatch", dispatch, "--full")
+            except OrcaError as e:
+                # The CLI exits 1 for release_unknown: a recorded handle that no longer resolves.
+                if "release_unknown" not in str(e):
+                    raise
+                result = {"state": "release_unknown"}
             releases.append((worker, terminal, result))
         except (OrcaError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as e:
             errors.append(f"{dispatch}: {e}")
@@ -1571,7 +1649,9 @@ def release_close_workers(workers, workspace, run, paths):
     dropped = set()
     for worker, terminal, result in releases:
         state = result.get("state")
-        if terminal not in live and (state in RELEASED or
+        settled = worker["dispatchStatus"] in ("completed", "failed")
+        # A settled worker whose handle is gone is released once its worktree has no agent terminal (checked below).
+        if terminal not in live and (state in RELEASED or (state == "release_unknown" and settled) or
                 (state == "retained" and worker["dispatchStatus"] == "completed"
                  and (terminal or result.get("reason") == "ownership_transferred"))):
             if terminal:
@@ -1656,6 +1736,8 @@ def close_tick(args, db):
     project, (_, (stage, _), (agent, _)), (_, needs_you) = project_fields()
     # Retry the same workspace if a partial close already removed the checkout.
     db.execute("CREATE TABLE IF NOT EXISTS closing (run TEXT, issue INTEGER, workspace TEXT, PRIMARY KEY(run,issue))")
+    db.execute("CREATE TABLE IF NOT EXISTS close_notice (run TEXT, issue INTEGER, reason TEXT, sent INTEGER,"
+               " carded INTEGER, PRIMARY KEY(run,issue))")
     for issue, card, branch in candidates:
         number = issue["number"]
         review = review_state(db, run, number) or {}
@@ -1697,13 +1779,33 @@ def close_tick(args, db):
             command(*edit, stage, "--clear")
             with db:
                 db.execute("DELETE FROM closing WHERE run=? AND issue=?", (run, number))
+                db.execute("DELETE FROM close_notice WHERE run=? AND issue=?", (run, number))
             log("closed", {"issue": number, "branch": branch, "head": sha})
         except (OrcaError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as e:
             log("Needs you", {"issue": number, "reason": str(e)})
-            if args.issue or (card["stage"] or {}).get("name") != "Needs you":
-                runtime("orchestration", "send", *actor, "--to", "run:" + run, "--type", "status",
-                        "--subject", f"#{number}: Needs you after close", "--body", str(e))
+            # One message per blocked state, recorded before sending; its card write is retried on its own.
+            subject = f"#{number}: Needs you after close"
+            notice = db.execute("SELECT reason,sent,carded FROM close_notice WHERE run=? AND issue=?",
+                                (run, number)).fetchone()
+            fresh = not notice or notice[0] != str(e)
+            if fresh:
+                with db:
+                    db.execute("INSERT OR REPLACE INTO close_notice VALUES (?,?,?,0,0)", (run, number, str(e)))
+                notice = (str(e), 0, 0)
+            if not notice[1]:
+                # A send whose reply was lost may have landed: look for it before sending again.
+                landed = not fresh and any(
+                    m.get("subject") == subject and m.get("body") == str(e) for m in
+                    runtime("orchestration", "inbox", "--terminal", "run:" + run, "--limit", "10000", "--full")["messages"])
+                if not landed:
+                    runtime("orchestration", "send", *actor, "--to", "run:" + run, "--type", "status",
+                            "--subject", subject, "--body", str(e))
+                with db:
+                    db.execute("UPDATE close_notice SET sent=1 WHERE run=? AND issue=?", (run, number))
+            if not notice[2]:
                 command(*edit, stage, "--single-select-option-id", needs_you)
+                with db:
+                    db.execute("UPDATE close_notice SET carded=1 WHERE run=? AND issue=?", (run, number))
 
 
 def close(args):
@@ -1864,7 +1966,12 @@ def watch_pass(args, db, actions, errors):
         if account is None:
             actions.append({"issue": number, "dispatch": dispatch, "waiting for seat": reasons})
             return
-        prior = codex_active(route)
+        # An unconfirmed restore from an earlier start is still the coordinator's account.
+        prior = state.get("coordinator") or codex_active(route)
+        if prior:
+            # Owed until confirmed: the next tick restores it before another start.
+            state["coordinator"] = prior
+            save(terminal, state)
         runtime("account", "select", "--agent", route[0], "--account", account["id"])
         if runtime("account", "list")[route[0]]["activeAccountId"] != account["id"]:
             raise OrcaError("selected account changed before restart")
@@ -1872,7 +1979,8 @@ def watch_pass(args, db, actions, errors):
         note = (f"You replace Dispatch {dispatch}, which stopped: {why}."
                 + (f" Its handoff: {report['reportPath']}." if isinstance(report, dict) and report.get("reportPath") else "")
                 + (f" Its last report:\n{report['body'][:1500]}\n" if isinstance(report, dict) and report.get("body") else " ")
-                + "Read its handoff first if there is one; otherwise continue from the last commit on this branch.")
+                + "Read its handoff first if there is one; otherwise continue from the last commit on this branch."
+                + (f"\n\nIts own resume note, never delivered:\n{state['note']['body']}" if state.get("note") else ""))
         if show["dispatch"]["status"] == "dispatched":
             # --retry-of takes a settled attempt, so fence the old one first.
             stop = runtime("orchestration", "worker-stop", "--dispatch", dispatch, "--full")
@@ -1883,9 +1991,16 @@ def watch_pass(args, db, actions, errors):
                                 label=account["label"], note=note, coordinator=prior)
         save(terminal, state)
         # The same Task keeps its title, dependencies and retry lineage for the review tick.
-        started = runtime("orchestration", "worker-start", *actor, "--task", task_id, "--retry-of", dispatch,
-                          "--worktree", "id:" + show["worker"]["worktreeId"], "--agent", route[0],
-                          "--model", route[1], "--effort", route[2], "--full")
+        try:
+            started = runtime("orchestration", "worker-start", *actor, "--task", task_id, "--retry-of", dispatch,
+                              "--worktree", "id:" + show["worker"]["worktreeId"], "--agent", route[0],
+                              "--model", route[1], "--effort", route[2], "--full")
+        except StartNotApplied as e:
+            # Nothing started: the next tick restarts afresh, and the coordinator's account is restored or kept owed.
+            state["pending"] = {"why": why, "crash": crash}
+            save(terminal, state)
+            send_note(terminal, state)
+            raise OrcaError(f"restart of {dispatch} not applied: {e}") from e
         adopt(terminal, state, *start_identity(started))
 
     def resume_start(terminal, state):
@@ -1928,9 +2043,11 @@ def watch_pass(args, db, actions, errors):
             review = None
         row = {"relaunched": bool(state.get("relaunched") or p["crash"]), "account": p["account"],
                "note": {"to": new, "subject": f"#{number}: resume" if number else "resume", "body": p["note"]}}
+        if p.get("coordinator"):
+            row["coordinator"] = p["coordinator"]
         if ticket:
             # The card leaves Handed off only once the resume note has a receipt.
-            row["card"] = {"number": number, "stage": phase(ticket, state, p["title"]),
+            row["card"] = {"number": number, "stage": (state.get("card") or {}).get("stage") or phase(ticket, state, p["title"]),
                            "agent": card_agent(ticket["agent"], "review" in p["title"], p["label"])}
         # One transaction: an interruption leaves either the predecessor row (adopted again) or the new row.
         with db:
@@ -1941,11 +2058,18 @@ def watch_pass(args, db, actions, errors):
         saved.pop(terminal, None)
         saved[handle] = json.dumps(row)
         actions.append({"issue": number, "restarted": p["dispatch"], "as": new, "why": p["why"], "account": p["label"]})
-        restore_coordinator(p.get("coordinator"))
         send_note(handle, row)
 
     def send_note(handle, row):
-        """The resume note is resent each tick until Orca returns a receipt; then the card is restored."""
+        """Retried each tick until confirmed: the coordinator's account, the resume note, then the card."""
+        failure = None
+        if row.get("coordinator"):
+            try:
+                restore_coordinator(row["coordinator"])
+                row.pop("coordinator")
+                save(handle, row)
+            except (OrcaError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as e:
+                failure = e  # the note and card go on; the restore is retried next tick
         if row.get("note"):
             note = row["note"]
             receipt = runtime("orchestration", "send", *actor, "--to", "dispatch:" + note["to"],
@@ -1958,6 +2082,8 @@ def watch_pass(args, db, actions, errors):
             stage(cards.get(card["number"]), card["stage"], card["agent"])
             row.pop("card")
             save(handle, row)
+        if failure:
+            raise failure
 
     def restore_prompt(ticket, state, title):
         """The forwarded prompt was answered: give the card back so review_tick reads the coder's report."""
@@ -1975,7 +2101,7 @@ def watch_pass(args, db, actions, errors):
         try:
             if (state.get("pending") or {}).get("starting") and state["pending"].get("task"):
                 resume_start(terminal, state)
-            elif state.get("note") or state.get("card"):
+            elif state.get("coordinator") or state.get("note") or state.get("card"):
                 send_note(terminal, state)
         except (OrcaError, OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as e:
             errors.append({"terminal": terminal, "error": str(e)})
@@ -2027,7 +2153,9 @@ def watch_pass(args, db, actions, errors):
                     continue
                 if w["dispatchStatus"] != "failed" or reported or stopped:
                     restore_prompt(ticket, state, title)  # answered, then finished before this tick
-                    save(terminal, None)  # finished, reported or stopped by the operator
+                    # Finished, reported or stopped; an unconfirmed restore, resume note or card target is kept.
+                    keep = state.get("coordinator") or state.get("note") or state.get("card")
+                    save(terminal, state if keep else None)
                     continue
                 exited = True
             if exited:

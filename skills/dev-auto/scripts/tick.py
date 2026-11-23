@@ -1916,35 +1916,48 @@ def watch_pass(args, db, actions, errors):
             edit.pop(terminal, None)
             edit[handle] = dict(account=p["account"], label=p["label"], agent=route[0], model=route[1],
                                 effort=route[2], host="local", at=int(now))
-        if number is not None:
-            review = review_state(db, run, number)
-            if review and review.get("coder") == p["dispatch"]:
-                review.update(coder=new, expected=new, coder_terminal=handle)
-                if review.get("agent"):
-                    review["agent"] = card_agent(review["agent"], False, p["label"])
-                save_review(db, run, number, review)
-            elif review and (review.get("reviewer") or {}).get("dispatch") == p["dispatch"]:
-                review["reviewer"].update(dispatch=new, terminal=handle)
-                review["expected"] = new
-                save_review(db, run, number, review)
-        save(terminal, None)
+        review = review_state(db, run, number) if number is not None else None
+        if review and review.get("coder") == p["dispatch"]:
+            review.update(coder=new, expected=new, coder_terminal=handle)
+            if review.get("agent"):
+                review["agent"] = card_agent(review["agent"], False, p["label"])
+        elif review and (review.get("reviewer") or {}).get("dispatch") == p["dispatch"]:
+            review["reviewer"].update(dispatch=new, terminal=handle)
+            review["expected"] = new
+        else:
+            review = None
         row = {"relaunched": bool(state.get("relaunched") or p["crash"]), "account": p["account"],
                "note": {"to": new, "subject": f"#{number}: resume" if number else "resume", "body": p["note"]}}
-        save(handle, row)
         if ticket:
-            stage(ticket, phase(ticket, state, p["title"]), card_agent(ticket["agent"], "review" in p["title"], p["label"]))
+            # The card leaves Handed off only once the resume note has a receipt.
+            row["card"] = {"number": number, "stage": phase(ticket, state, p["title"]),
+                           "agent": card_agent(ticket["agent"], "review" in p["title"], p["label"])}
+        # One transaction: an interruption leaves either the predecessor row (adopted again) or the new row.
+        with db:
+            if review:
+                db.execute("INSERT OR REPLACE INTO reviews VALUES (?,?,?)", (run, number, json.dumps(review)))
+            db.execute("DELETE FROM watch WHERE run=? AND terminal=?", (run, terminal))
+            db.execute("INSERT OR REPLACE INTO watch VALUES (?,?,?)", (run, handle, json.dumps(row)))
+        saved.pop(terminal, None)
+        saved[handle] = json.dumps(row)
         actions.append({"issue": number, "restarted": p["dispatch"], "as": new, "why": p["why"], "account": p["label"]})
         restore_coordinator(p.get("coordinator"))
         send_note(handle, row)
 
     def send_note(handle, row):
-        """The resume note is resent each tick until Orca returns a receipt."""
-        note = row["note"]
-        receipt = runtime("orchestration", "send", *actor, "--to", "dispatch:" + note["to"],
-                          "--subject", note["subject"], "--body", note["body"])
-        row.pop("note")
-        save(handle, row)
-        actions.append({"note": receipt.get("delivery"), "to": note["to"]})
+        """The resume note is resent each tick until Orca returns a receipt; then the card is restored."""
+        if row.get("note"):
+            note = row["note"]
+            receipt = runtime("orchestration", "send", *actor, "--to", "dispatch:" + note["to"],
+                              "--subject", note["subject"], "--body", note["body"])
+            row.pop("note")
+            save(handle, row)
+            actions.append({"note": receipt.get("delivery"), "to": note["to"]})
+        if row.get("card"):
+            card = row["card"]
+            stage(cards.get(card["number"]), card["stage"], card["agent"])
+            row.pop("card")
+            save(handle, row)
 
     def restore_prompt(ticket, state, title):
         """The forwarded prompt was answered: give the card back so review_tick reads the coder's report."""
@@ -1962,7 +1975,7 @@ def watch_pass(args, db, actions, errors):
         try:
             if (state.get("pending") or {}).get("starting") and state["pending"].get("task"):
                 resume_start(terminal, state)
-            elif state.get("note"):
+            elif state.get("note") or state.get("card"):
                 send_note(terminal, state)
         except (OrcaError, OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as e:
             errors.append({"terminal": terminal, "error": str(e)})

@@ -573,6 +573,13 @@ with TemporaryDirectory() as tmp:
     check.assertEqual(run("-C", str(wt), "status", "--porcelain", "--untracked-files=all"), "")
     exclude = Path(run("-C", str(wt), "rev-parse", "--path-format=absolute", "--git-path", "info/exclude").strip())
     check.assertEqual(exclude.read_text().splitlines().count(".codex/"), 1)
+    # The exclude is the clone's shared one: .codex/ stays out of the main checkout and every other worktree too.
+    other = Path(tmp) / "other"
+    run("-C", str(repo), "worktree", "add", "-q", "-b", "task/y", str(other))
+    for checkout in (repo, other):
+        (checkout / ".codex").mkdir(exist_ok=True)
+        (checkout / ".codex/config.toml").write_text("x = 1\n")
+        check.assertEqual(run("-C", str(checkout), "status", "--porcelain", "--untracked-files=all"), "")
 
 with patch.object(tick, "command", side_effect=[json.dumps({"id": "project"}), json.dumps({"fields": [
         {"name": "Status", "id": "status", "options": [{"name": "In Progress", "id": "progress"}]},
@@ -1366,12 +1373,52 @@ with TemporaryDirectory() as tmp:
     holds = json.loads(f.holds.read_text())
     assert "term_coder" not in holds and holds["term_restart"]["account"] == "x2"
     assert tick.review_state(f.db, "run", 553)["coder"] == "ctx_restart"
-    assert f.cards[-1] == ("Coding", "coder gpt-6.2-astra medium @x2") and f.sent() == []
+    assert f.cards[-1][0] == "Handed off" and f.sent() == []  # pending until the note is confirmed
+    assert json.loads(dict(f.db.execute("SELECT terminal,state FROM watch"))["term_restart"])["card"]["stage"] == "Coding"
     f.note_error = None
     calls = f.tick(1)
     assert ("orchestration", "worker-start") not in calls and len(f.notes) == 1 and "ctx_coder" in f.notes[0]
+    assert f.cards[-1] == ("Coding", "coder gpt-6.2-astra medium @x2")
     f.tick(1)
-    assert len(f.notes) == 1
+    assert len(f.notes) == 1 and f.cards[-1][0] == "Coding"
+
+
+class FailingWatchInsert:
+    """A connection that dies writing the successor's watch row once, inside adopt's transaction."""
+    def __init__(self, db):
+        self.db, self.armed = db, True
+
+    def __enter__(self):
+        return self.db.__enter__()
+
+    def __exit__(self, *exc):
+        return self.db.__exit__(*exc)
+
+    def execute(self, sql, params=()):
+        if self.armed and sql.startswith("INSERT OR REPLACE INTO watch") and params[1] == "term_restart":
+            self.armed = False
+            raise sqlite3.OperationalError("disk I/O error")
+        return self.db.execute(sql, params)
+
+
+# Interrupted inside the adoption transaction: the predecessor row and review state survive, the next tick adopts once.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    tick.review_state(f.db, "run", 553)
+    tick.save_review(f.db, "run", 553, {"coder": "ctx_coder", "expected": "ctx_coder", "coder_terminal": "term_coder"})
+    real, f.db = f.db, FailingWatchInsert(f.db)
+    with check.assertRaises(tick.OrcaError):
+        f.tick()
+    assert "disk I/O error" in f.lines[0] and f.notes == [] and f.cards[-1][0] == "Handed off"
+    rows = dict(real.execute("SELECT terminal,state FROM watch"))
+    assert list(rows) == ["term_coder"] and json.loads(rows["term_coder"])["pending"]["starting"]
+    assert tick.review_state(real, "run", 553)["coder"] == "ctx_coder"
+    f.db = real
+    calls = f.tick(1)
+    assert ("orchestration", "worker-start") not in calls and len(f.notes) == 1
+    assert list(dict(real.execute("SELECT terminal,state FROM watch"))) == ["term_restart"]
+    assert tick.review_state(real, "run", 553)["coder"] == "ctx_restart"
+    assert f.cards[-1] == ("Coding", "coder gpt-6.2-astra medium @x2")
 
 # A crash relaunches once, on any seat, in the worker's own phase; a second crash goes to the Run as Needs you.
 with TemporaryDirectory() as tmp:

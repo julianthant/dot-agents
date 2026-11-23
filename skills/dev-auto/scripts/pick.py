@@ -70,8 +70,10 @@ def live_holds(host):
 
 def windows(cfg, row, now):
     """(five_hour %, weekly %) from the newest reading of any age, Orca's or the CLI file's; a
-    window whose reset has passed reads 0. (None, None) when the account was never read."""
-    found = [r for r in (account_usage.orca_usage(now).get(account_usage.orca_key(row, now)), account_usage.file_usage(row)) if r]
+    window whose reset has passed reads 0. (None, None) when the account was never read.
+    Codex homes share one sessions folder, so a Codex row reads the file only when Orca has none."""
+    orca = account_usage.orca_usage(now).get(account_usage.orca_key(row, now))
+    found = [r for r in (orca, None if orca and row["agent"] == "codex" else account_usage.file_usage(row)) if r]
     if not found:
         return None, None
     _at, read = max(found, key=lambda r: float(r[0]))

@@ -559,27 +559,32 @@ with TemporaryDirectory() as temp, ExitStack() as stack:
     start.assert_called_once()
 
 
-# An unresolved attempt still owns its paths and seat; an unrelated ticket can start.
+# An unresolved attempt still holds its seat. A Bug can start alongside live work on overlapping paths.
 with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory:") as db:
     root = Path(tmp)
-    stuck = dict(ticket, number=40, branch="task/a/stuck", paths=["src/occupied"])
-    overlap_ticket = dict(ticket, number=41, branch="task/a/overlap", paths=["src/occupied/file"])
+    stuck = dict(ticket, number=40, branch="task/a/stuck", paths=["src/occupied", "src/unrelated"])
+    overlap_ticket = dict(ticket, number=41, branch="task/a/overlap", kind="Bug", paths=["src/occupied/file"])
     tick.reserve(db, 40, dict(task="stuck", run="different", route=base["route"], account="held"))
     args = SimpleNamespace(repo_path=root, dry_run=False, issue=None, holds=root / "holds.json")
     stack.enter_context(patch.object(tick, "command", git))
     raced = False
     stack.enter_context(patch.object(tick, "tickets", side_effect=lambda fresh=False: [dict(t) for t in (stuck, overlap_ticket, ticket)]))
     stack.enter_context(patch.object(tick, "supervisor", return_value=([], "own")))
-    stack.enter_context(patch.object(tick, "inventory", return_value=set()))
+    def live_inventory(path, issues, repo):
+        next(t for t in issues if t["number"] == 40)["live"] = True
+        return set()
+    stack.enter_context(patch.object(tick, "inventory", side_effect=live_inventory))
     stack.enter_context(patch.object(pick.account_usage, "load_config", return_value={}))
     picker = stack.enter_context(patch.object(pick, "pick", return_value=(account, [])))
     start = stack.enter_context(patch.object(tick, "launch"))
     output = stack.enter_context(redirect_stdout(io.StringIO()))
     tick.fill_tick(args, db)
     check.assertIn("reconcile from its owning Run", output.getvalue())
-    check.assertIn("overlaps #40", output.getvalue())
-    check.assertEqual(start.call_args.args[2]["number"], ticket["number"])
-    start.assert_called_once()
+    starts = [call.args[2] for call in start.call_args_list]
+    check.assertEqual([t["number"] for t in starts], [41, ticket["number"]])
+    check.assertIn("#40", starts[0]["overlap_note"])
+    check.assertIn("src/occupied", starts[0]["overlap_note"])
+    check.assertNotIn("src/unrelated", starts[0]["overlap_note"])
     check.assertEqual(picker.call_args.kwargs["holds"][0]["account"], "held")
     check.assertEqual(db.execute("SELECT issue FROM starts").fetchall(), [(40,)])
 

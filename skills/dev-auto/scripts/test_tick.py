@@ -1494,7 +1494,7 @@ with patch.object(tick, "runtime", side_effect=ancestry), patch.object(tick, "gr
 
 def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncertain=False, remote_race=False,
                   release_unknown=False, ticks=1, card_fails=False, send_lost=False, rewritten=False, pre_upgrade=None,
-                  rollback=False):
+                  rollback=False, remote_worker=False):
     root = Path(tmp)
     path = str(root / "task-tree")
     branch = "task/dev-auto/example"
@@ -1517,6 +1517,8 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
                for dispatch, terminal, owns in (("ctx_merge", "term_coder", True),
                                                 ("ctx_review", "term_reviewer", True),
                                                 ("ctx_initial", "term_coder", False))]
+    if remote_worker:
+        workers.insert(1, dict(dispatchId="ctx_wsl", taskId="task_wsl", host="Juzzark-WSL", state="ready"))
     events = []
     tree = dict(id=worktree, path=path, branch=ref, isMainWorktree=False)
     present = True
@@ -1689,7 +1691,7 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
         assert any(event[:2] == RM for event in events) == refused
 
 
-for scenario in ({}, {"merged": False}, {"dirty": True}, {"refused": True},
+for scenario in ({}, {"remote_worker": True}, {"merged": False}, {"dirty": True}, {"refused": True},
                  {"release_uncertain": True}, {"remote_race": True}, {"release_unknown": True},
                  {"release_uncertain": True, "ticks": 2}, {"release_uncertain": True, "ticks": 3, "card_fails": True},
                  {"release_uncertain": True, "ticks": 3, "send_lost": True},
@@ -2740,21 +2742,31 @@ with TemporaryDirectory() as tmp, ExitStack() as stack:
     starts = [line for line in result.getvalue().splitlines() if "would start" in line]
     assert len(starts) == 2 and '"host": "local"' in starts[0] and '"host": "Juzzark-WSL"' in starts[1]
 
-# A coordinator-side mirror has no terminal. Confirm the Dispatch and hold the
-# physical terminal in the execution-host checkout, including on receipt recovery.
-with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory:") as db:
-    root = Path(tmp)
+# Fill recovers a remote worker before its Dispatch is visible to dispatch-show.
+def remote_start(root, stack, db, has_receipt):
     host = "Juzzark-WSL"
     work = dict(base, number=99, sha="abc", base="origin/main")
     wt = {"id": "wsl-tree", "branch": work["branch"], "head": "abc", "path": "/remote/worktree"}
     dispatch = {"id": "ctx", "taskId": "task", "runId": "run"}
+    listed = False
+    starts = []
+
     def home_rpc(*args):
         if args[:2] == ("orchestration", "worker-start"):
+            starts.append(args)
             assert args[args.index("--on") + 1] == host
             assert args[args.index("--worktree") + 1] == "path:/remote/worktree"
-            raise tick.OrcaError("start response lost")
-        return {"task-create": {"task": {"id": "task"}}, "dispatch-show": {"dispatch": dispatch},
-                "worker-show": {"dispatch": dispatch, "worker": {"worktreeId": None}}}[args[1]]
+            return full_start("ctx", "wsl-term") if has_receipt else {"dispatchId": "ctx"}
+        if args[:2] == ("orchestration", "worker-list"):
+            assert "--include-remote" in args and args[args.index("--run") + 1] == "run"
+            if listed and "--cursor" not in args:
+                return {"workers": [{"dispatchId": "other", "taskId": "other", "host": host}],
+                        "page": {"hasMore": True, "nextCursor": "next"}}
+            if listed:
+                assert args[args.index("--cursor") + 1] == "next"
+            return {"workers": [{"dispatchId": "ctx", "taskId": "task", "state": "ready", "host": host}]
+                    if listed else [], "page": {"hasMore": False}}
+        return {"task-create": {"task": {"id": "task"}}, "dispatch-show": {"dispatch": None}}[args[1]]
 
     def remote_rpc(target, *args):
         assert target == host
@@ -2762,8 +2774,12 @@ with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory
             assert args[args.index("--repo") + 1] == "path:/remote/relay"
             return {"worktree": wt}
         if args[:2] == ("orchestration", "worker-show"):
+            assert args[args.index("--dispatch") + 1] == "ctx"
             return {"dispatch": dict(dispatch, assigneeHandle="wsl-term"), "worker": {"state": "ready", "worktreeId": wt["id"]},
                     "terminal": {"handle": "wsl-term"}}
+        if args[:2] == ("worktree", "show"):
+            assert args == ("worktree", "show", "--worktree", "id:wsl-tree")
+            return {"worktree": wt}
         assert args[:2] == ("terminal", "read") and "wsl-term" in args
         return {"terminal": {"tail": ["ready"]}}
 
@@ -2775,7 +2791,40 @@ with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory
     select = stack.enter_context(patch.object(pick.account_usage, "remote_account",
                                              side_effect=[{}, {"codex": {"activeAccountId": "seat"}}]))
     stack.enter_context(patch.object(tick, "remote_tree_settings"))
-    tick.launch(db, Path("/remote/relay"), work, dict(account, host=host), args, root / "holds.json")
+    stack.enter_context(patch.object(tick, "inventory", return_value=set()))
+    stack.enter_context(patch.object(pick.account_usage, "load_config", return_value={}))
+    stack.enter_context(patch.object(tick, "command", side_effect=lambda *argv:
+                                    "git@github.com:julianthant/hr-relay.git" if "get-url" in argv else ""))
+    args = SimpleNamespace(repo_path=root, issue=99, dry_run=False, holds=root / "holds.json")
+    if has_receipt:
+        tick.launch(db, Path("/remote/relay"), work, dict(account, host=host), args, args.holds)
+    else:
+        with check.assertRaisesRegex(tick.OrcaError, "no Dispatch"):
+            tick.launch(db, Path("/remote/relay"), work, dict(account, host=host), args, args.holds)
+    listed = True
+    with redirect_stdout(io.StringIO()) as output:
+        tick.fill_tick(args, db, issues=[])
+    assert "pending" not in output.getvalue(), output.getvalue()
+    assert len(starts) == 1
     assert select.call_args_list[0].args == (host, "select", "--agent", "codex", "--account", "seat")
-    assert json.loads((root / "holds.json").read_text())["wsl-term"]["host"] == host
+    assert json.loads(args.holds.read_text())["wsl-term"]["host"] == host
     assert db.execute("SELECT receipt FROM starts WHERE issue=99").fetchone() == ("done",)
+    state = tick.review_state(db, "run", 99)
+    assert (state["coder"], state["expected"], state["coder_terminal"], state["stage"]) == (
+        "ctx", "ctx", "wsl-term", "Coding")
+    assert state["path"] == wt["path"]
+
+    review_ticket = dict(work, item="card", agent=state["agent"])
+    with (patch.object(tick, "tickets", return_value=[review_ticket]),
+          patch.object(tick, "green_report", return_value=None) as check_ci,
+          patch.object(tick, "review_card"), patch.object(tick, "runtime", side_effect=[
+              {"messages": [report("ctx", "waiting for CI")]}, {"tasks": []},
+              {"delivery": "follow_up", "followUpOf": "ctx", "dispatchId": "fix"}]) as review_rpc):
+        tick.review_tick(SimpleNamespace(issue=99, coder=None), db)
+    check_ci.assert_called_once()
+    assert review_rpc.call_args.args[:4] == ("orchestration", "send", "--to", "dispatch:ctx")
+
+
+for has_receipt in (False, True):
+    with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory:") as db:
+        remote_start(Path(tmp), stack, db, has_receipt)

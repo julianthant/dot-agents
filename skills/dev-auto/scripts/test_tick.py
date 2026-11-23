@@ -1513,6 +1513,7 @@ class Fleet:
         self.followups = []  # Tasks Orca created for mail to a settled Dispatch
         self.note_lost = False  # the send to the replacement applies, but its reply is lost
         self.follow_retried = False  # Orca retried the follow-up Task; its newest attempt has no followUpOf
+        self.follow_terminal = "term_follow"  # the fresh pane Orca starts a follow-up in; None before its worker record
         self.tickets_error = None
         self.receipts = {}  # Orca's recorded receipts by request id
         self.db = sqlite3.connect(":memory:")
@@ -1546,9 +1547,11 @@ class Fleet:
             return {"dispatch": {"id": current, "status": "dispatched", "taskId": None, "assigneeHandle": None}}
         if verb == ("orchestration", "worker-show") and args[3] == "ctx_follow_retry":
             return {"dispatch": {"id": "ctx_follow_retry", "runId": "run", "taskId": "task_follow",
-                                 "retryOfDispatchId": "ctx_follow", "followUpOf": None}}
+                                 "retryOfDispatchId": "ctx_follow", "followUpOf": None},
+                    **self.follow_worker("ctx_follow_retry")}
         if verb == ("orchestration", "worker-show") and args[3] == "ctx_follow":
-            return {"dispatch": {"id": "ctx_follow", "runId": "run", "taskId": "task_follow", "followUpOf": "ctx_restart"}}
+            return {"dispatch": {"id": "ctx_follow", "runId": "run", "taskId": "task_follow", "followUpOf": "ctx_restart"},
+                    **self.follow_worker("ctx_follow")}
         if verb == ("orchestration", "dispatch-show"):
             # Recorded shape: only the newest Dispatch's id and status.
             return {"dispatch": {"id": self.dispatch, "status": self.status, "taskId": None, "assigneeHandle": None}}
@@ -1614,6 +1617,11 @@ class Fleet:
                 return receipt
             return {"delivery": "queued"}
         raise AssertionError(args)
+
+    def follow_worker(self, dispatch):
+        """Orca's worker record for a follow-up, omitted while it has none."""
+        return {"worker": {"dispatchId": dispatch, "effects": [
+            {"kind": "terminal", "role": "agent", "action": "created", "id": self.follow_terminal}]}} if self.follow_terminal else {}
 
     def tick(self, minutes=0):
         self.now += minutes * 60
@@ -1765,8 +1773,39 @@ with TemporaryDirectory() as tmp:
     assert len(f.notes) == 1 and f.cards[-1] == ("Coding", "coder gpt-6.2-astra medium @x2")
     review = tick.review_state(f.db, "run", 553)
     assert (review["coder"], review["expected"]) == ("ctx_follow", "ctx_follow") and "followed up" in f.lines[0]
+    assert review["coder_terminal"] == "term_follow"
     f.tick(1)
     assert not f.db.execute("SELECT * FROM watch").fetchall() and len(f.notes) == 1
+
+# A reviewer's settled replacement gets its note as a follow-up in a fresh pane. Review takes the pane with the
+# Dispatch, so a handoff there is not read as a review failure.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    f.title = "#553 review"
+    tick.review_state(f.db, "run", 553)
+    tick.save_review(f.db, "run", 553, {"coder": "ctx_c", "expected": "ctx_coder", "coder_terminal": "term_c",
+                                        "reviewer": {"dispatch": "ctx_coder", "terminal": "term_coder",
+                                                     "holds": str(f.holds)}})
+    f.note_error = tick.OrcaError("mailbox busy")
+    with check.assertRaises(tick.OrcaError):
+        f.tick()
+    f.status, f.state, f.liveness = "completed", "succeeded", "exited"
+    f.note_error, f.follow_terminal = None, None
+    with check.assertRaisesRegex(tick.OrcaError, "watch error"):
+        f.tick(1)
+    assert json.loads(dict(f.db.execute("SELECT terminal,state FROM watch"))["term_restart"])["note"]
+    review = tick.review_state(f.db, "run", 553)
+    assert review["expected"] == "ctx_restart" and review["reviewer"]["terminal"] == "term_restart"
+    f.follow_terminal = "term_follow"
+    f.tick(1)
+    assert len(f.notes) == 1 and len(f.followups) == 1
+    review = tick.review_state(f.db, "run", 553)
+    assert review["expected"] == "ctx_follow" and review["reviewer"]["dispatch"] == "ctx_follow"
+    assert review["reviewer"]["terminal"] == "term_follow"
+    f.db.execute("INSERT OR REPLACE INTO watch VALUES ('run','term_follow',?)", (json.dumps({"handoff": 1}),))
+    done = {"type": "worker_done", "id": "m1", "sequence": 9,
+            "payload": json.dumps({"dispatchId": "ctx_follow", "outcome": "failed"})}
+    assert tick.failed_reviews(f.db, "run", tick.review_state(f.db, "run", 553), [done]) == []
 
 # The settled-worker send applies but its reply is lost: the next tick adopts the follow-up Orca started instead of
 # sending again, even after Orca retried that Task. With no review state yet, the follow-up is recorded for review's

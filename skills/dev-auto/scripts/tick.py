@@ -2179,10 +2179,20 @@ def watch_pass(args, db, actions, errors):
                 # The replacement had settled, so the note started a new Dispatch; review must expect that one.
                 new = followup_dispatch(receipt, note["to"], run)
                 review = review_state(db, run, number) if number is not None else None
-                if review and review.get("coder") == note["to"]:
-                    review.update(coder=new, expected=new)
-                elif review and (review.get("reviewer") or {}).get("dispatch") == note["to"]:
-                    review["reviewer"]["dispatch"] = review["expected"] = new
+                coder = review and review.get("coder") == note["to"]
+                reviewer = review and (review.get("reviewer") or {}).get("dispatch") == note["to"]
+                if coder or reviewer:
+                    # The follow-up may run in a fresh pane, so review takes its verified terminal with its Dispatch.
+                    show = runtime("orchestration", "worker-show", "--dispatch", new, "--full")
+                    if (show["dispatch"]["id"] != new or show["dispatch"]["runId"] != run
+                            or start_identity(show.get("worker") or {})[0] != new):
+                        raise OrcaError(f"unverified follow-up {new} of {note['to']}")
+                    terminal = start_identity(show["worker"])[1]
+                if coder:
+                    review.update(coder=new, expected=new, coder_terminal=terminal)
+                elif reviewer:
+                    review["reviewer"].update(dispatch=new, terminal=terminal)
+                    review["expected"] = new
                 else:
                     review = None
                 actions.append({"issue": number, "followed up": note["to"], "as": new})

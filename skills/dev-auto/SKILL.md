@@ -9,8 +9,8 @@ disable-model-invocation: true
 Run these commands from this skill's directory. The picker reads accounts in
 `accounts.toml` order (override the path with `DEV_AUTO_ACCOUNTS`) and applies
 `limits.toml` to the newest usage reading from Orca or the account's CLI files.
-Codex homes share one sessions folder, so a Codex account reads its CLI files
-only when Orca has no reading for it.
+Codex homes share one sessions folder that names no account, so a Codex
+account reads only Orca's per-account reading, never its CLI files.
 Pass the same `--host` to all three commands for a remote environment. The
 default host is `local` and the default effort is `medium`.
 
@@ -19,8 +19,8 @@ default host is `local` and the default effort is `medium`.
    account qualifies, the picker exits 1 and writes skip reasons to stderr.
    It skips an account with under 10% of its 5-hour window or 5% of its week
    left, so no start or restart lands on an account about to hand off. Each
-   window comes from the newest reading that has it; a Codex account reads the
-   shared sessions file only while it is Orca's active Codex account. A plan's
+   window comes from the newest reading that has it; a Codex account never reads
+   the shared sessions file. A plan's
    `prefer_models` in `limits.toml` put those models on its accounts first and
    every other model on them last (Pro Lite takes gpt-6.2-astra before Plus).
 

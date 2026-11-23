@@ -1,10 +1,16 @@
 """Account configuration and usage readings for the Orca picker."""
 
+import base64
+import hashlib
 import json
 import os
+import shlex
 import subprocess
 import sys
+import time
 import tomllib
+import uuid
+import zlib
 from datetime import datetime
 from pathlib import Path
 
@@ -139,18 +145,96 @@ def usage_windows(row):
     return (read_at, found) if found and read_at else None
 
 
-def orca_usage(now):
-    """This Mac's Orca readings, fetched once per `now`: (read epoch, [(used percent,
-    reset epoch, window)]) per (agent, Orca account id); Grok's one reading has no id."""
-    if now in ORCA_USAGE:
-        return ORCA_USAGE[now]
+def host_orca(host, *args):
+    reply = subprocess.run([ORCA, *args, "--environment", host, "--json"], capture_output=True,
+                           text=True, timeout=120)
+    data = json.loads(reply.stdout)
+    if reply.returncode or not data.get("ok"):
+        raise OSError(f"{host}: {' '.join(args[:2])} failed: {data.get('error')}")
+    return data["result"]
+
+
+def host_checkout(host, repo):
+    matches = [r["path"] for r in host_orca(host, "repo", "list")["repos"]
+               if (r.get("gitRemoteIdentity") or {}).get("canonicalKey") == "github.com/julianthant/" + repo]
+    if len(matches) != 1:
+        raise ValueError(f"{host} needs one registered julianthant/{repo} checkout")
+    return matches[0]
+
+
+def remote_output(host, checkout, argv):
+    """Run argv on the execution host. A nonce and digest distinguish complete output from shell echo or truncation."""
+    tag = uuid.uuid4().hex
+    script = """import base64, hashlib, json, subprocess, sys, textwrap, zlib
+p = subprocess.run(json.loads(sys.argv[2]), capture_output=True, timeout=100)
+data = p.stdout if p.returncode == 0 else b''
+tag = sys.argv[1]
+for chunk in textwrap.wrap(base64.b64encode(zlib.compress(data)).decode(), 48):
+    print(tag + ' ' + chunk)
+print(tag + ' END', p.returncode, hashlib.sha256(data).hexdigest())
+"""
+    # One physical line: an interactive shell must not execute a partial multiline paste.
+    command = shlex.join(["python3", "-c", "exec(" + repr(script) + ")", tag, json.dumps(argv)])
+    result = host_orca(host, "terminal", "create", "--worktree", "path:" + str(checkout),
+                       "--title", "dev-auto", "--command", command)
+    handle = result["terminal"]["handle"]
     try:
-        reply = subprocess.run([ORCA, "account", "list", "--json"], capture_output=True,
-                               text=True, timeout=120, check=False)
-        data = json.loads(reply.stdout) or {}
-        result = (data.get("result") or {}) if data.get("ok", True) else {}
-    except (OSError, subprocess.TimeoutExpired, ValueError):
-        result = {}
+        until = time.monotonic() + 115
+        while time.monotonic() < until:
+            lines = host_orca(host, "terminal", "read", "--terminal", handle, "--limit", "5000")["terminal"]["tail"]
+            parts = [line[len(tag) + 1:] for line in lines if line.startswith(tag + " ")]
+            if parts and parts[-1].startswith("END "):
+                _, code, digest = parts.pop().split()
+                if code != "0":
+                    raise OSError(f"{host}: {argv[0]} exited {code}")
+                raw = zlib.decompress(base64.b64decode("".join(parts), validate=True))
+                if hashlib.sha256(raw).hexdigest() != digest:
+                    raise ValueError(f"{host}: incomplete command output")
+                return raw.decode()
+            time.sleep(1)
+        raise TimeoutError(f"{host}: no receipt for {argv[0]}")
+    finally:
+        host_orca(host, "terminal", "close", "--terminal", handle)
+
+
+def remote_account(host, *args):
+    # Keep account identities and provider metadata out of the scratch terminal's transcript.
+    script = """import json, subprocess, sys
+r = json.loads(subprocess.check_output(["orca", "account", *sys.argv[1:], "--json"]))
+if not r["ok"]: sys.exit(1)
+out = {}
+if sys.argv[1] == "list":
+    data = r["result"]
+    out["rateLimits"] = {}
+    def windows(reading):
+        reading = reading or {}
+        return {k: reading.get(k) for k in ("updatedAt", "session", "weekly")}
+    for agent in ("claude", "codex"):
+        out[agent] = {"activeAccountId": data[agent].get("activeAccountId")}
+        limits = data["rateLimits"]
+        out["rateLimits"][agent] = windows(limits.get(agent))
+        key = "inactive" + agent.title() + "Accounts"
+        out["rateLimits"][key] = [{"accountId": a["accountId"], "rateLimits": windows(a.get("rateLimits"))}
+                                  for a in limits.get(key) or []]
+print(json.dumps(out))
+"""
+    return json.loads(remote_output(host, host_checkout(host, "hr-relay"), ["python3", "-c", script, *args]))
+
+
+def orca_usage(now, host="local"):
+    """Read each host once per picker snapshot, including inactive managed accounts."""
+    if (now, host) in ORCA_USAGE:
+        return ORCA_USAGE[now, host]
+    if host != "local":
+        result = remote_account(host, "list")
+    else:
+        try:
+            reply = subprocess.run([ORCA, "account", "list", "--json"], capture_output=True,
+                                   text=True, timeout=120, check=False)
+            data = json.loads(reply.stdout) or {}
+            result = (data.get("result") or {}) if data.get("ok", True) else {}
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            result = {}
     limits = result.get("rateLimits") or {}
     readings = {}
     found = [("grok", None, limits.get("grok"))]
@@ -174,8 +258,9 @@ def orca_usage(now):
         ]
         if windows and reading.get("updatedAt") and (key or agent == "grok"):
             readings[agent, key] = (reading["updatedAt"] / 1000, windows)
-    ORCA_USAGE.clear()
-    ORCA_USAGE[now] = readings
+    if len(ORCA_USAGE) > 32:
+        ORCA_USAGE.clear()
+    ORCA_USAGE[now, host] = readings
     return readings
 
 
@@ -187,7 +272,7 @@ def orca_key(row, now):
     agent = row["agent"]
     if agent == "grok":
         return agent, None
-    readings = orca_usage(now)
+    readings = orca_usage(now, row["host"])
     if (agent, row["id"]) in readings or row["host"] != "local" or not row["home"]:
         return agent, row["id"]
     parts = Path(row["home"]).parts

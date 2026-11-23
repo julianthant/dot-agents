@@ -72,9 +72,9 @@ def windows(cfg, row, now):
     """(five_hour %, weekly %), each window from the newest reading that has it, Orca's or the CLI
     file's; a window whose reset has passed reads 0. (None, None) when the account was never read.
     Codex homes share one sessions folder whose newest row names no account: Codex reads only Orca's."""
-    readings = account_usage.orca_usage(now)
+    readings = account_usage.orca_usage(now, row["host"])
     key = account_usage.orca_key(row, now)
-    shared = row["agent"] == "codex"
+    shared = row["agent"] == "codex" or row["host"] != "local"
     found = [r for r in (readings.get(key), None if shared else account_usage.file_usage(row)) if r]
     if not found:
         return None, None
@@ -201,7 +201,7 @@ def past_handoff(row, five, week):
 
 def coordinator(cfg, host, now, active):
     """The selected Codex account also runs the coordinator bot; past its handoff point, choose another."""
-    row = next((r for r in cfg["account"] if r["id"] == active), None)
+    row = next((r for r in cfg["account"] if r.get("host", "local") == host and r["id"] == active), None)
     if row is not None:
         five, week = windows(cfg, row, now)
         if five is not None and past_handoff(row, five, week) is None:
@@ -231,7 +231,7 @@ def due(cfg, host, now):
     """Live holds whose account is past its handoff point, as (label, terminal, why)."""
     holds = json.loads(HOLDS.read_text()) if HOLDS.exists() else {}
     alive = {h for h in live_handles(host)} if holds else set()
-    rows = {r["id"]: r for r in cfg["account"]}
+    rows = {r["id"]: r for r in cfg["account"] if r["host"] == host}
     found = []
     for handle, rec in holds.items():
         row = rows.get(rec["account"])
@@ -244,7 +244,7 @@ def due(cfg, host, now):
 
 
 def hold(cfg, args):
-    row = next((r for r in cfg["account"] if args.account in (r["id"], r["label"])), None)
+    row = next((r for r in cfg["account"] if r["host"] == args.host and args.account in (r["id"], r["label"])), None)
     if row is None:
         raise SystemExit(f"no account {args.account} in accounts.toml")
     with edit_holds(HOLDS) as holds:
@@ -258,7 +258,7 @@ LIM = tomllib.loads(LIMITS.read_text())
 
 def main(argv=None):
     p = argparse.ArgumentParser()
-    p.add_argument("command", choices=["pick", "hold", "due", "coordinator", "fill"])
+    p.add_argument("command", choices=["pick", "select", "hold", "due", "coordinator", "fill"])
     p.add_argument("--agent", choices=["claude", "codex"])
     p.add_argument("--model")
     p.add_argument("--effort", default="medium")
@@ -277,12 +277,22 @@ def main(argv=None):
         if ready and seat:
             print(f"{len(ready)} ready tickets and a free seat: " + ", ".join(f"#{i['n']}" for i in ready[:10]))
         return 0 if ready and seat else 1
+    def account_command(*args_):
+        if args.host != "local":
+            return account_usage.remote_account(args.host, *args_)
+        out = subprocess.run(["orca", "account", *args_, "--json"], capture_output=True, text=True, check=True)
+        return json.loads(out.stdout)["result"]
+
+    if args.command == "select":
+        if not (args.agent and args.account):
+            raise SystemExit("select needs --agent and --account")
+        account_command("select", "--agent", args.agent, "--account", args.account)
+        return 0
     if args.command == "coordinator":
-        out = subprocess.run(["orca", "account", "list", "--json"], capture_output=True, text=True, check=True).stdout
-        active = json.loads(out)["result"]["codex"]["activeAccountId"]
+        active = account_command("list")["codex"]["activeAccountId"]
         new = coordinator(cfg, args.host, time.time(), active)
         if new is not None:
-            subprocess.run(["orca", "account", "select", "--agent", "codex", "--account", new["id"]], capture_output=True, check=True)
+            account_command("select", "--agent", "codex", "--account", new["id"])
             print(f"coordinator account switched to {new['label']}")
         return 0
     if not (args.agent and args.model):
@@ -297,9 +307,10 @@ def main(argv=None):
         print(line, file=sys.stderr)
     if row is None:
         return 1
-    print(json.dumps({"id": row["id"], "label": row["label"], "plan": row["plan"],
-                      "select": ["orca", "account", "select", "--agent", args.agent,
-                                 "--account", row["id"]]}))
+    select = (["orca", "account", "select"] if args.host == "local" else
+              [sys.executable, str(Path(__file__).resolve()), "select", "--host", args.host])
+    print(json.dumps({"id": row["id"], "label": row["label"], "plan": row["plan"], "host": args.host,
+                      "select": [*select, "--agent", args.agent, "--account", row["id"]]}))
     return 0
 
 

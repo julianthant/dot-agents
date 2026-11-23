@@ -288,6 +288,20 @@ def in_coder_chain(dispatch, previous, run):
     return False
 
 
+def follow_root(dispatch, attempts, run):
+    """The coder Task, and its attempt, that the follow-up's lineage reaches; it outranks any report."""
+    start, seen = dispatch, set()
+    while dispatch and dispatch not in seen:
+        seen.add(dispatch)
+        attempt = runtime("orchestration", "worker-show", "--dispatch", dispatch, "--full")["dispatch"]
+        if attempt["id"] != dispatch or attempt["runId"] != run:
+            break
+        if attempt.get("taskId") in attempts:
+            return attempt["taskId"], dispatch
+        dispatch = attempt.get("retryOfDispatchId") or attempt.get("followUpOf")
+    raise OrcaError(f"follow-up {start} does not reach a coder Task")
+
+
 def followup_dispatch(receipt, previous, run=None):
     dispatch = receipt.get("dispatchId")
     if (receipt.get("delivery") not in ("follow_up", "reopened", "started_fresh") or not dispatch
@@ -344,26 +358,35 @@ OWNER = "julianthant"
 HERE = Path(__file__).resolve().parent
 
 # Nested connections must be complete before their absence can establish readiness.
-QUERY = """
-query($endCursor:String) {
+ISSUE_FIELDS = """number title body state stateReason updatedAt issueType {name} milestone {title}
+  parent {number} subIssuesSummary {total completed}
+  assignees {totalCount} subIssues {totalCount} closedByPullRequestsReferences {totalCount}
+  labels(first:100){totalCount nodes{name}}
+  blockedBy(first:100){totalCount nodes{number state}}
+  blocking(first:100){totalCount nodes{state}}
+  projectItems(first:20){totalCount nodes{id project{number owner{... on User{login} ... on Organization{login}}}
+    status:fieldValueByName(name:"Status"){... on ProjectV2ItemFieldSingleSelectValue{name}}
+    agent:fieldValueByName(name:"Agent"){... on ProjectV2ItemFieldTextValue{text}}
+    stage:fieldValueByName(name:"Agent state"){... on ProjectV2ItemFieldSingleSelectValue{name}}
+    area:fieldValueByName(name:"Area"){... on ProjectV2ItemFieldSingleSelectValue{name}}
+  }}"""
+# Open issues keep creation order so an update mid-read cannot skip one; closed issues come newest first.
+ISSUES_QUERY = """query($endCursor:String,$states:IssueState!,$since:DateTime) {
   repository(owner:"julianthant",name:"hr-relay") {
-    issues(first:50,states:OPEN,after:$endCursor) {
+    issues(first:50,states:[$states],after:$endCursor,filterBy:{since:$since}%s) {
       pageInfo { hasNextPage endCursor }
-      nodes { number title body issueType {name} milestone {title}
-        assignees {totalCount} subIssues {totalCount} closedByPullRequestsReferences {totalCount}
-        labels(first:100){totalCount nodes{name}}
-        blockedBy(first:100){totalCount nodes{state}}
-        blocking(first:100){totalCount nodes{state}}
-        projectItems(first:20){totalCount nodes{id project{number owner{... on User{login} ... on Organization{login}}}
-          status:fieldValueByName(name:"Status"){... on ProjectV2ItemFieldSingleSelectValue{name}}
-          agent:fieldValueByName(name:"Agent"){... on ProjectV2ItemFieldTextValue{text}}
-          stage:fieldValueByName(name:"Agent state"){... on ProjectV2ItemFieldSingleSelectValue{name}}
-        }}
-      }
+      nodes { """ + ISSUE_FIELDS + """ }
     }
   }
 }
 """
+# One issue read per minute, shared by every tick verb and the roadmap rebuild (#592 bug 8).
+SNAPSHOT = Path.home() / ".local/state/dev-auto/issues.json"
+SNAPSHOT_SECONDS = 60
+CLOSED_FULL_SECONDS = 600
+CLOSED_KEPT = 400
+# The Project's id and its field and option ids are stable; field-list alone costs about 100 GraphQL points.
+PROJECT_CACHE = SNAPSHOT.with_name("project.json")
 
 
 class StartNotApplied(OrcaError):
@@ -372,6 +395,10 @@ class StartNotApplied(OrcaError):
 
 def command(*args):
     result = subprocess.run(args, capture_output=True, text=True, timeout=900 if "worker-start" in args else 90)
+    if args[:3] == ("gh", "project", "item-edit"):
+        stale_snapshot()
+        if result.returncode:
+            PROJECT_CACHE.unlink(missing_ok=True)  # a failed edit may mean renamed ids: refetch them next time
     if result.returncode:
         if args[1:3] == ("orchestration", "worker-start"):
             try:
@@ -419,7 +446,7 @@ def owned_paths(body):
     # These ownership descriptions in hr-relay use directory names and named config files.
     if "dot-agents" in section(body, "Branch"):
         return list(dict.fromkeys(paths)) or ["*"]
-    for phrase, path in ((r"backend storage", "src/backend/storage"), (r"tests?", "tests"),
+    for phrase, path in ((r"backend storage", "src/backend/storage"),
                          (r"documentation", "docs"), (r"workflows", ".github/workflows"),
                          (r"CI plan", "scripts/test/ci-plan.ts"), (r"smoke config", "playwright.smoke.config.ts")):
         if re.search(r"(?<![\w/.-])" + phrase + r"(?![\w/.-])", value, re.I):
@@ -438,44 +465,102 @@ def coder_route(body):
         return m.groups()
 
 
-def tickets():
-    pages = json.loads(command("gh", "api", "graphql", "--paginate", "--slurp", "-f", "query=" + QUERY))
+def issue_nodes(state, since=None, limit=None):
+    order = ",orderBy:{field:UPDATED_AT,direction:DESC}" if state == "CLOSED" else ""
+    out, cursor = [], None
+    while limit is None or len(out) < limit:
+        args = ["gh", "api", "graphql", "-f", "query=" + ISSUES_QUERY % order, "-f", "states=" + state]
+        args += ["-f", "since=" + since] if since else []
+        args += ["-f", "endCursor=" + cursor] if cursor else []
+        page = json.loads(command(*args))["data"]["repository"]["issues"]
+        out += page["nodes"]
+        if not page["pageInfo"]["hasNextPage"]:
+            break
+        cursor = page["pageInfo"]["endCursor"]
+    return out[:limit]
+
+
+def snapshot(fresh=False):
+    """Open issues and the newest closed ones, refetched at most once a minute across processes."""
+    import fcntl
+    SNAPSHOT.parent.mkdir(parents=True, exist_ok=True)
+    with SNAPSHOT.with_suffix(".lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            old = json.loads(SNAPSHOT.read_text())
+        except (OSError, ValueError):
+            old = {}
+        now = time.time()
+        if not fresh and 0 <= now - old.get("fetched", 0) < SNAPSHOT_SECONDS:
+            return old
+        opened = issue_nodes("OPEN")
+        # Closed issues change only when updated, so read the recent ones and a full list every ten minutes.
+        full = not 0 <= now - old.get("closed_full", 0) < CLOSED_FULL_SECONDS
+        since = None if full else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(old["read"] - 120))
+        closed = {} if full else {i["number"]: i for i in old.get("closed", [])}
+        closed.update((i["number"], i) for i in issue_nodes("CLOSED", since, CLOSED_KEPT if full else None))
+        numbers = {i["number"] for i in opened}
+        closed = sorted((i for n, i in closed.items() if n not in numbers), key=lambda i: i["updatedAt"], reverse=True)
+        new = {"fetched": now, "read": now, "closed_full": now if full else old["closed_full"],
+               "open": opened, "closed": closed[:CLOSED_KEPT]}
+        tmp = SNAPSHOT.with_suffix(".tmp")
+        tmp.write_text(json.dumps(new))
+        tmp.replace(SNAPSHOT)
+        return new
+
+
+def stale_snapshot():
+    """After a Project write, the next reader refetches open issues but keeps the closed list."""
+    import fcntl
+    if not SNAPSHOT.exists():
+        return
+    with SNAPSHOT.with_suffix(".lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            old = json.loads(SNAPSHOT.read_text())
+        except (OSError, ValueError):
+            return
+        tmp = SNAPSHOT.with_suffix(".tmp")
+        tmp.write_text(json.dumps({**old, "fetched": 0}))
+        tmp.replace(SNAPSHOT)
+
+
+def tickets(fresh=False):
     result = []
-    for page in pages:
-        for i in page["data"]["repository"]["issues"]["nodes"]:
-            card = next((c for c in nodes(i["projectItems"]) if c["project"]["number"] == PROJECT
-                         and c["project"]["owner"]["login"] == OWNER), None)
-            body = i["body"]
-            branch_section = section(body, "Branch")
-            m = re.search(r"\btask/([\w-]+)/([\w-]+)", branch_section)
-            branch = m[0] if m else None
-            if not branch:
-                slug = re.fullmatch(r"([\w-]+)\s*/\s*([\w-]+(?:[ \t]+[\w-]+)*)(?:\s*:.*)?", i["title"].strip())
-                if slug:
-                    lane = "-".join(slug[2].lower().split())
-                    branch = f"task/{slug[1].lower()}/{lane}"
-            dot = "dot-agents" in branch_section
-            card = card or {}
-            stage = (card.get("stage") or {}).get("name")
-            if dot:
-                base = "origin/main"
-            elif "development" in branch_section and "feature/" not in branch_section:
-                base = "origin/development"
-            else:
-                base = "origin/feature/" + branch.split("/")[1] if branch else None
-            result.append({
-                "number": i["number"], "title": i["title"], "item": card.get("id"), "body": body,
-                "agent": (card.get("agent") or {}).get("text"), "stage": stage,
-                "status": (card.get("status") or {}).get("name"), "kind": (i["issueType"] or {}).get("name"),
-                "assigned": bool(i["assignees"]["totalCount"] or (card.get("agent") or {}).get("text")),
-                "busy": bool(i["closedByPullRequestsReferences"]["totalCount"] or stage not in (None, "Queued")),
-                "later": (i["milestone"] or {}).get("title", "").lower() == "later"
-                         or any(label["name"].lower() == "later" for label in nodes(i["labels"])),
-                "blocked": bool(i["subIssues"]["totalCount"] or any(b["state"] == "OPEN" for b in nodes(i["blockedBy"]))),
-                "score": sum(b["state"] == "OPEN" for b in nodes(i["blocking"])),
-                "route": coder_route(body), "paths": owned_paths(body), "branch": branch, "base": base,
-                "repo": "dot-agents" if dot else "hr-relay",
-            })
+    for i in snapshot(fresh)["open"]:
+        card = next((c for c in nodes(i["projectItems"]) if c["project"]["number"] == PROJECT
+                     and c["project"]["owner"]["login"] == OWNER), None)
+        body = i["body"]
+        branch_section = section(body, "Branch")
+        m = re.search(r"\btask/([\w-]+)/([\w-]+)", branch_section)
+        branch = m[0] if m else None
+        if not branch:
+            slug = re.fullmatch(r"([\w-]+)\s*/\s*([\w-]+(?:[ \t]+[\w-]+)*)(?:\s*:.*)?", i["title"].strip())
+            if slug:
+                lane = "-".join(slug[2].lower().split())
+                branch = f"task/{slug[1].lower()}/{lane}"
+        dot = "dot-agents" in branch_section
+        card = card or {}
+        stage = (card.get("stage") or {}).get("name")
+        if dot:
+            base = "origin/main"
+        elif "development" in branch_section and "feature/" not in branch_section:
+            base = "origin/development"
+        else:
+            base = "origin/feature/" + branch.split("/")[1] if branch else None
+        result.append({
+            "number": i["number"], "title": i["title"], "item": card.get("id"), "body": body,
+            "agent": (card.get("agent") or {}).get("text"), "stage": stage,
+            "status": (card.get("status") or {}).get("name"), "kind": (i["issueType"] or {}).get("name"),
+            "assigned": bool(i["assignees"]["totalCount"] or (card.get("agent") or {}).get("text")),
+            "busy": bool(i["closedByPullRequestsReferences"]["totalCount"] or stage not in (None, "Queued")),
+            "later": (i["milestone"] or {}).get("title", "").lower() == "later"
+                     or any(label["name"].lower() == "later" for label in nodes(i["labels"])),
+            "blocked": bool(i["subIssues"]["totalCount"] or any(b["state"] == "OPEN" for b in nodes(i["blockedBy"]))),
+            "score": sum(b["state"] == "OPEN" for b in nodes(i["blocking"])),
+            "route": coder_route(body), "paths": owned_paths(body), "branch": branch, "base": base,
+            "repo": "dot-agents" if dot else "hr-relay",
+        })
     return result
 
 
@@ -540,11 +625,37 @@ def reserve(db, number, receipt):
         raise OrcaError(f"issue #{number} already reserved") from e
 
 
-def project_fields():
+def project_meta(refresh=False):
+    """{"id", "fields": {name: field}} from the cache, fetched only when missing or on refresh."""
+    if not refresh:
+        try:
+            return json.loads(PROJECT_CACHE.read_text())
+        except (OSError, ValueError):
+            pass
     args = (str(PROJECT), "--owner", OWNER, "--format", "json")
-    project = json.loads(command("gh", "project", "view", *args))["id"]
-    rows = json.loads(command("gh", "project", "field-list", *args))["fields"]
-    fields = {f["name"]: f for f in rows}
+    meta = {"id": json.loads(command("gh", "project", "view", *args))["id"],
+            "fields": {f["name"]: f for f in json.loads(command("gh", "project", "field-list", *args))["fields"]}}
+    PROJECT_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = PROJECT_CACHE.with_name(f"{PROJECT_CACHE.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(meta))
+    tmp.replace(PROJECT_CACHE)
+    return meta
+
+
+def with_project(use):
+    """use(meta) on the cached ids; an unknown field or option refetches them once."""
+    try:
+        return use(project_meta())
+    except (KeyError, StopIteration):
+        return use(project_meta(refresh=True))
+
+
+def project_fields():
+    return with_project(_project_fields)
+
+
+def _project_fields(meta):
+    project, fields = meta["id"], meta["fields"]
     edits = []
     for key, option in (("Status", "In Progress"), ("Agent state", "Coding"), ("Agent", None)):
         f = fields[key]
@@ -687,7 +798,7 @@ def fill_tick(args, db):
             base=ticket["base"], agent=route[0], model=route[1], effort=route[2], advisor=route[3], account=acct["label"]))
         if not args.dry_run:
             # Refresh GitHub, ownership and the picker immediately before committing to side effects.
-            current = mark_pending([t for t in tickets() if t["repo"] == repo])
+            current = mark_pending([t for t in tickets(fresh=True) if t["repo"] == repo])
             latest = inventory(repo_path, current, repo)
             candidate = next(fill_plan(current, lambda r, extra: seat(r, extra, latest, pending), n), None)
             if not candidate or candidate[0].get("occupied") or candidate[1]["id"] != acct["id"] or any(
@@ -1177,14 +1288,14 @@ def review_account(route):
 
 
 def review_card(ticket, stage, agent):
-    args = (str(PROJECT), "--owner", OWNER, "--format", "json")
-    project = json.loads(command("gh", "project", "view", *args))["id"]
-    fields = json.loads(command("gh", "project", "field-list", *args))["fields"]
-    fields = {field["name"]: field for field in fields}
-    options = {o["name"]: o["id"] for o in fields["Agent state"]["options"]}
-    for name, flag, value in (("Agent", "--text", agent), ("Agent state", "--single-select-option-id", options[stage])):
+    def ids(meta):
+        fields = meta["fields"]
+        options = {o["name"]: o["id"] for o in fields["Agent state"]["options"]}
+        return meta["id"], fields["Agent"]["id"], fields["Agent state"]["id"], options[stage]
+    project, agent_field, stage_field, option = with_project(ids)
+    for field, flag, value in ((agent_field, "--text", agent), (stage_field, "--single-select-option-id", option)):
         command("gh", "project", "item-edit", "--project-id", project, "--id", ticket["item"],
-                "--field-id", fields[name]["id"], flag, value)
+                "--field-id", field, flag, value)
 
 
 def review_state(db, run, number):
@@ -1536,21 +1647,29 @@ def review_tick(args, db):
                     continue
                 if not ticket["item"] or (not args.issue and ticket["stage"] not in ("Coding", "CI running")):
                     continue
-                followed = None
+                followed = task_id = None
                 if args.coder:
                     dispatch = args.coder
-                elif len(ids) == 1:
-                    dispatch = runtime("orchestration", "dispatch-show", "--task", ids[0], "--full")["dispatch"]["id"]
+                else:
+                    # A Task whose start never produced a Dispatch has no attempt to review.
+                    attempts = {i: d["id"] for i in ids
+                                if (d := runtime("orchestration", "dispatch-show", "--task", i, "--full")["dispatch"])}
+                    if not attempts:
+                        continue
+                    # Restarts can leave several coder Tasks: the newest succeeded report names the current one.
+                    task_id = max(attempts, key=lambda i: max((m["sequence"] for m in review_mail(messages, attempts[i])),
+                                                              default=-1))
+                    dispatch = attempts[task_id]
                     if db.execute("SELECT 1 FROM sqlite_master WHERE name='followups'").fetchone():
                         row = db.execute("SELECT dispatch FROM followups WHERE run=? AND issue=?", (run, number)).fetchone()
                         # Watch sent a resume note to the settled coder: its follow-up Dispatch is the current coder.
                         if row:
+                            task_id, first = follow_root(row[0], attempts, run)
                             # Its Task may have retried since: read the current attempt, validated below.
                             task = runtime("orchestration", "worker-show", "--dispatch", row[0], "--full")["dispatch"]["taskId"]
-                            current = runtime("orchestration", "dispatch-show", "--task", task, "--full")["dispatch"]["id"]
-                            followed, first, dispatch = row[0], dispatch, current
-                else:
-                    raise OrcaError("multiple coder Tasks; select the intended Dispatch with --issue and --coder")
+                            current = (runtime("orchestration", "dispatch-show", "--task", task, "--full")["dispatch"]
+                                       or {}).get("id")
+                            followed, dispatch = row[0], current
                 if not review_mail(messages, dispatch):
                     if args.coder:
                         log("review", {"issue": number, "waiting": f"no succeeded report from {dispatch}"})
@@ -1558,7 +1677,7 @@ def review_tick(args, db):
                 show = runtime("orchestration", "worker-show", "--dispatch", dispatch, "--full")
                 worker = show["worker"]
                 if (show["dispatch"]["id"] != dispatch or show["dispatch"]["runId"] != run or
-                        (not args.coder and show["dispatch"]["taskId"] != ids[0]
+                        (not args.coder and show["dispatch"]["taskId"] != task_id
                          and not (followed and in_coder_chain(dispatch, first, run)))):
                     raise OrcaError("coder Dispatch identity changed")
                 tree = runtime("worktree", "show", "--worktree", "id:" + worker["worktreeId"])["worktree"]
@@ -1911,7 +2030,6 @@ def close(args):
 NEAR_LIMIT = re.compile(r"^\s*⚠\s*(?:heads up, you have less than \d+% of your \S+ limit left"
                         r"|\S+ limit: only \d+% left\b)", re.I)
 # Codex's status line under its input box: "GPT-6.1-Sol xhigh · ~/repo".
-CODEX_STATUS = re.compile(r"\s*([\w.-]+)(?: (\w+))? · (?=[~/])")
 QUIET_MINUTES = 20
 HANDOFF = ("Your account is at its usage handoff point ({why}). Finish the current step, run /handoff, then send "
            "worker_done --outcome failed with the handoff path. A fresh worker on another account continues from it.")
@@ -1920,7 +2038,7 @@ NUDGE = ("Your screen has not changed for {minutes} minutes. If you are blocked,
 
 
 def screen_limit(tail, launch):
-    """Why this screen means the worker cannot hand off: a limit line, the model-switch menu, or a switched model."""
+    """Why this screen means the worker cannot hand off: a limit line or the model-switch menu."""
     hit = limited(tail)
     if hit:
         return hit
@@ -1931,10 +2049,7 @@ def screen_limit(tail, launch):
         # A menu counts only while it is showing: newer output or the input prompt below it makes it history.
         if not any(line.lstrip().startswith(OUTPUT) or re.match(r"^\s*[›❯>](?!\s*\d+[.)] )", line) for line in below):
             return lines[0].strip()
-    if launch.get("agent") == "codex":
-        status = next((m for line in reversed(tail[-6:]) if (m := CODEX_STATUS.match(line))), None)
-        if status and status[1].lower() != (launch.get("model") or "").lower():
-            return f"model switched to {status[1]} {status[2] or ''}".strip()
+    # The Codex status line's model is not a limit: it differs from the launch model on healthy workers.
     return None
 
 
@@ -1974,12 +2089,17 @@ def watch_pass(args, db, actions, errors):
     import pick
     actor, run = supervisor(args)
     now = time.time()
+    # While a restore is owed the active Codex account may be a worker's seat, not the coordinator's.
+    owed = owed_restores(db)
     try:
-        with contextlib.redirect_stdout(io.StringIO()) as out:
-            pick.main(["coordinator"])
-        if out.getvalue().strip():
-            actions.append({"coordinator": out.getvalue().strip()})
-    except (OSError, ValueError, KeyError, subprocess.SubprocessError, SystemExit) as e:
+        if owed:
+            actions.append({"coordinator": f"rotation deferred: restore owed by {sorted(owed)}"})
+        else:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                pick.main(["coordinator"])
+            if out.getvalue().strip():
+                actions.append({"coordinator": out.getvalue().strip()})
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError, SystemExit, sqlite3.Error) as e:
         errors.append({"coordinator": str(e)})
     cfg = pick.account_usage.load_config()
     holds_path = Path(args.holds or pick.HOLDS)
@@ -2020,6 +2140,36 @@ def watch_pass(args, db, actions, errors):
                 return name
         return "Reviewing" if "review" in title else "Coding"
 
+    def role_of(d):
+        """The role the first Task title in this Dispatch's retry and follow-up ancestry names, else None."""
+        for _ in range(10):
+            title = (tasks.get(d.get("taskId")) or {}).get("task_title") or ""
+            if "review" in title or "coder" in title:
+                return "reviewer" if "review" in title else "coder"
+            up = d.get("retryOfDispatchId") or d.get("followUpOf")
+            if not up:
+                return None
+            d = runtime("orchestration", "worker-show", "--dispatch", up, "--full")["dispatch"]
+        return None
+
+    def followup_route(show, ticket, title):
+        """A follow-up Dispatch records no model: its original's route, or the Coder line once that proves a coder."""
+        coder = ticket and ticket.get("route") and tuple(ticket["route"][:3])
+        d = show["dispatch"]
+        for _ in range(10):
+            if not d.get("followUpOf"):
+                break
+            prev = runtime("orchestration", "worker-show", "--dispatch", d["followUpOf"], "--full")
+            effective = (((prev.get("worker") or {}).get("startOptions") or {}).get("launch") or {}).get("effective") or {}
+            route = tuple(effective.get(k) for k in ("agent", "model", "effort"))
+            if None not in route:
+                # A resume Task is titled "#N: resume": the Coder line only when the ancestry names a coder.
+                return coder if coder and role_of(prev["dispatch"]) == "coder" else route
+            d = prev["dispatch"]
+        if "review" not in title and coder:
+            return coder
+        raise OrcaError(f"no agent, model and effort recorded for Dispatch {show['dispatch']['id']} or its originals")
+
     def restart(w, show, state, why, crash):
         dispatch, terminal, task_id = w["dispatchId"], w["agentTerminalHandle"], show["dispatch"]["taskId"]
         task, number = issue_of(task_id)
@@ -2048,6 +2198,8 @@ def watch_pass(args, db, actions, errors):
         save(terminal, state)
         launch = show["worker"]["startOptions"]["launch"]["effective"]
         route = (launch["agent"], launch["model"], launch["effort"])
+        if None in route:
+            route = followup_route(show, ticket, title)
         source = None if crash else state["account"]
         seats = dict(cfg, account=[r for r in cfg["account"] if r["id"] != source])
         account, reasons = pick.pick(seats, *route, "local", now)
@@ -2077,14 +2229,17 @@ def watch_pass(args, db, actions, errors):
             # --retry-of takes a settled attempt, so fence the old one first.
             stop = runtime("orchestration", "worker-stop", "--dispatch", dispatch, "--full")
             actions.append({"issue": number, "stopped": dispatch, "process": stop.get("processAction")})
+        # --retry-of names a failed Task's last attempt; after an Orca restart the Task can be ready again.
+        retry = show["dispatch"]["status"] == "dispatched" or task.get("status") != "ready"
         # Everything adoption needs if the start response is lost.
         state["pending"].update(starting=True, dispatch=dispatch, task=task_id, number=number, title=title,
                                 worktree=show["worker"]["worktreeId"], route=route, account=account["id"],
-                                label=account["label"], note=note, coordinator=prior)
+                                label=account["label"], note=note, coordinator=prior, retry=retry)
         save(terminal, state)
         # The same Task keeps its title, dependencies and retry lineage for the review tick.
         try:
-            started = runtime("orchestration", "worker-start", *actor, "--task", task_id, "--retry-of", dispatch,
+            started = runtime("orchestration", "worker-start", *actor, "--task", task_id,
+                              *(("--retry-of", dispatch) if retry else ()),
                               "--worktree", "id:" + show["worker"]["worktreeId"], "--agent", route[0],
                               "--model", route[1], "--effort", route[2], "--full")
         except StartNotApplied as e:
@@ -2103,7 +2258,8 @@ def watch_pass(args, db, actions, errors):
             if new and new != p["dispatch"]:
                 show = runtime("orchestration", "worker-show", "--dispatch", new, "--full")
                 d, worker = show["dispatch"], show.get("worker") or {}
-                if (d["id"] == new and d.get("retryOfDispatchId") == p["dispatch"] and d["runId"] == run
+                lineage = p["dispatch"] if p.get("retry", True) else None
+                if (d["id"] == new and d.get("retryOfDispatchId") == lineage and d["runId"] == run
                         and d["taskId"] == p["task"] and worker.get("worktreeId") == p["worktree"]
                         and start_identity(worker)[0] == new):
                     adopt(terminal, state, *start_identity(worker))
@@ -2180,7 +2336,8 @@ def watch_pass(args, db, actions, errors):
         if row.get("note"):
             note = row["note"]
             # A send whose reply was lost may have started a follow-up already; adopt it rather than start another.
-            receipt = note.get("sending") and sent_followup(note)
+            # A row saved before request ids has neither mark, so look it up whenever no request id is saved.
+            receipt = (note.get("sending") or not note.get("request")) and sent_followup(note)
             if not receipt:
                 # Saved before the call, so a retry replays Orca's receipt whatever the first delivery was.
                 note.setdefault("request", str(uuid.uuid4()))
@@ -2199,13 +2356,13 @@ def watch_pass(args, db, actions, errors):
                 review = review_state(db, run, number) if number is not None else None
                 coder = review and review.get("coder") == note["to"]
                 reviewer = review and (review.get("reviewer") or {}).get("dispatch") == note["to"]
-                if coder or reviewer:
-                    # The follow-up may run in a fresh pane, so review takes its verified terminal with its Dispatch.
-                    show = runtime("orchestration", "worker-show", "--dispatch", new, "--full")
-                    if (show["dispatch"]["id"] != new or show["dispatch"]["runId"] != run
-                            or start_identity(show.get("worker") or {})[0] != new):
-                        raise OrcaError(f"unverified follow-up {new} of {note['to']}")
-                    terminal = start_identity(show["worker"])[1]
+                # The follow-up may run in a fresh pane: review, the hold and this row move with its verified terminal.
+                show = runtime("orchestration", "worker-show", "--dispatch", new, "--full")
+                verified = (show["dispatch"]["id"] == new and show["dispatch"]["runId"] == run
+                            and start_identity(show.get("worker") or {})[0] == new)
+                if (coder or reviewer) and not verified:
+                    raise OrcaError(f"unverified follow-up {new} of {note['to']}")
+                terminal = start_identity(show["worker"])[1] if verified else handle
                 if coder:
                     review.update(coder=new, expected=new, coder_terminal=terminal)
                 elif reviewer:
@@ -2214,6 +2371,14 @@ def watch_pass(args, db, actions, errors):
                 else:
                     review = None
                 actions.append({"issue": number, "followed up": note["to"], "as": new})
+            moved = None
+            if receipt.get("delivery") in ("follow_up", "reopened", "started_fresh") and terminal != handle:
+                moved = terminal
+                with pick.edit_holds(holds_path) as edit:
+                    if handle in edit:
+                        edit[moved] = edit.pop(handle)
+                if handle in holds:
+                    holds[moved] = holds.pop(handle)
             # One transaction: review stays gated on the note until it expects the Dispatch that received it.
             with db:
                 if review:
@@ -2223,7 +2388,12 @@ def watch_pass(args, db, actions, errors):
                     db.execute("CREATE TABLE IF NOT EXISTS followups (run TEXT, issue INTEGER, dispatch TEXT,"
                                " PRIMARY KEY(run,issue))")
                     db.execute("INSERT OR REPLACE INTO followups VALUES (?,?,?)", (run, number, new))
-                db.execute("INSERT OR REPLACE INTO watch VALUES (?,?,?)", (run, handle, json.dumps(row)))
+                if moved:
+                    db.execute("DELETE FROM watch WHERE run=? AND terminal=?", (run, handle))
+                db.execute("INSERT OR REPLACE INTO watch VALUES (?,?,?)", (run, moved or handle, json.dumps(row)))
+            if moved:
+                saved.pop(handle, None)
+                handle = moved
             saved[handle] = json.dumps(row)
             actions.append({"note": receipt.get("delivery"), "to": note["to"]})
         if row.get("card"):
@@ -2256,16 +2426,24 @@ def watch_pass(args, db, actions, errors):
             errors.append({"terminal": terminal, "error": str(e)})
 
     seen_terminals, seen_tasks = set(), set()
-    for w in close_workers(run):
+    workers = list(close_workers(run))
+    task_of = {w["dispatchId"]: w["taskId"] for w in workers}
+    for w in workers:
         terminal, dispatch, task_id = w["agentTerminalHandle"], w["dispatchId"], w["taskId"]
         owner = (w.get("resource") or {}).get("ownerDispatchId")
         # worker-list is newest first: act only on the current attempt of each pane and Task.
-        if not terminal or terminal in seen_terminals or (owner and owner != dispatch):
+        if not terminal or (owner and owner != dispatch):
+            # Without a pane record, or on a pane handed to another Task's follow-up, this is still its Task's
+            # newest attempt; an owner in the same Task is listed later as that attempt.
+            if not (owner and owner != dispatch and task_of.get(owner) == task_id):
+                seen_tasks.add(task_id)
             continue
+        # A newer attempt on a pane a follow-up took is still its Task's current one: record both first.
+        history = terminal in seen_terminals or task_id in seen_tasks
         seen_terminals.add(terminal)
-        if task_id in seen_tasks:
-            continue
         seen_tasks.add(task_id)
+        if history:
+            continue
         state = json.loads(saved.get(terminal) or "null")
         live = w["dispatchStatus"] == "dispatched"
         if not live and state is None and (w["dispatchStatus"] != "failed" or w.get("workerState") == "stopped"):

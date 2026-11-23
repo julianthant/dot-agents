@@ -9,14 +9,20 @@ disable-model-invocation: true
 Run these commands from this skill's directory. The picker reads accounts in
 `accounts.toml` order (override the path with `DEV_AUTO_ACCOUNTS`) and applies
 `limits.toml` to the newest usage reading from Orca or the account's CLI files.
-Codex homes share one sessions folder, so a Codex account reads its CLI files
-only when Orca has no reading for it.
+Codex homes share one sessions folder that names no account, so a Codex
+account reads only Orca's per-account reading, never its CLI files.
 Pass the same `--host` to all three commands for a remote environment. The
 default host is `local` and the default effort is `medium`.
 
 1. **Pick an account** before starting a worker. The JSON output includes the
    account ID, label, plan, and selection command for the caller to run. When no
    account qualifies, the picker exits 1 and writes skip reasons to stderr.
+   It skips an account with under 10% of its 5-hour window or 5% of its week
+   left, so no start or restart lands on an account about to hand off. Each
+   window comes from the newest reading that has it; a Codex account never reads
+   the shared sessions file. A plan's
+   `prefer_models` in `limits.toml` put those models on its accounts first and
+   every other model on them last (Pro Lite takes gpt-6.2-astra before Plus).
 
    ```sh
    python3 scripts/pick.py pick --agent codex --model gpt-6.2-sol
@@ -77,15 +83,29 @@ Run, sets the Project's Agent state to **Needs you**, and retains the hold
 and reservation. After the operator answers in the worker pane, the next real
 tick checks that same Dispatch before recording Coding.
 
+## Issue snapshot
+
+Every tick verb reads open issues from one snapshot,
+`~/.local/state/dev-auto/issues.json`, refetched at most once a minute. A
+Project write marks it stale, and fill's check right before a start always
+refetches. Closed issues (the newest 400) are read in full every ten minutes
+and only the recently updated ones in between. `scripts/roadmap.py > data.json`
+renders the roadmap from the same snapshot. The Project's id and its field and
+option ids are cached in `project.json` beside it (`gh project field-list`
+costs about 100 GraphQL points); an unknown field or option refetches them, and
+a failed Project edit drops the cache.
+
 ## Watch
 
 Run `scripts/tick.py watch` from the coordinating Run (or pass its launchd
-`--anchor` and `--run`). Each tick runs `pick.py coordinator`, then checks
+`--anchor` and `--run`). Each tick runs `pick.py coordinator` (deferred while a
+coordinator restore is still owed), then checks
 the current attempt of every live worker in the Run and logs one `watch` line:
 
-- A limit screen, the Codex model-switch menu or a switched Codex model:
+- A limit screen or the Codex model-switch menu (a Codex status line naming another model is not a limit):
   once `pick.py` gives a different account, `worker-stop`, then the same Task
-  restarts with `worker-start --task <task> --retry-of <dispatch>`. The
+  restarts with `worker-start --task <task> --retry-of <dispatch>` (without
+  `--retry-of` when an Orca restart left the Task ready). The
   replacement then gets mail with the predecessor's `reportPath` and report.
 - A near-limit screen or an account `pick.py due` lists: one handoff request
   to the Dispatch. Its failed `worker_done` starts the replacement.

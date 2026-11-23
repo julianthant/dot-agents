@@ -152,13 +152,13 @@ def orca_usage(now):
     except (OSError, subprocess.TimeoutExpired, ValueError):
         result = {}
     limits = result.get("rateLimits") or {}
+    readings = {}
     found = [("grok", None, limits.get("grok"))]
     for agent in ("claude", "codex"):
         selected = (result.get(agent) or {}).get("activeAccountId")
         found.append((agent, selected, limits.get(agent)))
         for other in limits.get(f"inactive{agent.title()}Accounts") or []:
             found.append((agent, other.get("accountId"), other.get("rateLimits")))
-    readings = {}
     # Orca's own logins: (agent, id) -> home, so a row whose id is not Orca's can be found
     # through the profile it runs in.
     for agent in ("claude", "codex"):

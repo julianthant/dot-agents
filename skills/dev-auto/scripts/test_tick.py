@@ -8,6 +8,10 @@ from unittest.mock import patch
 
 import tick
 
+_snapshot_dir = TemporaryDirectory()  # never read or write the live issue snapshot
+tick.SNAPSHOT = tick.Path(_snapshot_dir.name) / "issues.json"
+tick.PROJECT_CACHE = tick.Path(_snapshot_dir.name) / "project.json"
+
 L = tick.limited
 assert L(["⏺ working", "⎿  You've hit your 5-hour limit · resets 5pm"]) == "⎿  You've hit your 5-hour limit · resets 5pm"
 assert L(["■ You’ve hit your usage limit. Try again in 3 days"]).startswith("■ You’ve hit")
@@ -540,7 +544,7 @@ with TemporaryDirectory() as temp, ExitStack() as stack:
         return "abc"
 
     stack.enter_context(patch.object(tick, "command", git))
-    stack.enter_context(patch.object(tick, "tickets", side_effect=lambda: [dict(ticket)]))
+    stack.enter_context(patch.object(tick, "tickets", side_effect=lambda fresh=False: [dict(ticket)]))
     stack.enter_context(patch.object(tick, "inventory", return_value=set()))
     stack.enter_context(patch.object(pick.account_usage, "load_config", return_value={}))
     stack.enter_context(patch.object(pick, "pick", return_value=(account, [])))
@@ -564,7 +568,7 @@ with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory
     args = SimpleNamespace(repo_path=root, dry_run=False, issue=None, holds=root / "holds.json")
     stack.enter_context(patch.object(tick, "command", git))
     raced = False
-    stack.enter_context(patch.object(tick, "tickets", side_effect=lambda: [dict(t) for t in (stuck, overlap_ticket, ticket)]))
+    stack.enter_context(patch.object(tick, "tickets", side_effect=lambda fresh=False: [dict(t) for t in (stuck, overlap_ticket, ticket)]))
     stack.enter_context(patch.object(tick, "supervisor", return_value=([], "own")))
     stack.enter_context(patch.object(tick, "inventory", return_value=set()))
     stack.enter_context(patch.object(pick.account_usage, "load_config", return_value={}))
@@ -592,7 +596,7 @@ with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory
             tick.reserve(db, 60, {"task": "t60", "run": "own", "coordinator": "coord"})
             raise tick.OrcaError("timed out")
     stack.enter_context(patch.object(tick, "command", git))
-    stack.enter_context(patch.object(tick, "tickets", side_effect=lambda: [dict(t) for t in (first, second, claude)]))
+    stack.enter_context(patch.object(tick, "tickets", side_effect=lambda fresh=False: [dict(t) for t in (first, second, claude)]))
     stack.enter_context(patch.object(tick, "inventory", return_value=set()))
     stack.enter_context(patch.object(pick.account_usage, "load_config", return_value={}))
     stack.enter_context(patch.object(pick, "pick", return_value=(account, [])))
@@ -633,6 +637,9 @@ check.assertEqual(tick.owned_paths("Owned paths: Edit `scripts/dev.py` and `docs
                   ["scripts/dev.py", "docs/how.md", "config/app.json"])
 check.assertEqual(tick.owned_paths("Owned paths: src, docs, scripts/setup.py."), ["src", "docs", "scripts/setup.py"])
 check.assertIn(".github/workflows", tick.owned_paths("Owned paths: Development/checks workflows, CI plan and focused tests."))
+# Bug 7: prose "test"/"tests" is no path, or every ticket overlaps the whole tests tree.
+check.assertEqual(tick.owned_paths("Owned paths: `src/a.ts` and its tests; focused test updates."), ["src/a.ts"])
+check.assertEqual(tick.owned_paths("Owned paths: src/a.ts, tests"), ["src/a.ts", "tests"])  # a listed path still counts
 
 with TemporaryDirectory() as tmp:
     import tomllib
@@ -738,10 +745,175 @@ def issue_row(number, title, body=""):
 rows = [issue_row(473, "dashboard-frontend-speed / clock-tick-in-leaves: render labels"),
         issue_row(497, "driver-reads / CRM SSO route recovery: recover sign-in"),
         issue_row(506, "tests-reliability / timing-guesses: condition waits", "Branch: task/tests/explicit")]
-with patch.object(tick, "command", return_value=json.dumps([{"data": {"repository": {"issues": {"nodes": rows}}}}])):
-    parsed = tick.tickets()
+def issue_page(nodes, more=False):
+    return json.dumps({"data": {"repository": {"issues": {"nodes": nodes,
+                                                          "pageInfo": {"hasNextPage": more, "endCursor": "c"}}}}})
+
+
+with patch.object(tick, "command", side_effect=lambda *a: issue_page(rows if "states=OPEN" in a else [])):
+    parsed = tick.tickets(fresh=True)
 check.assertEqual([row["branch"] for row in parsed], ["task/dashboard-frontend-speed/clock-tick-in-leaves",
                   "task/driver-reads/crm-sso-route-recovery", "task/tests/explicit"])
+
+# Bug 8: one issue read a minute across processes; closed issues are read incrementally between full reads.
+with TemporaryDirectory() as tmp:
+    calls, closed_rows = [], [dict(issue_row(n, f"c / {n}"), updatedAt=f"2026-11-23T10:0{n % 10}:00Z") for n in (1, 2)]
+
+    def gh(*a):
+        calls.append(("OPEN" if "states=OPEN" in a else "CLOSED", next((x for x in a if x.startswith("since=")), None)))
+        if "states=OPEN" in a:
+            return issue_page(rows[:2] if "endCursor=c" in a else rows[2:], more="endCursor=c" not in a)
+        return issue_page(closed_rows if not calls[-1][1] else [dict(closed_rows[0], title="edited"), dict(rows[0], updatedAt="2026-11-23T11:00:00Z")])
+
+    clock = [1_795_400_000]
+    with patch.object(tick, "SNAPSHOT", Path(tmp) / "issues.json"), patch.object(tick, "command", gh), \
+            patch.object(tick.time, "time", lambda: clock[0]):
+        check.assertEqual(len(tick.tickets()), 3)
+        check.assertEqual(calls, [("OPEN", None), ("OPEN", None), ("CLOSED", None)])  # two open pages, one full closed read
+        tick.tickets(), tick.snapshot()  # another verb, or the roadmap, within the minute
+        check.assertEqual(len(calls), 3)
+        clock[0] += 61
+        snap = tick.snapshot()
+        check.assertEqual(calls[3:], [("OPEN", None), ("OPEN", None), ("CLOSED", "since=2026-11-23T02:11:20Z")])
+        # An edited closed issue is replaced; one still open is never listed as closed.
+        check.assertEqual([(i["number"], i["title"]) for i in snap["closed"]], [(2, "c / 2"), (1, "edited")])
+        tick.stale_snapshot()  # a Project write: the next read refetches open issues and still reads closed ones since
+        tick.tickets()
+        check.assertEqual(calls[6:], [("OPEN", None), ("OPEN", None), ("CLOSED", "since=2026-11-23T02:12:21Z")])
+        with patch.object(tick, "SNAPSHOT", Path(tmp) / "missing" / "issues.json"):
+            tick.stale_snapshot()  # no snapshot yet (nor its directory): nothing to mark
+        tick.tickets(fresh=True)  # fill's refresh before side effects never uses a cached read
+        check.assertEqual(len(calls), 12)
+        clock[0] += 600
+        tick.snapshot()
+        check.assertEqual(calls[-1], ("CLOSED", None))  # ten minutes on: a full closed read again
+
+# Bug 8: the roadmap moved here renders a recorded snapshot exactly as the live script did for the same GitHub
+# replies (ROADMAP_BEFORE is that script's output), while reading issues from the shared snapshot.
+import roadmap
+
+def rm_card(status, agent, stage, area, project=5):
+    return {"id": "item", "project": {"number": project, "owner": {"login": "julianthant"}},
+            "status": status and {"name": status}, "agent": agent and {"text": agent},
+            "stage": stage and {"name": stage}, "area": area and {"name": area}}
+def rm_issue(n, state, updated, title, reason=None, cards=(), labels=(), blocked=(), parent=None, kids=0, done=0, ms=None, kind="Task"):
+    conn = lambda xs: {"totalCount": len(xs), "nodes": list(xs)}
+    return {"number": n, "title": title, "body": "Owned paths: `a`", "state": state, "stateReason": reason, "updatedAt": updated,
+            "issueType": kind and {"name": kind}, "milestone": ms and {"title": ms}, "parent": parent and {"number": parent},
+            "subIssuesSummary": {"total": kids, "completed": done} if kids else None,
+            "assignees": conn([]), "subIssues": conn([{}] * kids), "closedByPullRequestsReferences": conn([]),
+            "labels": conn([{"name": l} for l in labels]), "blockedBy": conn([{"number": b, "state": s} for b, s in blocked]),
+            "blocking": conn([]), "projectItems": conn(list(cards))}
+RM_OPEN = [rm_issue(10, "OPEN", "2026-11-23T09:00:00Z", "area / older", cards=[rm_card("Todo", None, "Queued", "Tick")], ms="Staging cut"),
+        rm_issue(11, "OPEN", "2026-11-23T10:00:00Z", "area / newest", cards=[rm_card(None, None, None, None, 7), rm_card("In Progress", "coder m e @a", "Coding", "Roadmap")],
+              labels=["later", "bug"], blocked=[(10, "OPEN"), (3, "CLOSED")], parent=1),
+        rm_issue(12, "OPEN", "2026-11-23T09:30:00Z", "feature", kind="Feature", kids=3, done=1)]
+RM_CLOSED = [rm_issue(3, "CLOSED", "2026-11-22T08:00:00Z", "done one", reason="COMPLETED", cards=[rm_card("Done", None, None, "Tick")]),
+          rm_issue(4, "CLOSED", "2026-11-22T07:00:00Z", "dropped", reason="NOT_PLANNED", kind=None)]
+RM_ROLL = [{"conclusion": "SUCCESS"}, {"status": "IN_PROGRESS", "conclusion": ""}]
+RM_PR = lambda n, roll: {"number": n, "title": f"pr {n}", "headRefName": f"task/a/{n}", "autoMergeRequest": None if n % 2 else {},
+                         "statusCheckRollup": roll, "isDraft": False, "closingIssuesReferences": [{"number": 11}], "updatedAt": "2026-11-23T09:00:00Z"}
+def rm_answer(args):
+    """The recorded gh reply for one command line, for both the old and the moved script."""
+    a = " ".join(args)
+    if args[:2] == ["project", "view"]:
+        return {"id": "proj"}
+    if args[:2] == ["project", "field-list"]:
+        return {"fields": [{"name": "Status", "options": [{"name": "Todo"}]}, {"name": "Area", "options": [{"name": "Tick"}, {"name": "Roadmap"}]}]}
+    if args[:2] == ["pr", "list"]:
+        return [RM_PR(21, RM_ROLL), RM_PR(22, [{"conclusion": "FAILURE"}])] if "development" in args else [RM_PR(30, [{"conclusion": "SUCCESS"}])]
+    if args[:2] == ["release", "list"]:
+        return [{"tagName": "v1.2.0", "publishedAt": "2026-11-20T12:00:00Z"}]
+    if "search/issues" in args:
+        assert "q=repo:julianthant/hr-relay is:pr is:merged base:development merged:>2026-11-20" in args, args
+        return {"total_count": 7, "items": [{}]}
+    if a.startswith("api repos/julianthant/hr-relay/compare/"):
+        return {"ahead_by": 4 if "staging..." in a else 9}
+    if a == "api repos/julianthant/hr-relay/commits/main":
+        return {"commit": {"committer": {"date": "2026-11-19T00:00:00Z"}}}
+    if a.endswith("matching-refs/heads/cut/"):
+        return [{"ref": "refs/heads/cut/2026-11-21"}]
+    if args[:2] == ["run", "list"]:
+        return [{"conclusion": "success", "status": "completed", "createdAt": "2026-11-23T06:00:00Z", "headSha": "abc", "url": "u"}]
+    if "milestones" in a:
+        return [{"title": "Staging cut"}, {"title": "Later"}]
+    raise AssertionError(args)
+
+ROADMAP_BEFORE = json.loads(
+    "{\"areas\":[\"Tick\",\"Roadmap\"],\"milestones\":[\"Staging cut\",\"Later\"],\"issues\":[{\"n\":11,\"t\":\"area / newest\",\"type\":"
+    "\"Task\",\"open\":true,\"done\":false,\"ms\":null,\"later\":true,\"parent\":1,\"kids\":0,\"kidsDone\":0,\"blockers\":[10],\"deps\""
+    ":[10,3],\"who\":\"coder m e @a\",\"updated\":\"2026-11-23T10:00:00Z\",\"status\":\"In Progress\",\"agent\":\"Coding\",\"area\":\""
+    "Roadmap\"},{\"n\":12,\"t\":\"feature\",\"type\":\"Feature\",\"open\":true,\"done\":false,\"ms\":null,\"later\":false,\"parent\":nul"
+    "l,\"kids\":3,\"kidsDone\":1,\"blockers\":[],\"deps\":[],\"who\":null,\"updated\":\"2026-11-23T09:30:00Z\",\"status\":null,\"age"
+    "nt\":null,\"area\":null},{\"n\":10,\"t\":\"area / older\",\"type\":\"Task\",\"open\":true,\"done\":false,\"ms\":\"Staging cut\",\"la"
+    "ter\":false,\"parent\":null,\"kids\":0,\"kidsDone\":0,\"blockers\":[],\"deps\":[],\"who\":null,\"updated\":\"2026-11-23T09:00:"
+    "00Z\",\"status\":\"Todo\",\"agent\":\"Queued\",\"area\":\"Tick\"},{\"n\":3,\"t\":\"done one\",\"type\":\"Task\",\"open\":false,\"done\":t"
+    "rue,\"ms\":null,\"later\":false,\"parent\":null,\"kids\":0,\"kidsDone\":0,\"blockers\":[],\"deps\":[],\"who\":null,\"updated\":\""
+    "2026-11-22T08:00:00Z\",\"status\":\"Done\",\"agent\":null,\"area\":\"Tick\"},{\"n\":4,\"t\":\"dropped\",\"type\":null,\"open\":fals"
+    "e,\"done\":false,\"ms\":null,\"later\":false,\"parent\":null,\"kids\":0,\"kidsDone\":0,\"blockers\":[],\"deps\":[],\"who\":null,"
+    "\"updated\":\"2026-11-22T07:00:00Z\",\"status\":null,\"agent\":null,\"area\":null}],\"pipeline\":{\"devPrs\":[{\"n\":21,\"t\":\"p"
+    "r 21\",\"head\":\"task/a/21\",\"auto\":false,\"draft\":false,\"checks\":\"running\",\"issues\":[11],\"updated\":\"2026-11-23T09:"
+    "00:00Z\"},{\"n\":22,\"t\":\"pr 22\",\"head\":\"task/a/22\",\"auto\":true,\"draft\":false,\"checks\":\"failing\",\"issues\":[11],\"up"
+    "dated\":\"2026-11-23T09:00:00Z\"}],\"mergedSinceRelease\":7,\"devAheadOfStaging\":4,\"devAheadOfMain\":9,\"stagingPr\":[{"
+    "\"n\":30,\"head\":\"task/a/30\",\"checks\":\"green\"}],\"release\":{\"tagName\":\"v1.2.0\",\"publishedAt\":\"2026-11-20T12:00:00Z"
+    "\"},\"cuts\":[\"cut/2026-11-21\"],\"fullRun\":{\"conclusion\":\"success\",\"status\":\"completed\",\"createdAt\":\"2026-11-23T06"
+    ":00:00Z\",\"headSha\":\"abc\",\"url\":\"u\"}}}")
+
+with patch.object(roadmap, "gh", lambda *a: rm_answer(list(a))), \
+        patch.object(tick, "command", lambda *a: json.dumps(rm_answer(list(a[1:])))):
+    built = roadmap.build({"open": RM_OPEN, "closed": RM_CLOSED})  # open issues in creation order, as the snapshot keeps them
+built.pop("generated")
+check.assertEqual(built, ROADMAP_BEFORE)
+
+# Bug 8: field-list costs about 100 points, so the Project's ids are cached and refetched only on a miss or a failed edit.
+with TemporaryDirectory() as tmp:
+    reads = []
+    fields = {"fields": [{"name": "Agent", "id": "f_agent"},
+                         {"name": "Agent state", "id": "f_stage", "options": [{"name": "Coding", "id": "o_coding"}]}]}
+
+    def gh(*a):
+        if a[1:3] == ("project", "field-list"):
+            reads.append(a)
+            return json.dumps(fields)
+        if a[1:3] == ("project", "view"):
+            return json.dumps({"id": "proj"})
+        if a[1:3] == ("project", "item-edit"):
+            return "{}"
+        raise AssertionError(a)
+
+    with patch.object(tick, "PROJECT_CACHE", Path(tmp) / "project.json"), patch.object(tick, "command", gh):
+        card = {"item": "card"}
+        tick.review_card(card, "Coding", "coder")
+        tick.review_card(card, "Coding", "coder")
+        check.assertEqual(len(reads), 1)  # the second card edit reads no ids
+        fields["fields"][1]["options"].append({"name": "Fixing", "id": "o_fixing"})
+        tick.review_card(card, "Fixing", "coder")  # an option added since the cache: one refetch
+        check.assertEqual(len(reads), 2)
+    # A failed edit drops the cache through command(), so the next edit refetches.
+    cache = Path(tmp) / "project.json"
+    with patch.object(tick, "PROJECT_CACHE", cache), patch.object(tick.subprocess, "run",
+            return_value=subprocess.CompletedProcess([], 1, "", "Could not resolve to a node")):
+        with check.assertRaises(tick.OrcaError):
+            tick.command("gh", "project", "item-edit", "--id", "card")
+    check.assertFalse(cache.exists())
+
+# The roadmap survives a 0-remaining GraphQL quota: a cold Project lookup renders without Areas, a warm cache keeps
+# its order and stays on disk, and a refused issue refetch renders the last good snapshot.
+with TemporaryDirectory() as tmp:
+    cache, snap = Path(tmp) / "project.json", Path(tmp) / "issues.json"
+    def refused(*a):
+        if a[:2] == ("gh", "project"):
+            raise tick.OrcaError("gh project failed: API rate limit already exceeded")
+        return json.dumps(rm_answer(list(a[1:])))
+    with patch.object(roadmap, "gh", lambda *a: rm_answer(list(a))), patch.object(tick, "PROJECT_CACHE", cache), \
+            patch.object(tick, "SNAPSHOT", snap), patch.object(tick, "command", refused):
+        check.assertEqual(roadmap.build({"open": RM_OPEN, "closed": RM_CLOSED})["areas"], [])
+        cache.write_text(json.dumps({"id": "proj", "fields": {"Area": {"options": [{"name": "Driver"}]}}}))
+        check.assertEqual(roadmap.build({"open": RM_OPEN, "closed": RM_CLOSED})["areas"], ["Driver"])
+        check.assertTrue(cache.exists())
+        snap.write_text(json.dumps({"open": RM_OPEN, "closed": RM_CLOSED}))
+        with patch.object(tick, "snapshot", side_effect=tick.OrcaError("gh api failed: rate limit")):
+            check.assertEqual(roadmap.last_snapshot()["open"], RM_OPEN)
 
 # Orca identifies agent terminals separately from plain shells and links recovery worktrees to issues.
 items = [dict(base, number=row["number"], branch=row["branch"], paths=[str(row["number"])]) for row in parsed]
@@ -1106,6 +1278,18 @@ with patch.object(tick, "tickets", return_value=[ticket]), patch.object(tick, "s
     tick.review_tick(args, sqlite3.connect(":memory:"))
     assert step.call_args.args[-1] == [recorded] and step.call_args.args[-2]["expected"] == "coder"
     assert cli.call_args_list[0].args == ("orchestration", "inbox", "--terminal", "run:run", "--limit", "10000", "--full")
+
+# Bug 3 (#488, #517): restarts left two "#41 coder" Tasks; the one whose attempt reported is reviewed.
+with patch.object(tick, "tickets", return_value=[ticket]), patch.object(tick, "supervisor", return_value=([], "run")), \
+        patch.object(tick, "command", return_value="https://github.com/julianthant/hr-relay.git\n"), \
+        patch.object(tick, "review_step") as step, patch.object(tick, "runtime") as cli:
+    cli.side_effect = [{"messages": [recorded]}, {"tasks": [{"title": "#41 coder", "id": "task_old"}, {"title": "#41 coder", "id": "task"}]},
+                       {"dispatch": {"id": "old"}}, {"dispatch": {"id": "coder"}},
+                       {"dispatch": {"id": "coder", "runId": "run", "taskId": "task"},
+                           "worker": {"worktreeId": "tree", "startOptions": {"launch": {"effective": {"model": "gpt-6.2-sol"}}}}},
+                       {"worktree": {"id": "tree", "path": "/fixture", "branch": "refs/heads/task/ui/header"}}]
+    tick.review_tick(args, sqlite3.connect(":memory:"))
+    assert step.call_args.args[-2]["expected"] == "coder"
 
 # An explicit coder that reports to another Run fails loudly instead of exiting quietly.
 args = SimpleNamespace(issue=41, coder="ctx_elsewhere", run=None, anchor=None)
@@ -1513,7 +1697,8 @@ CLAUDE_WORKING = ["⏺ Reading tick.py", "✶ Prestidigitating… (5m 45s · ↓
                   "  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt"]
 assert tick.screen_limit(CODEX_AT_LIMIT, {"agent": "codex", "model": "gpt-6.2-astra"}).startswith("■ You've hit")
 assert tick.screen_limit(CODEX_AT_LIMIT[3:], {"agent": "codex", "model": "gpt-6.2-astra"}) == "Approaching rate limits"
-assert tick.screen_limit(CODEX_SWITCHED, {"agent": "codex", "model": "gpt-6.2-astra"}) == "model switched to GPT-6-Luna medium"
+assert tick.screen_limit(CODEX_SWITCHED, {"agent": "codex", "model": "gpt-6.2-astra"}) is None
+assert tick.screen_limit(CODEX_SWITCHED, {"agent": "codex", "model": None}) is None
 assert tick.screen_limit(CODEX_NEAR_LIMIT, {"agent": "codex", "model": "gpt-6.2-astra"}) is None
 assert tick.screen_limit(CLAUDE_AT_LIMIT, {"agent": "claude", "model": "claude-opus-5-5"}).startswith("Usage limit reached")
 assert tick.screen_limit(CLAUDE_AT_LIMIT[:2], {"agent": "claude", "model": "claude-opus-5-5"}).startswith("⎿  You've hit")
@@ -1535,6 +1720,17 @@ class Fleet:
         self.liveness, self.failure, self.wait = "live", None, None
         self.seats = ["jzaw", "x2"]  # the limited account is first in accounts.toml order
         self.superseded = False
+        self.task_status = "dispatched"
+        self.follow_row = False
+        self.transferred = False  # the follow-up owns the current attempt's pane, which lists no older attempt
+        # The follow-up's own worker in its fresh pane, listed once it exists.
+        self.follow_status, self.follow_liveness = "succeeded", "exited"
+        self.effort = "medium" if model else None  # a follow-up Dispatch records no model or effort
+        self.follow_of = None  # the Dispatch this one follows up
+        self.orig_title = "#553 reviewer"  # the Task of the Dispatch it follows up
+        self.orig_parent = None  # the Dispatch that original itself follows up, on a "#553 reviewer" Task
+        self.bare = False  # the Task's newest attempt has no terminal or resource record
+        self.started_retry = None  # whether the restart passed --retry-of
         self.start_error = None
         self.lose_start = False  # Orca starts the retry, but the response is lost
         self.note_error = None
@@ -1557,13 +1753,15 @@ class Fleet:
         self.events.append(args)
         verb = args[:2]
         if verb == ("orchestration", "task-list"):
-            return {"tasks": [{"id": "task_coder", "run_id": "run", "task_title": self.title,
+            return {"tasks": [{"id": "task_coder", "run_id": "run", "task_title": self.title, "status": self.task_status,
                                "spec": "/goal Implement julianthant/hr-relay#553 and report a green SHA."},
-                              *self.followups]}
+                              *self.followups,
+                              *([{"id": "task_orig", "run_id": "run", "task_title": self.orig_title}] if self.follow_of else []),
+                              *([{"id": "task_root", "run_id": "run", "task_title": "#553 reviewer"}] if self.orig_parent else [])]}
         if verb == ("orchestration", "worker-list"):
             row = dict(dispatchId=self.dispatch, taskId="task_coder", runId="run", workerState=self.state,
                        dispatchStatus=self.status, agentTerminalHandle=self.terminal,
-                       resource={"ownerDispatchId": self.dispatch},
+                       resource={"ownerDispatchId": "ctx_follow" if self.transferred else self.dispatch},
                        projection={"host": {"kind": "local"}, "liveness": {"verdict": self.liveness}})
             # An older attempt on the same pane is history.
             old = dict(row, dispatchId="ctx_older", dispatchStatus="failed", resource={"ownerDispatchId": "ctx_older"})
@@ -1576,7 +1774,20 @@ class Fleet:
             replaced = [dict(row, dispatchId="ctx_coder", dispatchStatus="failed", workerState="stopped",
                              agentTerminalHandle="term_coder", resource={"ownerDispatchId": "ctx_coder"})
                         ] if self.dispatch == "ctx_restart" else []
-            return {"workers": [*before, row, old, retried, *replaced], "page": {"hasMore": False, "nextCursor": None}}
+            # A settled follow-up Task's newer Dispatch on the same pane.
+            follow = [dict(row, dispatchId="ctx_follow", taskId="task_follow", dispatchStatus="succeeded",
+                           workerState="succeeded", resource={"ownerDispatchId": "ctx_follow"})] if self.follow_row else []
+            fresh = [dict(row, dispatchId="ctx_follow", taskId="task_follow", agentTerminalHandle=self.follow_terminal,
+                          dispatchStatus=self.follow_status, workerState="ready" if self.follow_status == "dispatched" else "succeeded",
+                          resource={"ownerDispatchId": "ctx_follow"},
+                          projection={"host": {"kind": "local"}, "liveness": {"verdict": self.follow_liveness}})
+                     ] if self.followups and self.follow_terminal and self.follow_terminal != self.terminal else []
+            olds = [] if self.transferred else [old]
+            if self.bare:
+                newest = dict(row, dispatchId="ctx_newest", dispatchStatus="succeeded", workerState="succeeded",
+                              agentTerminalHandle=None, resource=None)
+                return {"workers": [newest, retried], "page": {"hasMore": False, "nextCursor": None}}
+            return {"workers": [*fresh, *follow, *before, row, *olds, retried, *replaced], "page": {"hasMore": False, "nextCursor": None}}
         if verb == ("orchestration", "dispatch-show") and args[3] == "task_follow":
             current = "ctx_follow_retry" if self.follow_retried else "ctx_follow"
             return {"dispatch": {"id": current, "status": "dispatched", "taskId": None, "assigneeHandle": None}}
@@ -1585,25 +1796,35 @@ class Fleet:
                                  "retryOfDispatchId": "ctx_follow", "followUpOf": None},
                     **self.follow_worker("ctx_follow_retry")}
         if verb == ("orchestration", "worker-show") and args[3] == "ctx_follow":
-            return {"dispatch": {"id": "ctx_follow", "runId": "run", "taskId": "task_follow", "followUpOf": "ctx_restart"},
+            return {"dispatch": {"id": "ctx_follow", "runId": "run", "taskId": "task_follow", "followUpOf": "ctx_restart",
+                                 "status": self.follow_status, "assigneeHandle": self.follow_terminal, "lastFailure": None},
+                    "projection": {"liveness": {"verdict": self.follow_liveness}},
                     **self.follow_worker("ctx_follow")}
         if verb == ("orchestration", "dispatch-show"):
             # Recorded shape: only the newest Dispatch's id and status.
             return {"dispatch": {"id": self.dispatch, "status": self.status, "taskId": None, "assigneeHandle": None}}
+        if verb == ("orchestration", "worker-show") and args[3] == "ctx_root":
+            return {"dispatch": {"id": "ctx_root", "taskId": "task_root", "followUpOf": None}}
+        if verb == ("orchestration", "worker-show") and args[3] == "ctx_orig":
+            return {"dispatch": {"id": "ctx_orig", "taskId": "task_orig", "followUpOf": self.orig_parent}, "worker": {"startOptions": {"launch": {
+                "effective": {"agent": "codex", "model": "gpt-6.2-sol", "effort": "xhigh"}}}}}
         if verb == ("orchestration", "worker-show"):
             assert args[3] == self.dispatch, args
-            retry = "ctx_coder" if self.dispatch == "ctx_restart" else None
+            retry = "ctx_coder" if self.dispatch == "ctx_restart" and self.started_retry is not False else None
             return {"dispatch": {"id": self.dispatch, "runId": "run", "taskId": "task_coder", "status": self.status,
                                  "assigneeHandle": self.terminal, "lastFailure": self.failure,
-                                 "retryOfDispatchId": retry, "followUpOf": None},
+                                 "retryOfDispatchId": retry, "followUpOf": self.follow_of},
                     "worker": {"state": self.state, "worktreeId": "repo::/wt", "dispatchId": self.dispatch,
                                "effects": [{"kind": "terminal", "role": "agent", "action": "created", "id": self.terminal}],
                                "startOptions": {"launch": {"effective": {"agent": self.agent, "model": self.model,
-                                                                         "effort": "medium"}}}},
+                                                                         "effort": self.effort}}}},
                     "projection": {"liveness": {"verdict": self.liveness}},
                     "terminal": {"handle": self.terminal, "agentWait": self.wait}, "observation": {"agentWait": self.wait}}
         if verb == ("terminal", "read"):
             return {"terminal": {"handle": self.terminal, "tail": self.screen, "source": "screen"}}
+        if verb == ("orchestration", "worker-stop") and args[3] == "ctx_follow":
+            self.follow_status = "failed"
+            return {"dispatchId": "ctx_follow", "processAction": "closed_agent_terminal"}
         if verb == ("orchestration", "worker-stop"):
             self.state, self.status, self.failure = "stopped", "failed", "stopped"
             if self.stop_lost:
@@ -1620,8 +1841,16 @@ class Fleet:
         if verb == ("orchestration", "worker-start"):
             if self.start_error:
                 raise self.start_error
+            if args[args.index("--task") + 1] == "task_follow":
+                # The follow-up Task retries in its own pane's worktree.
+                assert args[args.index("--retry-of") + 1] == "ctx_follow" and self.follow_status == "failed", args
+                self.follow_status, self.followups = "retried", []
+                return full_start("ctx_follow2", "term_follow2")
             # The same Task retries: no second same-titled Task for review discovery to refuse.
-            assert args[args.index("--task") + 1] == "task_coder" and args[args.index("--retry-of") + 1] == self.dispatch
+            assert args[args.index("--task") + 1] == "task_coder"
+            # Orca refuses --retry-of for a ready Task (task_not_startable).
+            assert ("--retry-of" not in args) if self.task_status == "ready" else args[args.index("--retry-of") + 1] == self.dispatch
+            self.started_retry = "--retry-of" in args
             assert "--spec" not in args and "--task-title" not in args and self.status == "failed", args
             assert args[args.index("--worktree") + 1] == "id:repo::/wt"
             self.dispatch, self.terminal = "ctx_restart", "term_restart"
@@ -1655,8 +1884,10 @@ class Fleet:
 
     def follow_worker(self, dispatch):
         """Orca's worker record for a follow-up, omitted while it has none."""
-        return {"worker": {"dispatchId": dispatch, "effects": [
-            {"kind": "terminal", "role": "agent", "action": "created", "id": self.follow_terminal}]}} if self.follow_terminal else {}
+        return {"worker": {"dispatchId": dispatch, "state": "ready", "worktreeId": "repo::/wt",
+                           "startOptions": {"launch": {"effective": {"agent": self.agent, "model": None, "effort": None}}},
+                           "effects": [{"kind": "terminal", "role": "agent", "action": "created", "id": self.follow_terminal}]}
+                } if self.follow_terminal else {}
 
     def tick(self, minutes=0):
         self.now += minutes * 60
@@ -1668,7 +1899,7 @@ class Fleet:
         out = io.StringIO()
         with patch.object(tick, "supervisor", return_value=([], "run")), patch.object(tick, "runtime", self.orca), \
                 patch.object(tick, "tickets", side_effect=self.tickets_error, return_value=[self.ticket]), patch.object(tick, "review_card", record), \
-                patch.object(pick, "main", return_value=0), patch.object(pick, "due", return_value=[]), \
+                patch.object(pick, "main", return_value=0) as self.pick_main, patch.object(pick, "due", return_value=[]), \
                 patch.object(pick, "pick", seat), patch.object(pick.account_usage, "load_config", return_value=cfg), \
                 patch.object(pick, "coordinator", return_value=self.fresh and {"id": self.fresh}), \
                 patch.object(tick.time, "time", return_value=self.now), redirect_stdout(out):
@@ -1714,8 +1945,8 @@ with TemporaryDirectory() as tmp:
     # Review discovery still finds exactly one "#553 coder" Task, whose newest Dispatch is the retry.
     assert [t["id"] for t in f.orca("orchestration", "task-list")["tasks"] if t["task_title"] == "#553 coder"] == ["task_coder"]
 
-# At the limit, on a model-switch menu, or after Codex switched models: stop it, then retry on another account.
-for agent, model, screen in (("codex", "gpt-6.2-astra", CODEX_AT_LIMIT), ("codex", "gpt-6.2-astra", CODEX_SWITCHED),
+# At the limit or on a model-switch menu: stop it, then retry on another account.
+for agent, model, screen in (("codex", "gpt-6.2-astra", CODEX_AT_LIMIT),
                              ("claude", "claude-opus-5-5", CLAUDE_AT_LIMIT), ("claude", "claude-opus-5-5", CLAUDE_CURRENT)):
     with TemporaryDirectory() as tmp:
         f = Fleet(tmp, agent, model, screen)
@@ -1724,6 +1955,13 @@ for agent, model, screen in (("codex", "gpt-6.2-astra", CODEX_AT_LIMIT), ("codex
         assert ("account", "select", "--agent", agent, "--account", "x2") in f.events
         assert [c[0] for c in f.cards] == ["Handed off", "Coding"]
         assert not any(e[:2] == ("terminal", "send") for e in f.events)  # never types into the pane
+
+# Bug 4 (#517, #485): a Codex status line naming another model is a healthy worker, not a limit.
+for model in ("gpt-6.2-astra", None):
+    with TemporaryDirectory() as tmp:
+        f = Fleet(tmp, "codex", model, CODEX_SWITCHED)
+        calls = f.tick()
+        assert ("orchestration", "worker-stop") not in calls and not f.sent() and f.cards == [], (calls, f.lines)
 
 # No hold ever recorded: the exhausted account cannot be excluded, so nothing is stopped and the Run decides.
 with TemporaryDirectory() as tmp:
@@ -1812,6 +2050,30 @@ with TemporaryDirectory() as tmp:
     f.tick(1)
     assert not f.db.execute("SELECT * FROM watch").fetchall() and len(f.notes) == 1
 
+# #588 item C: a follow-up in a fresh pane takes the account hold and the watch row with it, so its own usage limit
+# restarts it on another account instead of escalating "limit account unknown".
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    f.ticket["route"] = ("codex", "gpt-6.2-astra", "medium", None)
+    tick.review_state(f.db, "run", 553)
+    tick.save_review(f.db, "run", 553, {"coder": "ctx_coder", "expected": "ctx_coder", "coder_terminal": "term_coder"})
+    f.note_error = tick.OrcaError("mailbox busy")
+    with check.assertRaises(tick.OrcaError):
+        f.tick()
+    f.status, f.state, f.liveness, f.note_error = "completed", "succeeded", "exited", None
+    f.follow_status, f.follow_liveness = "dispatched", "live"
+    f.tick(1)
+    holds = json.loads(f.holds.read_text())
+    assert "term_restart" not in holds and holds["term_follow"]["account"] == "x2", holds
+    rows = dict(f.db.execute("SELECT terminal,state FROM watch"))
+    assert list(rows) == ["term_follow"] and json.loads(rows["term_follow"])["account"] == "x2", rows
+    f.screen = CODEX_AT_LIMIT  # the follow-up hits its own limit
+    f.tick(1)
+    start = next(e for e in f.events if e[:2] == ("orchestration", "worker-start"))
+    assert start[start.index("--task") + 1] == "task_follow" and ("account", "select", "--agent", "codex", "--account", "jzaw") in f.events
+    assert not [s for s in f.sent() if "limit account unknown" in s[1]] and f.cards[-1][0] != "Needs you", (f.sent(), f.cards)
+    assert json.loads(f.holds.read_text())["term_follow2"]["account"] == "jzaw"
+
 # A reviewer's settled replacement gets its note as a follow-up in a fresh pane. Review takes the pane with the
 # Dispatch, so a handoff there is not read as a review failure.
 with TemporaryDirectory() as tmp:
@@ -1861,6 +2123,28 @@ for retried, current in ((False, "ctx_follow"), (True, "ctx_follow_retry")):
         assert len(f.followups) == 1 and len(f.notes) == 1 and "followed up" in f.lines[0]
         assert f.db.execute("SELECT run,issue,dispatch FROM followups").fetchall() == [("run", 553, current)]
         assert f.cards[-1] == ("Coding", "coder gpt-6.2-astra medium @x2")
+
+# #588 item B: a pre-upgrade row (no sending mark, no request id) whose follow-up-starting send was applied is
+# reconciled against that follow-up instead of starting a second one.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    tick.review_state(f.db, "run", 553)
+    tick.save_review(f.db, "run", 553, {"coder": "ctx_coder", "expected": "ctx_coder", "coder_terminal": "term_coder"})
+    f.note_error = tick.OrcaError("mailbox busy")
+    with check.assertRaises(tick.OrcaError):
+        f.tick()
+    f.status, f.state, f.liveness = "completed", "succeeded", "exited"
+    f.note_error, f.note_lost = None, True
+    with check.assertRaisesRegex(tick.OrcaError, "watch error"):
+        f.tick(1)
+    row = json.loads(dict(f.db.execute("SELECT terminal,state FROM watch"))["term_restart"])
+    for key in ("sending", "request"):
+        row["note"].pop(key, None)
+    with f.db:
+        f.db.execute("UPDATE watch SET state=? WHERE terminal='term_restart'", (json.dumps(row),))
+    f.tick(1)
+    assert len(f.followups) == 1 and len(f.notes) == 1, (f.followups, f.lines)
+    assert tick.review_state(f.db, "run", 553)["expected"] == "ctx_follow"
 
 # Orca queues the note for the live replacement, the reply is lost, and the replacement settles before the next
 # tick: the retry replays the first send under its saved request instead of starting a follow-up.
@@ -1916,6 +2200,38 @@ for current in ("follow", "follow_retry"):
             patch.object(tick, "review_step") as step, patch.object(tick, "runtime", discovery):
         tick.review_tick(args, db)
         assert step.call_args.args[-2]["expected"] == current and step.call_args.args[-1] == [followed_report]
+
+# Bug 3: an older coder Task's success report does not outrank the follow-up's root, which has no report; a
+# Task with no Dispatch is skipped, and the next issue still runs.
+args = SimpleNamespace(issue=None, coder=None, run=None, anchor=None)
+ticket, state = review_fixture()
+ticket.update(agent=state["agent"], stage="Coding")
+empty = dict(ticket, number=40)
+db = sqlite3.connect(":memory:")
+db.execute("CREATE TABLE followups (run TEXT, issue INTEGER, dispatch TEXT, PRIMARY KEY(run,issue))")
+db.execute("INSERT INTO followups VALUES ('run', 41, 'follow')")
+reports = [report("old", f"I pushed {sha}.", msg_id="old-report"), report("follow", f"I pushed {sha}.", msg_id="follow-report")]
+attempts = {"old": {"id": "old", "runId": "run", "taskId": "task_old"},
+            "coder": {"id": "coder", "runId": "run", "taskId": "task"},
+            "follow": {"id": "follow", "runId": "run", "taskId": "task_follow", "followUpOf": "coder"}}
+def discovery(*argv):
+    if argv[:2] == ("orchestration", "inbox"):
+        return {"messages": reports}
+    if argv[:2] == ("orchestration", "task-list"):
+        return {"tasks": [{"title": "#40 coder", "id": "task_none"}, {"title": "#41 coder", "id": "task_old"},
+                          {"title": "#41 coder", "id": "task"}, {"title": "#41 coder", "id": "task_unstarted"}]}
+    if argv[:2] == ("orchestration", "dispatch-show"):
+        return {"dispatch": {"task_old": {"id": "old"}, "task": {"id": "coder"}, "task_follow": {"id": "follow"}}.get(argv[3])}
+    if argv[:2] == ("orchestration", "worker-show"):
+        return {"dispatch": attempts[argv[3]],
+                "worker": {"worktreeId": "tree", "startOptions": {"launch": {"effective": {"model": "gpt-6.2-sol"}}}}}
+    assert argv[:2] == ("worktree", "show"), argv
+    return {"worktree": {"id": "tree", "path": "/fixture", "branch": "refs/heads/task/ui/header"}}
+with patch.object(tick, "tickets", return_value=[empty, ticket]), patch.object(tick, "supervisor", return_value=([], "run")), \
+        patch.object(tick, "command", return_value="https://github.com/julianthant/hr-relay.git\n"), \
+        patch.object(tick, "review_step") as step, patch.object(tick, "runtime", discovery):
+    tick.review_tick(args, db)
+    assert step.call_count == 1 and step.call_args.args[-2]["expected"] == "follow"
 
 # A replacement that reports while its resume note is undelivered waits; review acts once delivery is confirmed.
 ticket, state = review_fixture()
@@ -2064,6 +2380,74 @@ with TemporaryDirectory() as tmp:
     assert f.cards[-1][0] == "Needs you"
     f.tick(1)
     assert f.sent() == []
+
+# #588 item A: no coordinator rotation while a restore is owed; the active Codex account is a worker's seat.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    tick.reserve(f.db, 60, {"task": "t60", "run": "run", "coordinator": "coord"})
+    f.active = "x2"
+    f.tick()
+    f.pick_main.assert_not_called()
+    assert "rotation deferred" in f.lines[0]
+    with f.db:
+        f.db.execute("UPDATE starts SET receipt=? WHERE issue=60", (json.dumps({"task": "t60", "run": "run"}),))
+    f.tick(1)
+    f.pick_main.assert_called_once_with(["coordinator"])
+
+# Bug 5: the retry shares its pane with a newer follow-up; the Task's earlier, failed attempts stay history.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.dispatch, f.terminal, f.status, f.state, f.follow_row = "ctx_restart", "term_restart", "succeeded", "succeeded", True
+    calls = f.tick()
+    assert not [e for e in f.events if e[:2] in (("orchestration", "worker-show"), ("orchestration", "worker-start"))], f.events
+# Bug 5: ownership of the newest attempt's pane moved to the follow-up; the Task's older failed attempt stays history.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.dispatch, f.terminal, f.status, f.state, f.follow_row = "ctx_restart", "term_restart", "succeeded", "succeeded", True
+    f.transferred = True
+    f.tick()
+    assert not [e for e in f.events if e[:2] in (("orchestration", "worker-show"), ("orchestration", "worker-start"))], f.events
+# Bug 5: a completed newest attempt with no terminal or resource record still makes the older failed one history.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.bare = True
+    f.tick()
+    assert not [e for e in f.events if e[:2] in (("orchestration", "worker-show"), ("orchestration", "worker-start"))], f.events
+
+# Bug 6: a follow-up Dispatch records no model; its restart takes the Coder line, or a reviewer's original Dispatch.
+# Orca titles a resume Task "#N: resume", so the original Dispatch's Task names the role.
+# A second resume follows a resume Task: the reviewer Task its ancestry reaches keeps the parent's verified route.
+for title, follow_of, orig, parent, want in (("#553 coder", None, None, None, ("gpt-6.2-astra", "medium")),
+                                             ("#553 reviewer", "ctx_orig", "#553 reviewer", None, ("gpt-6.2-sol", "xhigh")),
+                                             ("#553: resume", "ctx_orig", "#553 reviewer m1", None, ("gpt-6.2-sol", "xhigh")),
+                                             ("#553: resume", "ctx_orig", "#553 coder", None, ("gpt-6.2-astra", "medium")),
+                                             ("#553: resume", "ctx_orig", "#553: resume", "ctx_root", ("gpt-6.2-sol", "xhigh")),
+                                             ("#553: resume", "ctx_orig", "#553: resume", None, ("gpt-6.2-sol", "xhigh"))):
+    with TemporaryDirectory() as tmp:
+        f = Fleet(tmp, "codex", None, CODEX_AT_LIMIT)
+        f.title, f.follow_of, f.orig_title, f.orig_parent = title, follow_of, orig, parent
+        f.ticket["route"] = ("codex", "gpt-6.2-astra", "medium", None)
+        f.tick()
+        start = next(e for e in f.events if e[:2] == ("orchestration", "worker-start"))
+        assert (start[start.index("--model") + 1], start[start.index("--effort") + 1]) == want, start
+
+# Bug 1: after an Orca restart the crashed worker's Task is ready again; it starts without --retry-of and is adopted.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.task_status, f.status, f.state, f.liveness, f.failure = "ready", "failed", "failed", "exited", "agent process exited"
+    assert ("orchestration", "worker-start") in f.tick() and f.started_retry is False
+    assert json.loads(f.holds.read_text())["term_restart"]["account"] == "jzaw"
+    row = json.loads(f.db.execute("SELECT state FROM watch WHERE terminal='term_restart'").fetchone()[0])
+    assert row["relaunched"] and "pending" not in row, row
+# A lost start response: the next tick adopts the Task's new attempt, which has no retry lineage.
+with TemporaryDirectory() as tmp:
+    g = Fleet(tmp, screen=CLAUDE_WORKING)
+    g.task_status, g.status, g.state, g.liveness, g.failure = "ready", "failed", "failed", "exited", "agent process exited"
+    g.lose_start = True
+    with check.assertRaises(tick.OrcaError):
+        g.tick()
+    calls = g.tick(1)
+    assert ("orchestration", "worker-start") not in calls and "term_restart" in json.loads(g.holds.read_text()), (calls, g.lines)
 
 # A reviewer Orca already settled as failed, before any watch row: relaunched once, card kept at Reviewing.
 with TemporaryDirectory() as tmp:

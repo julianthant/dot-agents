@@ -1430,6 +1430,7 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
         elif pre_upgrade == "unsent":
             assert len(sends) == 1 and notice[0] == 1 and notice[2], notice
         else:
+            assert len(sends) == (2 if send_lost else 1), sends  # a lost reply's retry replays the same request
             assert notice[0] == 1 and notice[2], notice
         assert any(event[:2] == RM for event in events) == refused
 

@@ -2704,7 +2704,7 @@ with TemporaryDirectory() as home:
 with TemporaryDirectory() as tmp, ExitStack() as stack:
     root = Path(tmp)
     args = SimpleNamespace(repo_path=root, dry_run=True, issue=None, holds=root / "holds.json")
-    work = [dict(ticket, number=n, branch=f"task/test/{n}", paths=[str(n)]) for n in range(3)]
+    work = [dict(base, base="origin/main", number=n, branch=f"task/test/{n}", paths=[str(n)]) for n in range(1, 4)]
     stack.enter_context(patch.object(tick, "tickets", return_value=work))
     stack.enter_context(patch.object(tick, "command", side_effect=["git@github.com:julianthant/hr-relay.git", "",
                                                                    "abc refs/heads/main"]))
@@ -2718,3 +2718,43 @@ with TemporaryDirectory() as tmp, ExitStack() as stack:
         tick.fill_tick(args, None)
     starts = [line for line in result.getvalue().splitlines() if "would start" in line]
     assert len(starts) == 2 and '"host": "local"' in starts[0] and '"host": "Juzzark-WSL"' in starts[1]
+
+# A coordinator-side mirror has no terminal. Confirm the Dispatch and hold the
+# physical terminal in the execution-host checkout, including on receipt recovery.
+with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory:") as db:
+    root = Path(tmp)
+    host = "Juzzark-WSL"
+    work = dict(base, number=99, sha="abc", base="origin/main")
+    wt = {"id": "wsl-tree", "branch": work["branch"], "head": "abc", "path": "/remote/worktree"}
+    dispatch = {"id": "ctx", "taskId": "task", "runId": "run"}
+    def home_rpc(*args):
+        if args[:2] == ("orchestration", "worker-start"):
+            assert args[args.index("--on") + 1] == host
+            assert args[args.index("--worktree") + 1] == "path:/remote/worktree"
+            raise tick.OrcaError("start response lost")
+        return {"task-create": {"task": {"id": "task"}}, "dispatch-show": {"dispatch": dispatch},
+                "worker-show": {"dispatch": dispatch, "worker": {"worktreeId": None}}}[args[1]]
+
+    def remote_rpc(target, *args):
+        assert target == host
+        if args[:2] == ("worktree", "create"):
+            assert args[args.index("--repo") + 1] == "path:/remote/relay"
+            return {"worktree": wt}
+        if args[:2] == ("orchestration", "worker-show"):
+            return {"dispatch": dict(dispatch, assigneeHandle="wsl-term"), "worker": {"state": "ready", "worktreeId": wt["id"]},
+                    "terminal": {"handle": "wsl-term"}}
+        assert args[:2] == ("terminal", "read") and "wsl-term" in args
+        return {"terminal": {"tail": ["ready"]}}
+
+    stack.enter_context(patch.object(tick, "runtime", side_effect=home_rpc))
+    stack.enter_context(patch.object(tick, "supervisor", return_value=([], "run")))
+    stack.enter_context(patch.object(tick, "project_fields", return_value=("p", [], ("field", "waiting"))))
+    stack.enter_context(patch.object(pick.account_usage, "remote_output", side_effect=["", work["branch"], "abc"]))
+    stack.enter_context(patch.object(pick.account_usage, "host_orca", side_effect=remote_rpc))
+    select = stack.enter_context(patch.object(pick.account_usage, "remote_account",
+                                             side_effect=[{}, {"codex": {"activeAccountId": "seat"}}]))
+    stack.enter_context(patch.object(tick, "remote_tree_settings"))
+    tick.launch(db, Path("/remote/relay"), work, dict(account, host=host), args, root / "holds.json")
+    assert select.call_args_list[0].args == (host, "select", "--agent", "codex", "--account", "seat")
+    assert json.loads((root / "holds.json").read_text())["wsl-term"]["host"] == host
+    assert db.execute("SELECT receipt FROM starts WHERE issue=99").fetchone() == ("done",)

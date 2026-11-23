@@ -1168,6 +1168,8 @@ def launch(db, repo_path, t, acct, args, holds_path):
     account = runtime if not remote else lambda _, *args: account_usage.remote_account(host, *args)
     branch = t["branch"]
     existing_refs = set(git("git", "-C", str(repo_path), "for-each-ref", "--format=%(refname)", "refs/heads").splitlines())
+    if remote and "refs/heads/" + branch in existing_refs:
+        raise OrcaError(f"{host}: task branch already exists")
     wt = tree_command("worktree", "create", "--repo", "path:" + str(repo_path), "--name", branch[5:].replace("/", "."),
                  "--branch", branch, "--base-branch", t["base"], "--no-parent", "--setup", "skip")["worktree"]
     path = Path(wt["path"])

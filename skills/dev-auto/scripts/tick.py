@@ -1265,6 +1265,17 @@ def publish_review(db, run, ticket, state):
     log("review", {"issue": ticket["number"], "stage": state["stage"], "dispatch": state["expected"]})
 
 
+def resume_pending(db, run, number, dispatches):
+    """A watch restart of this ticket whose resume note or card restore has no receipt yet."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='watch'").fetchone():
+        return False
+    for (raw,) in db.execute("SELECT state FROM watch WHERE run=?", (run,)):
+        row = json.loads(raw)
+        if (row.get("note") or {}).get("to") in dispatches or (row.get("card") or {}).get("number") == number:
+            return True
+    return False
+
+
 def review_step(db, run, actor, ticket, initial, messages):
     import pick
     number = ticket["number"]
@@ -1286,6 +1297,8 @@ def review_step(db, run, actor, ticket, initial, messages):
     if state.get("publish"):
         publish_review(db, run, ticket, state)
     if state["stage"] in ("Merging", "Needs you"):
+        return
+    if resume_pending(db, run, number, {state["coder"], state["expected"]}):
         return
     db.execute("CREATE TABLE IF NOT EXISTS review_mail (run TEXT, id TEXT, PRIMARY KEY(run,id))")
     reports = (sorted(review_mail(messages, state["expected"]) + failed_reviews(db, run, state, messages),
@@ -2047,7 +2060,8 @@ def watch_pass(args, db, actions, errors):
                     continue
                 if w["dispatchStatus"] != "failed" or reported or stopped:
                     restore_prompt(ticket, state, title)  # answered, then finished before this tick
-                    save(terminal, None)  # finished, reported or stopped by the operator
+                    # Finished, reported or stopped; an undelivered resume note or card target is kept until sent.
+                    save(terminal, state if state.get("note") or state.get("card") else None)
                     continue
                 exited = True
             if exited:

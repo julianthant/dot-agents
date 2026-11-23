@@ -1409,6 +1409,46 @@ with TemporaryDirectory() as tmp:
     assert len(f.notes) == 1 and f.cards[-1][0] == "Coding"
 
 
+# The replacement settles while its resume note cannot be sent: the note and card target outlive the worker scan.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    f.note_error = tick.OrcaError("mailbox busy")
+    with check.assertRaises(tick.OrcaError):
+        f.tick()
+    assert f.dispatch == "ctx_restart" and f.cards[-1][0] == "Handed off"
+    f.status, f.state, f.liveness = "completed", "succeeded", "exited"
+    with check.assertRaises(tick.OrcaError):
+        f.tick(1)
+    row = json.loads(dict(f.db.execute("SELECT terminal,state FROM watch"))["term_restart"])
+    assert row["note"]["to"] == "ctx_restart" and row["card"]["stage"] == "Coding"
+    f.note_error = None
+    f.tick(1)
+    assert len(f.notes) == 1 and f.cards[-1] == ("Coding", "coder gpt-6.2-astra medium @x2")
+    f.tick(1)
+    assert not f.db.execute("SELECT * FROM watch").fetchall() and len(f.notes) == 1
+
+# A replacement that reports while its resume note is undelivered waits; review acts once delivery is confirmed.
+ticket, state = review_fixture()
+db = sqlite3.connect(":memory:")
+db.execute("CREATE TABLE watch (run TEXT, terminal TEXT, state TEXT, PRIMARY KEY(run,terminal))")
+pending_note = {"note": {"to": "coder", "subject": "#41: resume", "body": "read the handoff"},
+                "card": {"number": 41, "stage": "Coding", "agent": state["agent"]}}
+db.execute("INSERT INTO watch VALUES ('run','pane-new',?)", (json.dumps(pending_note),))
+with patch.object(tick, "green_report", return_value=None) as verify, patch.object(tick, "review_card") as card, \
+        patch.object(tick, "runtime", return_value={"delivery": "follow_up", "followUpOf": "coder", "dispatchId": "fix"}) as cli:
+    tick.review_step(db, "run", [], ticket, state, [recorded])
+    verify.assert_not_called()
+    card.assert_not_called()
+    cli.assert_not_called()
+    pending_note.pop("note")  # delivered; the card target is still being restored
+    db.execute("UPDATE watch SET state=?", (json.dumps(pending_note),))
+    tick.review_step(db, "run", [], ticket, state, [recorded])
+    card.assert_not_called()
+    db.execute("UPDATE watch SET state='{}'")
+    tick.review_step(db, "run", [], ticket, state, [recorded])
+    assert card.call_args.args[1] == "Fixing" and cli.call_count == 1
+
+
 class FailingWatchInsert:
     """A connection that dies writing the successor's watch row once, inside adopt's transaction."""
     def __init__(self, db):

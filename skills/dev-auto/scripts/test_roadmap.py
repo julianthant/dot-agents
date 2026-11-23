@@ -72,7 +72,7 @@ class Roadmap(unittest.TestCase):
 
     def gh_api(self, argv, **kw):
         self.sent.append(argv)
-        name = next(k for k, url in roadmap.POLLS.items() if argv[-1].startswith(url.split("?")[0] + "?"))
+        name = next((k for k, url in roadmap.POLLS.items() if argv[-1].startswith(url.split("?")[0] + "?")), argv[-1])
         reply = self.replies.get(name) or R304.format(tag=name)
         return subprocess.CompletedProcess(argv, 1 if reply.startswith("HTTP/2.0 304") else 0, reply, "")
 
@@ -83,6 +83,9 @@ class Roadmap(unittest.TestCase):
 
     def issues(self, *pairs, tag="i"):
         self.replies["issues"] = R200.format(tag=tag, body=json.dumps([{"number": n, "updated_at": u} for n, u in pairs]))
+
+    def runs(self, *runs):
+        self.replies["runs"] = R200.format(tag="r2", body=json.dumps({"workflow_runs": runs}))
 
     def fetches(self, fail=False):
         """Patch the snapshot read to record each fresh flag, failing as a refused refetch when asked."""
@@ -214,7 +217,7 @@ class Roadmap(unittest.TestCase):
     def test_a_refused_refresh_stays_pending_until_it_succeeds(self):
         self.warm()
         built = []
-        rebuild = patch.object(roadmap, "pipeline", side_effect=lambda: built.append(1) or GITHUB)
+        rebuild = patch.object(roadmap, "pipeline", side_effect=lambda _: built.append(1) or GITHUB)
         calls, snapshot = self.fetches(fail=True)
         with snapshot, rebuild:
             self.issues((1, "2026-11-23T13:05:00Z"))
@@ -229,20 +232,66 @@ class Roadmap(unittest.TestCase):
         self.assertEqual(calls, [True, False])
         self.assertEqual(len(built), 1)  # only the real change rebuilt the pipeline; retries reuse the cache
 
-    def test_pr_or_run_changes_and_the_minute_rebuild_the_pipeline_only(self):
-        built = []
-        with patch.object(roadmap, "pipeline", side_effect=lambda: built.append(1) or GITHUB):
+    def test_runs_update_the_full_run_without_rebuilding_the_pipeline(self):
+        self.warm()
+        full = {"head_branch": "development", "event": "workflow_dispatch", "status": "in_progress",
+                "conclusion": None, "created_at": SINCE, "head_sha": "abc", "html_url": "https://example.com/run"}
+        self.runs(dict(full, event="push", head_sha="other"), full)
+        expected = {"status": "in_progress", "conclusion": None, "createdAt": SINCE,
+                    "headSha": "abc", "url": "https://example.com/run"}
+        with patch.object(roadmap, "pipeline", return_value=GITHUB) as rebuild:
+            self.assertEqual(roadmap.render()["pipeline"].get("fullRun"), expected)
+            self.replies.clear()
+            self.assertEqual(roadmap.render()["pipeline"].get("fullRun"), expected)
+            self.runs(dict(full, event="push", head_sha="other"))
+            self.assertEqual(roadmap.render()["pipeline"].get("fullRun"), expected)
+        rebuild.assert_not_called()
+        self.assertEqual(self.reads, [])
+
+    def test_issue_and_pr_changes_and_the_minute_rebuild_the_pipeline(self):
+        calls, snapshot = self.fetches()
+        with snapshot, patch.object(roadmap, "pipeline", return_value=GITHUB) as rebuild:
             self.warm()
-            self.replies["runs"] = R200.format(tag="r2", body="{}")
+            self.issues((1, "2026-11-23T13:05:00Z"))
             roadmap.render()
-            self.assertEqual(len(built), 1)
+            self.assertEqual(rebuild.call_count, 1)
+            self.replies.clear()
+            self.replies["pulls"] = R200.format(tag="p2", body="[]")
+            roadmap.render()
+            self.assertEqual(rebuild.call_count, 2)
             self.replies.clear()
             roadmap.render()
-            self.assertEqual(len(built), 1)
+            self.assertEqual(rebuild.call_count, 2)
             self.warm(built=time.time() - 61)
             roadmap.render()
-            self.assertEqual(len(built), 2)
-        self.assertEqual(self.reads, [])  # the issue snapshot stayed within its minute throughout
+            self.assertEqual(rebuild.call_count, 3)
+        self.assertEqual(calls, [True, False, False, False])
+        self.assertEqual(self.reads, [])
+
+    def test_minute_refresh_reuses_unchanged_rest_fields(self):
+        endpoints = {"releases?per_page=1": [{"tag_name": "v1", "published_at": SINCE}],
+                     "git/matching-refs/heads/cut/": [{"ref": "refs/heads/cut/old"}],
+                     "compare/staging...development?per_page=1": {"ahead_by": 8},
+                     "compare/main...development?per_page=1": {"ahead_by": 9},
+                     "milestones?state=open&per_page=50": [{"title": "Staging cut"}]}
+        self.warm(built=time.time() - 61)
+        for path, body in endpoints.items():
+            self.replies[f"repos/{roadmap.REPO}/{path}"] = R200.format(tag="cached", body=json.dumps(body))
+        with patch.object(self, "answer", side_effect=lambda a: [] if a[:2] == ("pr", "list") else {"total_count": 7}):
+            first = roadmap.render()
+            self.sent.clear()
+            self.replies.clear()
+            state = json.loads(roadmap.STATE.read_text())
+            roadmap.STATE.write_text(json.dumps({**state, "built": time.time() - 61}))
+            second = roadmap.render()
+        self.assertEqual(first["pipeline"]["release"], {"tagName": "v1", "publishedAt": SINCE})
+        self.assertEqual(first["pipeline"]["cuts"], ["cut/old"])
+        self.assertEqual(first["pipeline"]["devAheadOfStaging"], 8)
+        self.assertEqual(first["pipeline"]["devAheadOfMain"], 9)
+        self.assertEqual(first["milestones"], ["Staging cut"])
+        self.assertEqual((second["pipeline"], second["milestones"]), (first["pipeline"], first["milestones"]))
+        self.assertEqual([a[-1] for a in self.sent[3:]], [f"repos/{roadmap.REPO}/{path}" for path in endpoints])
+        self.assertTrue(all('If-None-Match: W/"cached"' in a for a in self.sent[3:]))
 
 
 if __name__ == "__main__":

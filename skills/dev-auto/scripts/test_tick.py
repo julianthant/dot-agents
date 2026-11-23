@@ -1811,7 +1811,7 @@ class Fleet:
         out = io.StringIO()
         with patch.object(tick, "supervisor", return_value=([], "run")), patch.object(tick, "runtime", self.orca), \
                 patch.object(tick, "tickets", side_effect=self.tickets_error, return_value=[self.ticket]), patch.object(tick, "review_card", record), \
-                patch.object(pick, "main", return_value=0), patch.object(pick, "due", return_value=[]), \
+                patch.object(pick, "main", return_value=0) as self.pick_main, patch.object(pick, "due", return_value=[]), \
                 patch.object(pick, "pick", seat), patch.object(pick.account_usage, "load_config", return_value=cfg), \
                 patch.object(pick, "coordinator", return_value=self.fresh and {"id": self.fresh}), \
                 patch.object(tick.time, "time", return_value=self.now), redirect_stdout(out):
@@ -2214,6 +2214,19 @@ with TemporaryDirectory() as tmp:
     assert f.cards[-1][0] == "Needs you"
     f.tick(1)
     assert f.sent() == []
+
+# #588 item A: no coordinator rotation while a restore is owed; the active Codex account is a worker's seat.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    tick.reserve(f.db, 60, {"task": "t60", "run": "run", "coordinator": "coord"})
+    f.active = "x2"
+    f.tick()
+    f.pick_main.assert_not_called()
+    assert "rotation deferred" in f.lines[0]
+    with f.db:
+        f.db.execute("UPDATE starts SET receipt=? WHERE issue=60", (json.dumps({"task": "t60", "run": "run"}),))
+    f.tick(1)
+    f.pick_main.assert_called_once_with(["coordinator"])
 
 # Bug 5: the retry shares its pane with a newer follow-up; the Task's earlier, failed attempts stay history.
 with TemporaryDirectory() as tmp:

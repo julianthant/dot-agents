@@ -2038,12 +2038,17 @@ def watch_pass(args, db, actions, errors):
     import pick
     actor, run = supervisor(args)
     now = time.time()
+    # While a restore is owed the active Codex account may be a worker's seat, not the coordinator's.
+    owed = owed_restores(db)
     try:
-        with contextlib.redirect_stdout(io.StringIO()) as out:
-            pick.main(["coordinator"])
-        if out.getvalue().strip():
-            actions.append({"coordinator": out.getvalue().strip()})
-    except (OSError, ValueError, KeyError, subprocess.SubprocessError, SystemExit) as e:
+        if owed:
+            actions.append({"coordinator": f"rotation deferred: restore owed by {sorted(owed)}"})
+        else:
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                pick.main(["coordinator"])
+            if out.getvalue().strip():
+                actions.append({"coordinator": out.getvalue().strip()})
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError, SystemExit, sqlite3.Error) as e:
         errors.append({"coordinator": str(e)})
     cfg = pick.account_usage.load_config()
     holds_path = Path(args.holds or pick.HOLDS)

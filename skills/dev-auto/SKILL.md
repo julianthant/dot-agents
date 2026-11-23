@@ -91,7 +91,8 @@ renders the roadmap from the same snapshot.
 ## Watch
 
 Run `scripts/tick.py watch` from the coordinating Run (or pass its launchd
-`--anchor` and `--run`). Each tick runs `pick.py coordinator`, then checks
+`--anchor` and `--run`). Each tick runs `pick.py coordinator` (deferred while a
+coordinator restore is still owed), then checks
 the current attempt of every live worker in the Run and logs one `watch` line:
 
 - A limit screen or the Codex model-switch menu (a Codex status line naming another model is not a limit):

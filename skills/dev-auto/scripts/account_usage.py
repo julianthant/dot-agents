@@ -166,7 +166,8 @@ def remote_output(host, checkout, argv):
     """Run argv on the execution host. A nonce and digest distinguish complete output from shell echo or truncation."""
     tag = uuid.uuid4().hex
     script = """import base64, hashlib, json, subprocess, sys, textwrap, zlib
-p = subprocess.run(json.loads(sys.argv[2]), capture_output=True, timeout=100)
+argv = json.loads(zlib.decompress(base64.b64decode(sys.argv[2])))
+p = subprocess.run(argv, capture_output=True, timeout=100)
 data = p.stdout if p.returncode == 0 else b''
 tag = sys.argv[1]
 for chunk in textwrap.wrap(base64.b64encode(zlib.compress(data)).decode(), 48):
@@ -174,7 +175,8 @@ for chunk in textwrap.wrap(base64.b64encode(zlib.compress(data)).decode(), 48):
 print(tag + ' END', p.returncode, hashlib.sha256(data).hexdigest())
 """
     # One physical line: an interactive shell must not execute a partial multiline paste.
-    command = shlex.join(["python3", "-c", "exec(" + repr(script) + ")", tag, json.dumps(argv)])
+    command = shlex.join(["python3", "-c", "exec(" + repr(script) + ")", tag,
+                          base64.b64encode(zlib.compress(json.dumps(argv).encode())).decode()])
     result = host_orca(host, "terminal", "create", "--worktree", "path:" + str(checkout),
                        "--title", "dev-auto", "--command", command)
     handle = result["terminal"]["handle"]

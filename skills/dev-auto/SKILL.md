@@ -185,3 +185,32 @@ Each roadmap render reads `tick.lastRun` and `tick.errors` from the latest
 finished invocation. `tick` is `null` before the first run. An error lists
 its phase and exception type. The matching local `tick.log` entry has the
 CLI diagnostic.
+
+## WSL accounts and fill placement
+
+Keep one `[[account]]` row per managed login in the private, untracked
+`accounts.toml`, in picker preference order within each plan. Get the ID from
+`orca account list --json` **on WSL**. Disabled rows stay in the file.
+
+```toml
+[[account]]
+host = "Juzzark-WSL"
+agent = "codex"
+id = "<WSL Orca account ID>"
+label = "wsl-codex-1"
+plan = "plus"
+enabled = true
+```
+
+Set `local_target_tickets` at the top level and `target_tickets` in
+`[hosts.Juzzark-WSL]`. A missing or zero remote target disables overflow.
+For hr-relay, fill counts distinct live agent worktrees on task branches
+and pending starts, tries the Mac first, then uses the registered hr-relay
+checkout on WSL. Dry-run output includes the selected host. The Task and
+Run stay on the coordinator. Account selection, Git preparation, worker
+settings, terminal reads and holds belong to the execution host.
+
+Orca's account commands operate on the machine running the CLI. The picker
+reads active and inactive WSL windows through a short-lived WSL terminal and
+closes it after the read. Use the picker's returned selection command so the
+account switch runs on that host.

@@ -18,6 +18,7 @@ from pathlib import Path
 import argparse
 import datetime
 import hashlib
+import inspect
 import sqlite3
 import tempfile
 import tomllib
@@ -637,7 +638,7 @@ def fill_plan(tickets, seat, issue=None):
         if not account:
             log("no seat", {"issue": t["number"], "reason": why or ["no eligible account"]})
             continue
-        held.append(dict(account=account["id"], agent=t["route"][0], model=t["route"][1], effort=t["route"][2]))
+        held.append(dict(host=account.get("host", "local"), account=account["id"], agent=t["route"][0], model=t["route"][1], effort=t["route"][2]))
         busy.append(t)
         yield t, account
 
@@ -707,7 +708,7 @@ def record_hold(rec):
     import pick
     with pick.edit_holds(Path(rec["holds"])) as holds:
         holds[rec["terminal"]] = dict(account=rec["account"], label=rec["label"], agent=tier[0],
-                                      model=tier[1], effort=tier[2], host="local", at=rec["time"])
+                                      model=tier[1], effort=tier[2], host=rec.get("host", "local"), at=rec["time"])
 
 
 def record_start(db, number, rec):
@@ -721,12 +722,17 @@ def record_start(db, number, rec):
         db.execute("UPDATE starts SET receipt='done' WHERE issue=?", (number,))
 
 
-def inventory(repo_path, issues, repo):
-    trees = runtime("worktree", "list", "--repo", "path:" + str(repo_path), "--limit", "10000")
-    terms = runtime("terminal", "list", "--limit", "10000")
+def inventory(repo_path, issues, repo, host="local", counts=None):
+    import account_usage
+    run = runtime if host == "local" else lambda *args: account_usage.host_orca(host, *args)
+    trees = run("worktree", "list", "--repo", "path:" + str(repo_path), "--limit", "10000")
+    terms = run("terminal", "list", "--limit", "10000")
     if trees["truncated"] or terms["truncated"]:
         raise OrcaError("incomplete Orca inventory")
     agents = {term["worktreeId"] for term in terms["terminals"] if term.get("agentIdentity")}
+    if counts is not None:
+        counts[host] = len({term["worktreeId"] for term in terms["terminals"]
+                            if term.get("agentIdentity") and (term.get("branch") or "").removeprefix("refs/heads/").startswith("task/")})
     repo_issues = [t for t in issues if t["repo"] == repo]
     for tree in trees["worktrees"]:
         branch = (tree["branch"] or "").removeprefix("refs/heads/")
@@ -795,7 +801,21 @@ def fill_tick(args, db):
         return issues
 
     issues = mark_pending([t for t in tickets() if t["repo"] == repo])
-    live = inventory(repo_path, issues, repo)
+    cfg = pick.account_usage.load_config()
+    wsl = "Juzzark-WSL"
+    targets = {"local": cfg.get("local_target_tickets", float("inf"))}
+    paths = {"local": repo_path}
+    remote_target = cfg.get("hosts", {}).get(wsl, {}).get("target_tickets", 0)
+    if repo == "hr-relay" and remote_target > 0:
+        targets[wsl] = remote_target
+        paths[wsl] = Path(pick.account_usage.host_checkout(wsl, repo))
+
+    def scan(items):
+        counts = {}
+        live = {host: inventory(path, items, repo, host, counts) for host, path in paths.items()}
+        return live, counts, time.time()
+
+    snapshot = scan(issues)
     refs = set(command("git", "-C", str(repo_path), "for-each-ref", "--format=%(refname:short)",
                        "refs/heads", "refs/remotes/origin").splitlines())
     remote_refs = command("git", "-C", str(repo_path), "ls-remote", "--heads", "origin")
@@ -810,46 +830,58 @@ def fill_tick(args, db):
             t["skip"].append("task branch exists")
         if not t["base"] or "refs/heads/" + t["base"].removeprefix("origin/") not in heads:
             t["skip"].append("base missing on origin")
-    cfg = pick.account_usage.load_config()
     holds_path = (args.holds or pick.HOLDS).resolve()
-
-    def seat(route, extra, handles=live, reservations=pending.copy()):
-        holds = json.loads(holds_path.read_text()) if holds_path.exists() else {}
-        held = [h for handle, h in holds.items() if handle in handles and h["host"] == "local"]
-        for rec in reservations.values():
-            if rec.get("route") and rec.get("account") and not (rec.get("terminal") in handles and rec["terminal"] in holds):
+    def seat(route, extra, state=snapshot, reservations=pending.copy()):
+        all_holds = json.loads(holds_path.read_text()) if holds_path.exists() else {}
+        reasons = []
+        now = state[2]
+        for host, handles in state[0].items():
+            planned = [h for h in extra if h["host"] == host]
+            held = [h for handle, h in all_holds.items() if handle in handles and h["host"] == host]
+            reserved = [rec for rec in reservations.values() if rec.get("host", "local") == host
+                        and rec.get("route") and rec.get("account") and rec.get("terminal") not in handles]
+            if state[1].get(host, 0) + len(planned) + len(reserved) >= targets[host]:
+                reasons.append(f"{host}: ticket target reached")
+                continue
+            for rec in reserved:
                 agent, model, effort = rec["route"][:3]
                 held.append(dict(account=rec["account"], agent=agent, model=model, effort=effort))
-        # pick.live_holds prunes the real file; use the read-only snapshot for planning.
-        return pick.pick(cfg, *route[:3], "local", time.time(), holds=held + extra)
+            acct, why = pick.pick(cfg, *route[:3], host, now, holds=held + planned)
+            if acct:
+                return acct, reasons
+            reasons.extend(why)
+        return None, reasons
 
     count = 0
     for ticket, acct in fill_plan(issues, seat, args.issue):
         route, n = ticket["route"], ticket["number"]
-        owed = route[0] == "codex" and db and owed_restores(db)
+        host = acct.get("host", "local")
+        owed = host == "local" and route[0] == "codex" and db and owed_restores(db)
         if owed:
             log("skip", {"issue": n, "reason": f"coordinator restore still owed by {sorted(owed)}"})
             continue
         log("would start" if args.dry_run else "start", dict(issue=n, repo=repo, branch=ticket["branch"],
-            base=ticket["base"], agent=route[0], model=route[1], effort=route[2], advisor=route[3], account=acct["label"]))
+            base=ticket["base"], host=host, agent=route[0], model=route[1], effort=route[2], advisor=route[3], account=acct["label"]))
         if not args.dry_run:
             # Refresh GitHub, ownership and the picker immediately before committing to side effects.
             current = mark_pending([t for t in tickets(fresh=True) if t["repo"] == repo])
-            latest = inventory(repo_path, current, repo)
+            latest = scan(current)
             candidate = next(fill_plan(current, lambda r, extra: seat(r, extra, latest, pending), n), None)
-            if not candidate or candidate[0].get("occupied") or candidate[1]["id"] != acct["id"] or any(
+            if not candidate or candidate[0].get("occupied") or candidate[1]["id"] != acct["id"] or candidate[1].get("host", "local") != host or any(
                 candidate[0][k] != ticket[k] for k in ("branch", "base", "route", "paths", "item")):
                 raise OrcaError(f"#{n} readiness or seat changed")
             ref = "refs/heads/" + ticket["base"].removeprefix("origin/")
             wanted = "refs/heads/" + ticket["branch"]
-            command("git", "-C", str(repo_path), "fetch", "--no-tags", "origin",
+            path = paths[host]
+            git = command if host == "local" else lambda *args: pick.account_usage.remote_output(host, path, args)
+            git("git", "-C", str(path), "fetch", "--no-tags", "origin",
                     ref + ":refs/remotes/" + ticket["base"])
-            latest_refs = command("git", "-C", str(repo_path), "ls-remote", "--heads", "origin", ref, wanted)
-            sha = command("git", "-C", str(repo_path), "rev-parse", "--verify", ticket["base"]).strip()
+            latest_refs = git("git", "-C", str(path), "ls-remote", "--heads", "origin", ref, wanted)
+            sha = git("git", "-C", str(path), "rev-parse", "--verify", ticket["base"]).strip()
             if latest_refs.split() != [sha, ref]:
                 raise OrcaError(f"#{n} base changed or task branch already exists on origin")
             try:
-                launch(db, repo_path, dict(ticket, sha=sha), acct, args, holds_path)
+                launch(db, path, dict(ticket, sha=sha), acct, args, holds_path)
             except (OrcaError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as e:
                 if not db or not db.execute("SELECT name FROM sqlite_master WHERE name='starts'").fetchone():
                     raise
@@ -980,6 +1012,56 @@ def remove_prelaunch_tree(repo, wt, existing_refs, settings_change):
         command("git", "-C", str(repo), "update-ref", "-d", ref, sha)
 
 
+def remote_tree_settings(host, repo, wt, route, *, rollback=False, change=None, existed=False):
+    """Run this version of the settings and guarded cleanup helpers in the remote checkout."""
+    import account_usage
+    script = """import hashlib, json, os, re, subprocess, sys, tempfile, tomllib
+from pathlib import Path
+def command(*args):
+    return subprocess.check_output(args, text=True)
+def runtime(*args):
+    reply = json.loads(command("orca", *args, "--environment", "local", "--json"))
+    if not reply["ok"]: raise OSError("worktree removal failed")
+    return reply["result"]
+OrcaError = RuntimeError
+def log(step, value):
+    print(step, value, file=sys.stderr)
+"""
+    if rollback:
+        script += inspect.getsource(remove_prelaunch_tree) + """
+repo, wt, ref_existed, change = json.loads(sys.argv[1])
+path = Path(wt["path"])
+settings = None
+if change:
+    relative, old_digest, written_digest = change
+    target = path / relative
+    if target.parent.is_symlink() or target.is_symlink(): raise ValueError("settings path changed")
+    written = target.read_bytes()
+    if hashlib.sha256(written).hexdigest() != written_digest: raise ValueError("settings changed")
+    before = None
+    if old_digest is not None:
+        before = subprocess.check_output(["git", "-C", str(path), "show", "HEAD:" + relative])
+        if hashlib.sha256(before).hexdigest() != old_digest: raise ValueError("preserve original settings")
+    settings = target, before, written
+refs = ["refs/heads/" + wt["branch"].removeprefix("refs/heads/")] if ref_existed else []
+remove_prelaunch_tree(Path(repo), wt, refs, settings)
+print("null")
+"""
+        data = [str(repo), {k: wt.get(k) for k in ("id", "path", "branch", "head", "isMainWorktree")}, existed, change]
+    else:
+        script += inspect.getsource(configure_codex_notice) + inspect.getsource(worker_settings) + """
+path, route = json.loads(sys.argv[1])
+change = worker_settings(Path(path), route)
+if change:
+    target, before, written = change
+    change = [str(target.relative_to(path)), hashlib.sha256(before).hexdigest() if before is not None else None,
+              hashlib.sha256(written).hexdigest()]
+print(json.dumps(change))
+"""
+        data = [wt["path"], route]
+    return json.loads(account_usage.remote_output(host, repo, ["python3", "-c", script, json.dumps(data)]))
+
+
 def start_identity(receipt):
     terminals = [effect["id"] for effect in receipt.get("effects", [])
                  if effect.get("kind") == "terminal" and effect.get("role") == "agent" and effect.get("id")]
@@ -1030,31 +1112,40 @@ def launch(db, repo_path, t, acct, args, holds_path):
     if db.execute("SELECT name FROM sqlite_master WHERE name='starts'").fetchone() and db.execute(
             "SELECT 1 FROM starts WHERE issue=?", (number,)).fetchone():
         raise OrcaError(f"issue #{number} already reserved")
+    import account_usage
+    host = acct.get("host", "local")
+    remote = host != "local"
+    git = command if not remote else lambda *args: account_usage.remote_output(host, repo_path, args)
+    tree_command = runtime if not remote else lambda *args: account_usage.host_orca(host, *args)
+    account = runtime if not remote else lambda _, *args: account_usage.remote_account(host, *args)
     branch = t["branch"]
-    existing_refs = set(command("git", "-C", str(repo_path), "for-each-ref", "--format=%(refname)", "refs/heads").splitlines())
-    wt = runtime("worktree", "create", "--repo", "path:" + str(repo_path), "--name", branch[5:].replace("/", "."),
+    existing_refs = set(git("git", "-C", str(repo_path), "for-each-ref", "--format=%(refname)", "refs/heads").splitlines())
+    wt = tree_command("worktree", "create", "--repo", "path:" + str(repo_path), "--name", branch[5:].replace("/", "."),
                  "--branch", branch, "--base-branch", t["base"], "--no-parent", "--setup", "skip")["worktree"]
     path = Path(wt["path"])
     settings_change = task = prior = None
     reserved = False
     try:
-        actual_branch = command("git", "-C", str(path), "branch", "--show-current").strip()
+        actual_branch = git("git", "-C", str(path), "branch", "--show-current").strip()
         if wt["branch"].removeprefix("refs/heads/") != branch or actual_branch != branch:
             raise OrcaError("created worktree does not own the requested branch")
-        if command("git", "-C", str(path), "rev-parse", "HEAD").strip() != t["sha"]:
+        if git("git", "-C", str(path), "rev-parse", "HEAD").strip() != t["sha"]:
             raise OrcaError("created worktree has a different base commit")
-        settings_change = worker_settings(path, route)
-        prior = codex_active(route)
+        if remote:
+            settings_change = remote_tree_settings(host, repo_path, wt, route)
+        else:
+            settings_change = worker_settings(path, route)
+            prior = codex_active(route)
         # Owed before the selection: if this start fails and its restore too, the next fill restores it.
         reserve(db, number, {"not_applied": True, "coordinator": prior})
         reserved = True
-        runtime("account", "select", "--agent", route[0], "--account", acct["id"])
+        account("account", "select", "--agent", route[0], "--account", acct["id"])
         task = runtime("orchestration", "task-create", *actor, "--task-title", f"#{number} coder",
                        "--spec", spec, "--full")["task"]["id"]
-        selected = runtime("account", "list")[route[0]]["activeAccountId"]
+        selected = account("account", "list")[route[0]]["activeAccountId"]
         if selected != acct["id"]:
             raise OrcaError("selected account changed before worker start")
-        rec = dict(task=task, run=run, worktree=wt["id"], account=acct["id"], label=acct["label"],
+        rec = dict(host=host, task=task, run=run, worktree=wt["id"], account=acct["id"], label=acct["label"],
                    route=route, project=project, item=t["item"], fields=fields, time=int(time.time()),
                    holds=str(holds_path), waiting_field=waiting_field, coordinator=prior)
         # The fill lock covers preparation. A durable Task identity precedes the only start call.
@@ -1069,8 +1160,12 @@ def launch(db, repo_path, t, acct, args, holds_path):
                 left = f"; inspect uncancelled Task {task} ({cancel_error})"
         tree = f"rolled back worktree {wt['path']}"
         try:
-            remove_prelaunch_tree(repo_path, wt, existing_refs, settings_change)
-        except (OSError, OrcaError, subprocess.TimeoutExpired) as cleanup_error:
+            if remote:
+                remote_tree_settings(host, repo_path, wt, route, rollback=True, change=settings_change,
+                                     existed="refs/heads/" + branch in existing_refs)
+            else:
+                remove_prelaunch_tree(repo_path, wt, existing_refs, settings_change)
+        except (OSError, OrcaError, ValueError, subprocess.TimeoutExpired) as cleanup_error:
             log("prelaunch cleanup", {"issue": number, "worktree": wt["path"], "reason": str(cleanup_error)})
             tree = f"inspect prepared worktree {wt['path']}"
         try:
@@ -1086,7 +1181,8 @@ def launch(db, repo_path, t, acct, args, holds_path):
                                (json.dumps({"not_applied": True, "coordinator": prior}), number))
         raise OrcaError(f"#{number}: {e}{left}; {tree}") from e
     try:
-        started = runtime("orchestration", "worker-start", *actor, "--task", task, "--worktree", "path:" + str(path),
+        started = runtime("orchestration", "worker-start", *actor, "--task", task, *(("--on", host) if remote else ()),
+                          "--worktree", "path:" + str(path),
                           "--agent", route[0], "--model", route[1], "--effort", route[2], "--keep-open", "--full")
         rec["dispatch"], rec["terminal"] = start_identity(started)
         with db:
@@ -1176,7 +1272,10 @@ def reconcile_start(db, number, rec, actor):
         if observed_terminal:
             if observed_terminal.get("handle") != terminal:
                 raise OrcaError(f"#{number} reserved: worker terminal identity changed")
-            tail = runtime("terminal", "read", "--terminal", terminal, "--screen")["terminal"]["tail"]
+            import account_usage
+            host = rec.get("host", "local")
+            read = runtime if host == "local" else lambda *args: account_usage.host_orca(host, *args)
+            tail = read("terminal", "read", "--terminal", terminal, "--screen")["terminal"]["tail"]
             prompt = codex_prompt(tail)
         if not observed_terminal and "agentWait" not in observation:
             raise OrcaError(f"#{number} reserved: no Codex startup observation for {dispatch_id}")

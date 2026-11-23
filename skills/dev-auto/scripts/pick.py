@@ -244,7 +244,7 @@ def due(cfg, host, now):
 
 
 def hold(cfg, args):
-    row = next((r for r in cfg["account"] if r["host"] == args.host and args.account in (r["id"], r["label"])), None)
+    row = next((r for r in cfg["account"] if r.get("host", "local") == args.host and args.account in (r["id"], r["label"])), None)
     if row is None:
         raise SystemExit(f"no account {args.account} in accounts.toml")
     with edit_holds(HOLDS) as holds:

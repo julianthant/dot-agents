@@ -86,7 +86,10 @@ Every tick verb reads open issues from one snapshot,
 Project write marks it stale, and fill's check right before a start always
 refetches. Closed issues (the newest 400) are read in full every ten minutes
 and only the recently updated ones in between. `scripts/roadmap.py > data.json`
-renders the roadmap from the same snapshot.
+renders the roadmap from the same snapshot. The Project's id and its field and
+option ids are cached in `project.json` beside it (`gh project field-list`
+costs about 100 GraphQL points); an unknown field or option refetches them, and
+a failed Project edit drops the cache.
 
 ## Watch
 

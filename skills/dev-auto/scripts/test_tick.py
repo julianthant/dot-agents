@@ -10,6 +10,7 @@ import tick
 
 _snapshot_dir = TemporaryDirectory()  # never read or write the live issue snapshot
 tick.SNAPSHOT = tick.Path(_snapshot_dir.name) / "issues.json"
+tick.PROJECT_CACHE = tick.Path(_snapshot_dir.name) / "project.json"
 
 L = tick.limited
 assert L(["⏺ working", "⎿  You've hit your 5-hour limit · resets 5pm"]) == "⎿  You've hit your 5-hour limit · resets 5pm"
@@ -815,6 +816,8 @@ RM_PR = lambda n, roll: {"number": n, "title": f"pr {n}", "headRefName": f"task/
 def rm_answer(args):
     """The recorded gh reply for one command line, for both the old and the moved script."""
     a = " ".join(args)
+    if args[:2] == ["project", "view"]:
+        return {"id": "proj"}
     if args[:2] == ["project", "field-list"]:
         return {"fields": [{"name": "Status", "options": [{"name": "Todo"}]}, {"name": "Area", "options": [{"name": "Tick"}, {"name": "Roadmap"}]}]}
     if args[:2] == ["pr", "list"]:
@@ -856,10 +859,43 @@ ROADMAP_BEFORE = json.loads(
     "\"},\"cuts\":[\"cut/2026-11-21\"],\"fullRun\":{\"conclusion\":\"success\",\"status\":\"completed\",\"createdAt\":\"2026-11-23T06"
     ":00:00Z\",\"headSha\":\"abc\",\"url\":\"u\"}}}")
 
-with patch.object(roadmap, "gh", lambda *a: rm_answer(list(a))):
+with patch.object(roadmap, "gh", lambda *a: rm_answer(list(a))), \
+        patch.object(tick, "command", lambda *a: json.dumps(rm_answer(list(a[1:])))):
     built = roadmap.build({"open": RM_OPEN, "closed": RM_CLOSED})  # open issues in creation order, as the snapshot keeps them
 built.pop("generated")
 check.assertEqual(built, ROADMAP_BEFORE)
+
+# Bug 8: field-list costs about 100 points, so the Project's ids are cached and refetched only on a miss or a failed edit.
+with TemporaryDirectory() as tmp:
+    reads = []
+    fields = {"fields": [{"name": "Agent", "id": "f_agent"},
+                         {"name": "Agent state", "id": "f_stage", "options": [{"name": "Coding", "id": "o_coding"}]}]}
+
+    def gh(*a):
+        if a[1:3] == ("project", "field-list"):
+            reads.append(a)
+            return json.dumps(fields)
+        if a[1:3] == ("project", "view"):
+            return json.dumps({"id": "proj"})
+        if a[1:3] == ("project", "item-edit"):
+            return "{}"
+        raise AssertionError(a)
+
+    with patch.object(tick, "PROJECT_CACHE", Path(tmp) / "project.json"), patch.object(tick, "command", gh):
+        card = {"item": "card"}
+        tick.review_card(card, "Coding", "coder")
+        tick.review_card(card, "Coding", "coder")
+        check.assertEqual(len(reads), 1)  # the second card edit reads no ids
+        fields["fields"][1]["options"].append({"name": "Fixing", "id": "o_fixing"})
+        tick.review_card(card, "Fixing", "coder")  # an option added since the cache: one refetch
+        check.assertEqual(len(reads), 2)
+    # A failed edit drops the cache through command(), so the next edit refetches.
+    cache = Path(tmp) / "project.json"
+    with patch.object(tick, "PROJECT_CACHE", cache), patch.object(tick.subprocess, "run",
+            return_value=subprocess.CompletedProcess([], 1, "", "Could not resolve to a node")):
+        with check.assertRaises(tick.OrcaError):
+            tick.command("gh", "project", "item-edit", "--id", "card")
+    check.assertFalse(cache.exists())
 
 # Orca identifies agent terminals separately from plain shells and links recovery worktrees to issues.
 items = [dict(base, number=row["number"], branch=row["branch"], paths=[str(row["number"])]) for row in parsed]

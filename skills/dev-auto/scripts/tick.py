@@ -371,6 +371,8 @@ SNAPSHOT = Path.home() / ".local/state/dev-auto/issues.json"
 SNAPSHOT_SECONDS = 60
 CLOSED_FULL_SECONDS = 600
 CLOSED_KEPT = 400
+# The Project's id and its field and option ids are stable; field-list alone costs about 100 GraphQL points.
+PROJECT_CACHE = SNAPSHOT.with_name("project.json")
 
 
 class StartNotApplied(OrcaError):
@@ -381,6 +383,8 @@ def command(*args):
     result = subprocess.run(args, capture_output=True, text=True, timeout=900 if "worker-start" in args else 90)
     if args[:3] == ("gh", "project", "item-edit"):
         stale_snapshot()
+        if result.returncode:
+            PROJECT_CACHE.unlink(missing_ok=True)  # a failed edit may mean renamed ids: refetch them next time
     if result.returncode:
         if args[1:3] == ("orchestration", "worker-start"):
             try:
@@ -607,11 +611,37 @@ def reserve(db, number, receipt):
         raise OrcaError(f"issue #{number} already reserved") from e
 
 
-def project_fields():
+def project_meta(refresh=False):
+    """{"id", "fields": {name: field}} from the cache, fetched only when missing or on refresh."""
+    if not refresh:
+        try:
+            return json.loads(PROJECT_CACHE.read_text())
+        except (OSError, ValueError):
+            pass
     args = (str(PROJECT), "--owner", OWNER, "--format", "json")
-    project = json.loads(command("gh", "project", "view", *args))["id"]
-    rows = json.loads(command("gh", "project", "field-list", *args))["fields"]
-    fields = {f["name"]: f for f in rows}
+    meta = {"id": json.loads(command("gh", "project", "view", *args))["id"],
+            "fields": {f["name"]: f for f in json.loads(command("gh", "project", "field-list", *args))["fields"]}}
+    PROJECT_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = PROJECT_CACHE.with_name(f"{PROJECT_CACHE.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(meta))
+    tmp.replace(PROJECT_CACHE)
+    return meta
+
+
+def with_project(use):
+    """use(meta) on the cached ids; an unknown field or option refetches them once."""
+    try:
+        return use(project_meta())
+    except (KeyError, StopIteration):
+        return use(project_meta(refresh=True))
+
+
+def project_fields():
+    return with_project(_project_fields)
+
+
+def _project_fields(meta):
+    project, fields = meta["id"], meta["fields"]
     edits = []
     for key, option in (("Status", "In Progress"), ("Agent state", "Coding"), ("Agent", None)):
         f = fields[key]
@@ -1244,14 +1274,14 @@ def review_account(route):
 
 
 def review_card(ticket, stage, agent):
-    args = (str(PROJECT), "--owner", OWNER, "--format", "json")
-    project = json.loads(command("gh", "project", "view", *args))["id"]
-    fields = json.loads(command("gh", "project", "field-list", *args))["fields"]
-    fields = {field["name"]: field for field in fields}
-    options = {o["name"]: o["id"] for o in fields["Agent state"]["options"]}
-    for name, flag, value in (("Agent", "--text", agent), ("Agent state", "--single-select-option-id", options[stage])):
+    def ids(meta):
+        fields = meta["fields"]
+        options = {o["name"]: o["id"] for o in fields["Agent state"]["options"]}
+        return meta["id"], fields["Agent"]["id"], fields["Agent state"]["id"], options[stage]
+    project, agent_field, stage_field, option = with_project(ids)
+    for field, flag, value in ((agent_field, "--text", agent), (stage_field, "--single-select-option-id", option)):
         command("gh", "project", "item-edit", "--project-id", project, "--id", ticket["item"],
-                "--field-id", fields[name]["id"], flag, value)
+                "--field-id", field, flag, value)
 
 
 def review_state(db, run, number):

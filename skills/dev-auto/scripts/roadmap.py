@@ -51,8 +51,10 @@ def checks(roll):
 def build(snap):
     issues = sorted(snap["open"], key=lambda n: n["updatedAt"], reverse=True) + snap["closed"]
     rows = [row(n) for n in issues]
-    areas = [o["name"] for f in gh("project", "field-list", str(tick.PROJECT), "--owner", tick.OWNER, "--format", "json")["fields"]
-             if f["name"] == "Area" for o in f["options"]]
+    areas = lambda meta: [o["name"] for o in meta["fields"]["Area"]["options"]]
+    area_order = tick.with_project(areas)
+    if {r["area"] for r in rows} - {None, *area_order}:
+        area_order = areas(tick.project_meta(refresh=True))  # an Area option added since the ids were cached
     dev_prs = [dict(n=p["number"], t=p["title"], head=p["headRefName"], auto=p["autoMergeRequest"] is not None,
                     draft=p["isDraft"], checks=checks(p["statusCheckRollup"]),
                     issues=[i["number"] for i in p["closingIssuesReferences"]], updated=p["updatedAt"])
@@ -75,7 +77,7 @@ def build(snap):
                     release=(rel[0] if rel else {"tagName": None, "publishedAt": main_date}), cuts=cuts,
                     fullRun=(full[0] if full else None))
     milestones = [m["title"] for m in ghq("api", f"repos/{REPO}/milestones?state=open&per_page=50") or []]
-    return {"generated": datetime.datetime.now(datetime.timezone.utc).isoformat(), "areas": areas,
+    return {"generated": datetime.datetime.now(datetime.timezone.utc).isoformat(), "areas": area_order,
             "milestones": milestones, "issues": rows, "pipeline": pipeline}
 
 

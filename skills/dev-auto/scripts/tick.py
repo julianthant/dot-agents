@@ -862,7 +862,7 @@ def launch(db, repo_path, t, acct, args, holds_path):
     wt = runtime("worktree", "create", "--repo", "path:" + str(repo_path), "--name", branch[5:].replace("/", "."),
                  "--branch", branch, "--base-branch", t["base"], "--no-parent", "--setup", "skip")["worktree"]
     path = Path(wt["path"])
-    settings_change = task = None
+    settings_change = task = prior = None
     try:
         actual_branch = command("git", "-C", str(path), "branch", "--show-current").strip()
         if wt["branch"].removeprefix("refs/heads/") != branch or actual_branch != branch:
@@ -879,7 +879,7 @@ def launch(db, repo_path, t, acct, args, holds_path):
             raise OrcaError("selected account changed before worker start")
         rec = dict(task=task, run=run, worktree=wt["id"], account=acct["id"], label=acct["label"],
                    route=route, project=project, item=t["item"], fields=fields, time=int(time.time()),
-                   holds=str(holds_path), waiting_field=waiting_field)
+                   holds=str(holds_path), waiting_field=waiting_field, coordinator=prior)
         # The fill lock covers preparation. A durable Task identity precedes the only start call.
         reserve(db, number, rec)
     except Exception as e:
@@ -895,6 +895,10 @@ def launch(db, repo_path, t, acct, args, holds_path):
         except (OSError, OrcaError, subprocess.TimeoutExpired) as cleanup_error:
             log("prelaunch cleanup", {"issue": number, "worktree": wt["path"], "reason": str(cleanup_error)})
             tree = f"inspect prepared worktree {wt['path']}"
+        try:
+            restore_coordinator(prior)
+        except (OSError, OrcaError, ValueError, KeyError, subprocess.TimeoutExpired) as restore_error:
+            left += f"; restore the coordinator's Codex account {prior} ({restore_error})"
         raise OrcaError(f"#{number}: {e}{left}; {tree}") from e
     try:
         started = runtime("orchestration", "worker-start", *actor, "--task", task, "--worktree", "path:" + str(path),
@@ -903,13 +907,13 @@ def launch(db, repo_path, t, acct, args, holds_path):
         with db:
             db.execute("UPDATE starts SET receipt=? WHERE issue=?", (json.dumps(rec), number))
     except StartNotApplied as e:
+        restore_coordinator(prior)
         with db:
             db.execute("DELETE FROM starts WHERE issue=?", (number,))
         raise OrcaError(f"#{number}: Orca confirmed no start effects; inspect prepared worktree {path}: {e}") from e
     except (OrcaError, OSError, ValueError, subprocess.TimeoutExpired) as e:
         log("start receipt unavailable", {"issue": number, "task": task, "reason": str(e)})
     reconcile_start(db, number, rec, actor)
-    restore_coordinator(prior)
 
 
 def codex_prompt(tail):
@@ -946,6 +950,12 @@ def reconcile_start(db, number, rec, actor):
         raise OrcaError(f"#{number} reserved: Task {task} has a different attempt; inspect {dispatch_id}")
     if rec.get("terminal") and rec["terminal"] != terminal:
         raise OrcaError(f"#{number} reserved: assignee changed for Dispatch {dispatch_id}")
+    # The verified attempt has consumed the worker's selection; the coordinator's comes back before anything else can fail.
+    if rec.get("coordinator"):
+        restore_coordinator(rec["coordinator"])
+        rec.pop("coordinator")
+        with db:
+            db.execute("UPDATE starts SET receipt=? WHERE issue=?", (json.dumps(rec), number))
     resource = (show.get("projection") or {}).get("resource") or {}
     released_failure = worker["state"] == "failed" and resource.get("terminalState") == "released"
     if released_failure or dispatch.get("status") == "completed":
@@ -1016,6 +1026,9 @@ def fill(args):
             if getattr(args, "release", None) is not None:
                 deleted = 0
                 if db.execute("SELECT name FROM sqlite_master WHERE name='starts'").fetchone():
+                    row = db.execute("SELECT receipt FROM starts WHERE issue=?", (args.release,)).fetchone()
+                    if row and row[0] not in (None, "done"):
+                        restore_coordinator(json.loads(row[0]).get("coordinator"))
                     with db:
                         deleted = db.execute("DELETE FROM starts WHERE issue=? AND receipt IS NOT 'done'",
                                              (args.release,)).rowcount
@@ -1282,6 +1295,14 @@ def resume_pending(db, run, number, dispatches):
     return False
 
 
+def review_coordinator(db, run, number, state):
+    """Give the coordinator its Codex account back once the reviewer start is settled, before any card write."""
+    if state.get("coordinator") and not state.get("pending"):
+        restore_coordinator(state["coordinator"])
+        state.pop("coordinator")
+        save_review(db, run, number, state)
+
+
 def review_step(db, run, actor, ticket, initial, messages):
     import pick
     number = ticket["number"]
@@ -1300,6 +1321,7 @@ def review_step(db, run, actor, ticket, initial, messages):
             state.pop("review_title", None)
             state.pop("hold", None)
             save_review(db, run, number, state)
+    review_coordinator(db, run, number, state)
     if state.get("publish"):
         publish_review(db, run, ticket, state)
     if state["stage"] in ("Merging", "Needs you"):
@@ -1365,6 +1387,8 @@ def review_step(db, run, actor, ticket, initial, messages):
                 runtime("account", "select", "--agent", route[0], "--account", account["id"])
                 if runtime("account", "list")[route[0]]["activeAccountId"] != account["id"]:
                     raise OrcaError("reviewer account selection changed")
+                if prior:
+                    state["coordinator"] = prior
                 stage = "Reviewing"
             else:
                 stage = "Merging"
@@ -1413,9 +1437,8 @@ def review_step(db, run, actor, ticket, initial, messages):
     state.pop("pending")
     state.update(stage=stage, publish=True)
     save_review(db, run, number, state)
+    review_coordinator(db, run, number, state)
     publish_review(db, run, ticket, state)
-    if account:
-        restore_coordinator(prior)
 
 
 def review_tick(args, db):
@@ -1968,6 +1991,8 @@ def watch_pass(args, db, actions, errors):
             review = None
         row = {"relaunched": bool(state.get("relaunched") or p["crash"]), "account": p["account"],
                "note": {"to": new, "subject": f"#{number}: resume" if number else "resume", "body": p["note"]}}
+        if p.get("coordinator"):
+            row["coordinator"] = p["coordinator"]
         if ticket:
             # The card leaves Handed off only once the resume note has a receipt.
             row["card"] = {"number": number, "stage": phase(ticket, state, p["title"]),
@@ -1981,11 +2006,18 @@ def watch_pass(args, db, actions, errors):
         saved.pop(terminal, None)
         saved[handle] = json.dumps(row)
         actions.append({"issue": number, "restarted": p["dispatch"], "as": new, "why": p["why"], "account": p["label"]})
-        restore_coordinator(p.get("coordinator"))
         send_note(handle, row)
 
     def send_note(handle, row):
-        """The resume note is resent each tick until Orca returns a receipt; then the card is restored."""
+        """Retried each tick until confirmed: the coordinator's account, the resume note, then the card."""
+        failure = None
+        if row.get("coordinator"):
+            try:
+                restore_coordinator(row["coordinator"])
+                row.pop("coordinator")
+                save(handle, row)
+            except (OrcaError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as e:
+                failure = e  # the note and card go on; the restore is retried next tick
         if row.get("note"):
             note = row["note"]
             receipt = runtime("orchestration", "send", *actor, "--to", "dispatch:" + note["to"],
@@ -1998,6 +2030,8 @@ def watch_pass(args, db, actions, errors):
             stage(cards.get(card["number"]), card["stage"], card["agent"])
             row.pop("card")
             save(handle, row)
+        if failure:
+            raise failure
 
     def restore_prompt(ticket, state, title):
         """The forwarded prompt was answered: give the card back so review_tick reads the coder's report."""
@@ -2015,7 +2049,7 @@ def watch_pass(args, db, actions, errors):
         try:
             if (state.get("pending") or {}).get("starting") and state["pending"].get("task"):
                 resume_start(terminal, state)
-            elif state.get("note") or state.get("card"):
+            elif state.get("coordinator") or state.get("note") or state.get("card"):
                 send_note(terminal, state)
         except (OrcaError, OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as e:
             errors.append({"terminal": terminal, "error": str(e)})

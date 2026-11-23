@@ -2753,16 +2753,18 @@ with TemporaryDirectory() as tmp, ExitStack() as stack:
     assert len(starts) == 2 and '"host": "local"' in starts[0] and '"host": "Juzzark-WSL"' in starts[1]
 
 # Fill recovers a remote worker before its Dispatch is visible to dispatch-show.
-def remote_start(root, stack, db, has_receipt):
+def remote_start(root, stack, db, has_receipt, repo="hr-relay"):
     host = "Juzzark-WSL"
-    work = dict(base, number=99, sha="abc", base="origin/main")
+    dot = repo == "dot-agents"
+    checkout = Path("/remote") / repo
+    work = dict(base, repo=repo, number=99, sha="abc", base="origin/main")
     wt = {"id": "wsl-tree", "branch": work["branch"], "head": "abc", "path": "/remote/worktree"}
     dispatch = {"id": "ctx", "taskId": "task", "runId": "run"}
     mirror = {"dispatch": dispatch, "worker": {"dispatchId": "ctx", "state": "ready", "stage": "server_record",
                                                "agentTerminalHandle": None, "worktreeId": None}, "terminal": None}
     server = {"environmentId": "env_wsl", "name": host, "asOf": "2026-11-23T18:00:00Z"}
     listed = False
-    execution_worktree = "other-tree" if has_receipt else wt["id"]
+    execution_worktree = "other-tree" if has_receipt and not dot else wt["id"]
     starts = []
 
     def home_rpc(*args):
@@ -2788,7 +2790,7 @@ def remote_start(root, stack, db, has_receipt):
     def remote_rpc(target, *args):
         assert target == host
         if args[:2] == ("worktree", "create"):
-            assert args[args.index("--repo") + 1] == "path:/remote/relay"
+            assert args[args.index("--repo") + 1] == "path:" + str(checkout)
             return {"worktree": wt}
         if args[:2] == ("worktree", "show"):
             assert args == ("worktree", "show", "--worktree", "id:wsl-tree")
@@ -2796,12 +2798,12 @@ def remote_start(root, stack, db, has_receipt):
         assert args[:2] == ("terminal", "read") and "wsl-term" in args
         return {"terminal": {"tail": ["ready"]}}
 
-    git_output = iter(("", work["branch"], "abc"))
-
     def remote_command(target, path, argv):
         assert target == host
         if argv[0] == "git":
-            return next(git_output)
+            assert path == checkout
+            return {"fetch": "", "ls-remote": "abc refs/heads/main", "rev-parse": "abc",
+                    "for-each-ref": "", "branch": work["branch"]}[argv[3]]
         assert str(path) == wt["path"]
         assert tuple(argv[1:]) == ("orchestration", "worker-show", "--dispatch", "ctx", "--full",
                                    "--environment", "local", "--json")
@@ -2821,19 +2823,35 @@ def remote_start(root, stack, db, has_receipt):
     select = stack.enter_context(patch.object(pick.account_usage, "remote_account",
                                              side_effect=[{}, {"codex": {"activeAccountId": "seat"}}]))
     stack.enter_context(patch.object(tick, "remote_tree_settings"))
-    stack.enter_context(patch.object(tick, "inventory", return_value=set()))
-    stack.enter_context(patch.object(pick.account_usage, "load_config", return_value={}))
-    stack.enter_context(patch.object(tick, "command", side_effect=lambda *argv:
-                                    "git@github.com:julianthant/hr-relay.git" if "get-url" in argv else ""))
+
+    def count_workers(path, tickets, name, emit, target, counts):
+        assert name == repo
+        assert path == (root if target == "local" else checkout)
+        counts[target] = 1 if target == "local" else 0
+        return set()
+
+    stack.enter_context(patch.object(tick, "inventory", side_effect=count_workers))
+    stack.enter_context(patch.object(pick.account_usage, "load_config", return_value={
+        "local_target_tickets": 1, "hosts": {host: {"target_tickets": 1}}} if dot else {}))
+    registered = stack.enter_context(patch.object(pick.account_usage, "host_checkout", return_value=str(checkout)))
+    stack.enter_context(patch.object(tick, "command", side_effect=lambda *argv: {
+        "remote": f"git@github.com:julianthant/{repo}.git", "for-each-ref": "",
+        "ls-remote": "abc refs/heads/main"}.get(argv[3], "") if argv[0] == "git" else ""))
     args = SimpleNamespace(repo_path=root, issue=99, dry_run=False, holds=root / "holds.json")
-    if has_receipt:
+    if dot:
+        stack.enter_context(patch.object(tick, "tickets", return_value=[work]))
+        picker = stack.enter_context(patch.object(pick, "pick", return_value=(dict(account, host=host), [])))
+        tick.fill_tick(args, db, issues=[work])
+        registered.assert_called_once_with(host, repo)
+        assert all(call.args[4] == host for call in picker.call_args_list)
+    elif has_receipt:
         with check.assertRaisesRegex(tick.OrcaError, "unverified worker"):
-            tick.launch(db, Path("/remote/relay"), work, dict(account, host=host), args, args.holds)
+            tick.launch(db, checkout, work, dict(account, host=host), args, args.holds)
         assert tick.review_state(db, "run", 99) is None
         execution_worktree = wt["id"]
     else:
         with check.assertRaisesRegex(tick.OrcaError, "no Dispatch"):
-            tick.launch(db, Path("/remote/relay"), work, dict(account, host=host), args, args.holds)
+            tick.launch(db, checkout, work, dict(account, host=host), args, args.holds)
     listed = True
     with redirect_stdout(io.StringIO()) as output:
         tick.fill_tick(args, db, issues=[])
@@ -2845,7 +2863,7 @@ def remote_start(root, stack, db, has_receipt):
     state = tick.review_state(db, "run", 99)
     assert (state["coder"], state["expected"], state["coder_terminal"], state["stage"]) == (
         "ctx", "ctx", "wsl-term", "Coding")
-    assert state["path"] == wt["path"]
+    assert (state["path"], state["host"]) == (wt["path"], host)
 
     review_ticket = dict(work, item="card", agent=state["agent"])
     with (patch.object(tick, "tickets", return_value=[review_ticket]),
@@ -2858,6 +2876,92 @@ def remote_start(root, stack, db, has_receipt):
     assert review_rpc.call_args.args[:4] == ("orchestration", "send", "--to", "dispatch:ctx")
 
 
-for has_receipt in (True, False):
+for has_receipt, repo in ((True, "hr-relay"), (False, "hr-relay"), (True, "dot-agents")):
     with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory:") as db:
-        remote_start(Path(tmp), stack, db, has_receipt)
+        remote_start(Path(tmp), stack, db, has_receipt, repo)
+
+# Review rows written before host tracking identify their coder through the Run's server records.
+with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory:") as db:
+    host = "Juzzark-WSL"
+    ticket, state = review_fixture()
+    ticket["body"] += " with Opus advisor"
+    state.update(path="/remote/worktree", coder_terminal="wsl-coder")
+    tick.review_state(db, "run", 41)
+    tick.save_review(db, "run", 41, state)
+    messages = [dict(recorded, created_at="2026-11-23T18:00:00Z")]
+    sends = []
+    starts = []
+    server = {"environmentId": "env_wsl", "name": host, "asOf": "2026-11-23T18:00:00Z"}
+    attempt = {"id": "wsl-review", "taskId": "review-task", "runId": "run"}
+
+    def review_rpc(*args):
+        match args[:2]:
+            case "orchestration", "inbox":
+                return {"messages": messages}
+            case "orchestration", "task-list":
+                return {"tasks": starts}
+            case "orchestration", "worker-list":
+                assert "--include-remote" in args
+                return {"workers": [{"dispatchId": "coder", "taskId": "task", "server": server},
+                                    {"dispatchId": "wsl-review", "taskId": "review-task", "server": server}],
+                        "page": {"hasMore": False}}
+            case "orchestration", "worker-start":
+                assert args[args.index("--on") + 1] == host
+                assert args[args.index("--worktree") + 1] == "path:/remote/worktree"
+                starts.append({"id": "review-task", "run_id": "run", "created_at": "2026-11-23T18:00:01Z",
+                               "task_title": args[args.index("--task-title") + 1],
+                               "spec": args[args.index("--spec") + 1]})
+                raise tick.OrcaError("lost reviewer receipt")
+            case "orchestration", "worker-show":
+                assert args[2:4] == ("--dispatch", "wsl-review")
+                return {"dispatch": attempt, "worker": {"stage": "server_record", "worktreeId": None},
+                        "terminal": None}
+            case "orchestration", "send":
+                # Dispatch-addressed mail is relayed by the Run home to the worker server.
+                assert args[2:4] == ("--to", "dispatch:coder") and "--on" not in args
+                sends.append(args[-1])
+                return {"delivery": "follow_up", "followUpOf": "coder", "dispatchId": "wsl-land"}
+        raise AssertionError(args)
+
+    def reviewer_execution(target, path, argv):
+        assert target == host and path == Path("/remote/worktree")
+        assert argv == ("orca", "orchestration", "worker-show", "--dispatch", "wsl-review",
+                        "--full", "--environment", "local", "--json")
+        return json.dumps({"ok": True, "result": {
+            "dispatch": dict(attempt, runId="wsl-run", assigneeHandle="wsl-reader"),
+            "worker": {"worktreeId": "wsl-tree", "startOptions": {"launch": {"effective": {
+                "agent": "claude", "model": "claude-sonnet-5-5", "effort": "medium"}}}},
+        }})
+
+    stack.enter_context(patch.object(tick, "supervisor", return_value=([], "run")))
+    stack.enter_context(patch.object(tick, "tickets", return_value=[ticket]))
+    stack.enter_context(patch.object(tick, "green_report", return_value=sha))
+    stack.enter_context(patch.object(tick, "review_card"))
+    stack.enter_context(patch.object(tick, "runtime", side_effect=review_rpc))
+    stack.enter_context(patch.object(tick, "worker_settings", side_effect=AssertionError("local settings")))
+    settings = stack.enter_context(patch.object(tick, "remote_tree_settings"))
+    tree = stack.enter_context(patch.object(pick.account_usage, "host_orca", return_value={
+        "worktree": {"id": "wsl-tree", "path": state["path"]}}))
+    stack.enter_context(patch.object(pick.account_usage, "remote_output", side_effect=reviewer_execution))
+    select = stack.enter_context(patch.object(pick.account_usage, "remote_account",
+                                             side_effect=[{}, {"claude": {"activeAccountId": "seat"}}]))
+    stack.enter_context(patch.object(pick.account_usage, "load_config", return_value={}))
+    seat = stack.enter_context(patch.object(pick, "pick", return_value=(dict(account, host=host), [])))
+    holds = Path(tmp) / "holds.json"
+    stack.enter_context(patch.object(pick, "HOLDS", holds))
+    args = SimpleNamespace(issue=41, coder=None)
+    with check.assertRaisesRegex(tick.OrcaError, "lost reviewer receipt"):
+        tick.review_tick(args, db)
+    tick.review_tick(args, db)
+    assert len(starts) == 1
+    tree.assert_called_once_with(host, "worktree", "show", "--worktree", "path:/remote/worktree")
+    assert seat.call_args.args[4] == host
+    assert settings.call_args.args[0] == host and settings.call_args.args[2]["path"] == state["path"]
+    assert select.call_args_list[0].args == (host, "select", "--agent", "claude", "--account", "seat")
+    assert json.loads(holds.read_text())["wsl-reader"]["host"] == host
+    assert tick.review_state(db, "run", 41)["host"] == host
+    messages = [recorded, dict(report("wsl-review", "REVIEW VERDICT: PUSH " + sha, msg_id="verdict"), sequence=2)]
+    tick.review_tick(args, db)
+    assert len(sends) == 1 and "Land the approved change" in sends[0]
+    state = tick.review_state(db, "run", 41)
+    assert (state["coder"], state["stage"], state["host"]) == ("wsl-land", "Merging", host)

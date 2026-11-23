@@ -846,7 +846,7 @@ def fill_tick(args, db, *, issues=None, emit=log):
     targets = {"local": cfg.get("local_target_tickets", float("inf"))}
     paths = {"local": repo_path}
     remote_target = cfg.get("hosts", {}).get(wsl, {}).get("target_tickets", 0)
-    if repo == "hr-relay" and remote_target > 0:
+    if remote_target > 0:
         targets[wsl] = remote_target
 
     def scan(items):
@@ -1296,24 +1296,30 @@ def return_coordinator(db, number, rec):
             db.execute("UPDATE starts SET receipt=? WHERE issue=?", (json.dumps(rec), number))
 
 
-def remote_start_dispatch(run, task, host):
+def fleet_workers(run):
     cursor = []
     seen = set()
     while True:
         inventory = runtime("orchestration", "worker-list", "--run", run, "--include-remote",
                             "--full", "--limit", "100", *cursor)
-        for worker in inventory["workers"]:
-            server = worker.get("server") or {}
-            if worker.get("taskId") == task and (server.get("name") or worker.get("host")) == host:
-                return worker["dispatchId"]
+        yield from inventory["workers"]
         page = inventory["page"]
         if not page["hasMore"]:
-            return None
+            return
         next_cursor = page["nextCursor"]
         if not next_cursor or next_cursor in seen:
             raise OrcaError("incomplete Orca worker inventory")
         seen.add(next_cursor)
         cursor = ["--cursor", next_cursor]
+
+
+def worker_host(worker):
+    return (worker.get("server") or {}).get("name") or worker.get("host") or "local"
+
+
+def remote_start_dispatch(run, task, host):
+    return next((w["dispatchId"] for w in fleet_workers(run)
+                 if w.get("taskId") == task and worker_host(w) == host), None)
 
 
 def execution_worker_show(host, path, dispatch_id):
@@ -1335,7 +1341,7 @@ def record_remote_review(db, number, rec, path):
     agent = f"coder {model} {effort}" + ("+advisor" if advisor else "") + " @" + rec["label"]
     save_review(db, run, number,
                 dict(coder=rec["dispatch"], expected=rec["dispatch"], coder_terminal=rec["terminal"],
-                     path=path, model=model, agent=agent, history=[], stage="Coding"))
+                     path=path, host=rec["host"], model=model, agent=agent, history=[], stage="Coding"))
 
 
 def reconcile_start(db, number, rec, actor):
@@ -1552,9 +1558,9 @@ def green_report(ticket, body):
         return head
 
 
-def review_account(route):
+def review_account(route, host):
     import pick
-    account, reasons = pick.pick(pick.account_usage.load_config(), *route[:3], "local", time.time())
+    account, reasons = pick.pick(pick.account_usage.load_config(), *route[:3], host, time.time())
     if account is None:
         raise OrcaError("no reviewer seat: " + ", ".join(reasons))
     return account
@@ -1598,6 +1604,13 @@ def assign_reviewer(state, dispatch, terminal, hold):
     state["card_agent"] = f"{state['agent']} · reviewer {route[1]} {route[2]}{advisor} @{hold['label']}"
 
 
+def review_dispatch(run, task, state):
+    host = state.get("host", "local")
+    if host != "local":
+        return remote_start_dispatch(run, task, host)
+    return (runtime("orchestration", "dispatch-show", "--task", task, "--full").get("dispatch") or {}).get("id")
+
+
 def adopt_reviewer(db, run, ticket, state, messages):
     import pick
     number = ticket["number"]
@@ -1618,16 +1631,29 @@ def adopt_reviewer(db, run, ticket, state, messages):
     if len(matches) != 1:
         raise error
     task = matches[0]["id"]
-    dispatch = (runtime("orchestration", "dispatch-show", "--task", task, "--full").get("dispatch") or {}).get("id")
+    dispatch = review_dispatch(run, task, state)
     if not dispatch:
         raise error
     show = runtime("orchestration", "worker-show", "--dispatch", dispatch, "--full")
-    attempt, worker = show["dispatch"], show["worker"]
-    tree = runtime("worktree", "show", "--worktree", "id:" + worker["worktreeId"])["worktree"]
+    attempt = show["dispatch"]
+    host = state.get("host", "local")
+    execution = show
+    if host != "local":
+        import account_usage
+        tree = account_usage.host_orca(host, "worktree", "show", "--worktree", "path:" + state["path"])["worktree"]
+        if (show.get("worker") or {}).get("stage") == "server_record":
+            execution = execution_worker_show(host, tree["path"], dispatch)
+    else:
+        tree = runtime("worktree", "show", "--worktree", "id:" + show["worker"]["worktreeId"])["worktree"]
+    worker = execution["worker"]
     effective = worker["startOptions"]["launch"]["effective"]
-    terminal = attempt.get("assigneeHandle")
+    executed = execution["dispatch"]
+    terminal = executed.get("assigneeHandle")
     if (not terminal or attempt["id"] != dispatch or attempt["runId"] != run or attempt["taskId"] != task
             or attempt.get("retryOfDispatchId") or attempt.get("followUpOf")
+            or (executed["id"], executed["taskId"]) != (dispatch, task)
+            or executed.get("retryOfDispatchId") or executed.get("followUpOf")
+            or attempt.get("assigneeHandle") not in (None, terminal)
             or tree["id"] != worker["worktreeId"] or tree["path"] != state["path"]
             or tuple(effective.get(k) for k in ("agent", "model", "effort")) != route[:3]):
         raise error
@@ -1637,7 +1663,8 @@ def adopt_reviewer(db, run, ticket, state, messages):
     else:
         with pick.edit_holds(pick.HOLDS) as holds:
             entry = holds.get(terminal)
-        if entry and all(entry.get(k) == v for k, v in zip(("agent", "model", "effort"), route)):
+        if (entry and entry.get("host", "local") == host
+                and all(entry.get(k) == v for k, v in zip(("agent", "model", "effort"), route))):
             label = entry["label"]
         elif (not entry and ticket["stage"] == "Reviewing" and
               " · reviewer " in (ticket["agent"] or "") and "@" in ticket["agent"].split(" · reviewer ")[-1]):
@@ -1689,7 +1716,7 @@ def recover_followup(run, ticket, state, messages, message_id):
     if len(matches) != 1:
         return False
     task = matches[0]["id"]
-    dispatch = (runtime("orchestration", "dispatch-show", "--task", task, "--full").get("dispatch") or {}).get("id")
+    dispatch = review_dispatch(run, task, state)
     if not dispatch:
         return False
     attempt = runtime("orchestration", "worker-show", "--dispatch", dispatch, "--full")["dispatch"]
@@ -1741,9 +1768,11 @@ def review_coordinator(db, run, number, state):
 
 
 def review_step(db, run, actor, ticket, initial, messages):
+    import account_usage
     import pick
     number = ticket["number"]
     state = review_state(db, run, number) or initial.copy()
+    host = state.get("host", "local")
     reservation = state.get("pending") or state.get("released")
     if reservation:
         if recover_followup(run, ticket, state, messages, reservation):
@@ -1818,19 +1847,27 @@ def review_step(db, run, actor, ticket, initial, messages):
                               and re.search(r"(?i)\bTier:\s*UI,?\s+multi-step\b", ticket["body"]))
                 if route[1] == state["model"] and not ui_advisor:
                     raise OrcaError("reviewer must use a different model from the coder")
-                owed = route[0] == "codex" and set(owed_restores(db)) - {f"reviews:{run}:{number}"}
+                owed = host == "local" and route[0] == "codex" and set(owed_restores(db)) - {f"reviews:{run}:{number}"}
                 if owed:
                     log("review", {"issue": number, "waiting": f"coordinator restore still owed by {sorted(owed)}"})
                     return
-                account = review_account(route)
-                worker_settings(Path(state["path"]), route)
-                prior = state.get("coordinator") or codex_active(route)
+                account = review_account(route, host)
+                path = Path(state["path"])
+                if host == "local":
+                    worker_settings(path, route)
+                    account_rpc = lambda *args: runtime("account", *args)
+                    prior = state.get("coordinator") or codex_active(route)
+                else:
+                    if route[0] == "codex" or route[3]:
+                        remote_tree_settings(host, path, {"path": state["path"]}, route)
+                    account_rpc = lambda *args: account_usage.remote_account(host, *args)
+                    prior = None
                 if prior:
                     # Owed from here on: the next tick restores it before reading this report again.
                     state["coordinator"] = prior
                     save_review(db, run, number, state)
-                runtime("account", "select", "--agent", route[0], "--account", account["id"])
-                if runtime("account", "list")[route[0]]["activeAccountId"] != account["id"]:
+                account_rpc("select", "--agent", route[0], "--account", account["id"])
+                if account_rpc("list")[route[0]]["activeAccountId"] != account["id"]:
                     raise OrcaError("reviewer account selection changed")
                 stage = "Reviewing"
             else:
@@ -1847,7 +1884,7 @@ def review_step(db, run, actor, ticket, initial, messages):
         spec = reviewer_spec(ticket, state["sha"], route[1] == state["model"])
         state["review_title"] = f"#{number} reviewer {message['id']}"
         state["hold"] = {"account": account["id"], "label": account["label"], "route": route,
-                         "time": int(time.time()), "holds": str(pick.HOLDS)}
+                         "time": int(time.time()), "holds": str(pick.HOLDS), "host": host}
     else:
         spec = coder_spec(ticket, stage, instructions)
         if stage != "Needs you":
@@ -1860,7 +1897,8 @@ def review_step(db, run, actor, ticket, initial, messages):
     state["card_agent"] = state["agent"]
     if account:
         try:
-            result = runtime("orchestration", "worker-start", *actor, "--worktree", "path:" + state["path"],
+            result = runtime("orchestration", "worker-start", *actor, *(("--on", host) if host != "local" else ()),
+                             "--worktree", "path:" + state["path"],
                              "--agent", route[0], "--model", route[1], "--effort", route[2],
                              "--task-title", state["review_title"], "--spec", spec, "--full")
         except StartNotApplied as e:
@@ -1882,6 +1920,7 @@ def review_step(db, run, actor, ticket, initial, messages):
                 "--subject", f"#{number}: third FIX", "--body", instructions)
         state["card_agent"] = "coordinator"
     else:
+        # The Run home relays Dispatch-addressed mail to the coder's execution server.
         result = runtime("orchestration", "send", *actor, "--to", "dispatch:" + state["coder"],
                          "--subject", f"#{number}: {stage}", "--body", spec)
         finish_followup(state, stage, followup_dispatch(result, state["coder"], run))
@@ -1963,8 +2002,14 @@ def review_tick(args, db):
                 agent = held_label((ticket["agent"] or "").split(" · ")[0] or f"coder {model}",
                                    show["dispatch"].get("assigneeHandle"))
                 state = {"coder": dispatch, "expected": dispatch, "coder_terminal": show["dispatch"].get("assigneeHandle"),
-                         "path": tree["path"], "model": model,
+                         "path": tree["path"], "host": "local", "model": model,
                          "agent": agent, "history": [], "stage": "Coding"}
+            elif "host" not in state and state["stage"] not in ("Merging", "Needs you"):
+                worker = next((w for w in fleet_workers(run) if w["dispatchId"] == state["coder"]), None)
+                if worker is None:
+                    raise OrcaError(f"cannot locate coder Dispatch {state['coder']} in the Run's worker inventory")
+                state["host"] = worker_host(worker)
+                save_review(db, run, number, state)
             review_step(db, run, actor, ticket, state, messages)
         except (OrcaError, OSError, KeyError, ValueError, subprocess.TimeoutExpired) as e:
             failures.append(f"#{number}: {e}")

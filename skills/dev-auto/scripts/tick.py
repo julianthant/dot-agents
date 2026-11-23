@@ -2140,6 +2140,18 @@ def watch_pass(args, db, actions, errors):
                 return name
         return "Reviewing" if "review" in title else "Coding"
 
+    def role_of(d):
+        """The role the first Task title in this Dispatch's retry and follow-up ancestry names, else None."""
+        for _ in range(10):
+            title = (tasks.get(d.get("taskId")) or {}).get("task_title") or ""
+            if "review" in title or "coder" in title:
+                return "reviewer" if "review" in title else "coder"
+            up = d.get("retryOfDispatchId") or d.get("followUpOf")
+            if not up:
+                return None
+            d = runtime("orchestration", "worker-show", "--dispatch", up, "--full")["dispatch"]
+        return None
+
     def followup_route(show, ticket, title):
         """A follow-up Dispatch records no model: its original's route, or the Coder line once that proves a coder."""
         coder = ticket and ticket.get("route") and tuple(ticket["route"][:3])
@@ -2151,9 +2163,8 @@ def watch_pass(args, db, actions, errors):
             effective = (((prev.get("worker") or {}).get("startOptions") or {}).get("launch") or {}).get("effective") or {}
             route = tuple(effective.get(k) for k in ("agent", "model", "effort"))
             if None not in route:
-                # A resume Task is titled "#N: resume"; the original's own Task says which role it is.
-                original = (tasks.get(prev["dispatch"].get("taskId")) or {}).get("task_title") or ""
-                return route if "review" in original or not coder else coder
+                # A resume Task is titled "#N: resume": the Coder line only when the ancestry names a coder.
+                return coder if coder and role_of(prev["dispatch"]) == "coder" else route
             d = prev["dispatch"]
         if "review" not in title and coder:
             return coder
@@ -2422,8 +2433,9 @@ def watch_pass(args, db, actions, errors):
         owner = (w.get("resource") or {}).get("ownerDispatchId")
         # worker-list is newest first: act only on the current attempt of each pane and Task.
         if not terminal or (owner and owner != dispatch):
-            # A pane handed to another Task's follow-up still makes this its Task's newest attempt.
-            if owner and task_of.get(owner) != task_id:
+            # Without a pane record, or on a pane handed to another Task's follow-up, this is still its Task's
+            # newest attempt; an owner in the same Task is listed later as that attempt.
+            if not (owner and owner != dispatch and task_of.get(owner) == task_id):
                 seen_tasks.add(task_id)
             continue
         # A newer attempt on a pane a follow-up took is still its Task's current one: record both first.

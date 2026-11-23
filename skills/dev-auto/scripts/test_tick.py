@@ -4,7 +4,7 @@ import subprocess
 import sys
 from contextlib import redirect_stderr, redirect_stdout
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import tick
 
@@ -2670,9 +2670,11 @@ with TemporaryDirectory() as tmp:
             patch.object(tick, "supervisor", return_value=(["--from", args.anchor, "--run", args.run], args.run)) as bind, \
             patch.object(tick, "watch_tick", phase("watch")), patch.object(tick, "review_tick", phase("review")), \
             patch.object(tick, "close_tick", phase("close")), patch.object(tick, "fill_tick", phase("fill")), \
+            patch.object(tick, "full_run_tick", phase_full := Mock()), \
             redirect_stdout(io.StringIO()) as output:
         assert tick.scheduled_tick(args) == 1
         bind.assert_called_once()
+        phase_full.assert_called_once_with()
         status = json.loads((root / "tick.json").read_text())
         assert status["lastRun"] and status["errors"] == [{"phase": "review", "error": "OrcaError"}], status
         assert "private CLI error" in output.getvalue()
@@ -2965,3 +2967,31 @@ with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory
     assert len(sends) == 1 and "Land the approved change" in sends[0]
     state = tick.review_state(db, "run", 41)
     assert (state["coder"], state["stage"], state["host"]) == ("wsl-land", "Merging", host)
+
+# The tick dispatches the development full run at most every 20 minutes and never twice at once.
+with TemporaryDirectory() as tmp:
+    stamp = Path(tmp) / "full-run.json"
+    sent = []
+
+    def gh(runs):
+        def run(*a):
+            sent.append(a)
+            return json.dumps(runs) if a[:3] == ("gh", "run", "list") else ""
+        return run
+
+    def lines(now, runs):
+        out = io.StringIO()
+        with patch.object(tick, "FULL_RUN_STAMP", stamp), patch.object(tick, "command", gh(runs)), redirect_stdout(out):
+            tick.full_run_tick(now)
+        return out.getvalue()
+
+    dispatch = ("gh", "workflow", "run", "development.yml", "-R", "julianthant/hr-relay", "--ref", "development")
+    assert "dispatched" in lines(10_000, [{"status": "completed", "event": "push"}])
+    assert sent[-1] == dispatch and sent[0][:3] == ("gh", "run", "list") and "development" in sent[0]
+    sent.clear()
+    assert "within 20 minutes" in lines(10_000 + 1199, []) and sent == []
+    assert "dispatched" in lines(10_000 + 1200, [])
+    sent.clear()
+    assert "already queued or running" in lines(20_000, [{"status": "in_progress", "event": "schedule"}])
+    assert dispatch not in sent
+    assert all(a[:3] == ("gh", "run", "list") or a == dispatch for a in sent)

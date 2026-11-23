@@ -2895,6 +2895,34 @@ def watch_workers(args):
         watch_tick(args, db)
 
 
+FULL_RUN_REPO = "julianthant/hr-relay"
+FULL_RUN_WORKFLOW = "development.yml"
+FULL_RUN_BRANCH = "development"
+FULL_RUN_SECONDS = 20 * 60
+FULL_RUN_STAMP = SNAPSHOT.with_name("full-run.json")
+
+
+def full_run_tick(now=None):
+    """Dispatch the development full run at most every 20 minutes; the workflow decides whether it is needed."""
+    now = time.time() if now is None else now
+    try:
+        last = json.loads(FULL_RUN_STAMP.read_text()).get("at", 0)
+    except (OSError, ValueError, AttributeError):
+        last = 0
+    if now - last < FULL_RUN_SECONDS:
+        log("full-run", "skipped: dispatched within 20 minutes")
+        return
+    runs = json.loads(command("gh", "run", "list", "-R", FULL_RUN_REPO, "--workflow", FULL_RUN_WORKFLOW,
+                              "--branch", FULL_RUN_BRANCH, "--limit", "20", "--json", "status,event"))
+    if any(r.get("status") in ("queued", "in_progress", "waiting", "requested", "pending") for r in runs):
+        log("full-run", "skipped: a full run is already queued or running")
+        return
+    command("gh", "workflow", "run", FULL_RUN_WORKFLOW, "-R", FULL_RUN_REPO, "--ref", FULL_RUN_BRANCH)
+    FULL_RUN_STAMP.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    FULL_RUN_STAMP.write_text(json.dumps({"at": now}))
+    log("full-run", "dispatched development.yml on development")
+
+
 def scheduled_tick(args):
     import fcntl
 
@@ -2934,6 +2962,7 @@ def scheduled_tick(args):
                             opts.repo_path = repo
                             step(phase, action, opts, db)
             step("state", advance)
+            step("full-run", full_run_tick)
 
         path = state / "tick.json"
         tmp = path.with_suffix(".tmp")

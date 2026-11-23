@@ -1911,7 +1911,6 @@ def close(args):
 NEAR_LIMIT = re.compile(r"^\s*⚠\s*(?:heads up, you have less than \d+% of your \S+ limit left"
                         r"|\S+ limit: only \d+% left\b)", re.I)
 # Codex's status line under its input box: "GPT-6.1-Sol xhigh · ~/repo".
-CODEX_STATUS = re.compile(r"\s*([\w.-]+)(?: (\w+))? · (?=[~/])")
 QUIET_MINUTES = 20
 HANDOFF = ("Your account is at its usage handoff point ({why}). Finish the current step, run /handoff, then send "
            "worker_done --outcome failed with the handoff path. A fresh worker on another account continues from it.")
@@ -1920,7 +1919,7 @@ NUDGE = ("Your screen has not changed for {minutes} minutes. If you are blocked,
 
 
 def screen_limit(tail, launch):
-    """Why this screen means the worker cannot hand off: a limit line, the model-switch menu, or a switched model."""
+    """Why this screen means the worker cannot hand off: a limit line or the model-switch menu."""
     hit = limited(tail)
     if hit:
         return hit
@@ -1931,10 +1930,7 @@ def screen_limit(tail, launch):
         # A menu counts only while it is showing: newer output or the input prompt below it makes it history.
         if not any(line.lstrip().startswith(OUTPUT) or re.match(r"^\s*[›❯>](?!\s*\d+[.)] )", line) for line in below):
             return lines[0].strip()
-    if launch.get("agent") == "codex":
-        status = next((m for line in reversed(tail[-6:]) if (m := CODEX_STATUS.match(line))), None)
-        if status and status[1].lower() != (launch.get("model") or "").lower():
-            return f"model switched to {status[1]} {status[2] or ''}".strip()
+    # The Codex status line's model is not a limit: it differs from the launch model on healthy workers.
     return None
 
 

@@ -1513,7 +1513,8 @@ CLAUDE_WORKING = ["⏺ Reading tick.py", "✶ Prestidigitating… (5m 45s · ↓
                   "  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt"]
 assert tick.screen_limit(CODEX_AT_LIMIT, {"agent": "codex", "model": "gpt-6.2-astra"}).startswith("■ You've hit")
 assert tick.screen_limit(CODEX_AT_LIMIT[3:], {"agent": "codex", "model": "gpt-6.2-astra"}) == "Approaching rate limits"
-assert tick.screen_limit(CODEX_SWITCHED, {"agent": "codex", "model": "gpt-6.2-astra"}) == "model switched to GPT-6-Luna medium"
+assert tick.screen_limit(CODEX_SWITCHED, {"agent": "codex", "model": "gpt-6.2-astra"}) is None
+assert tick.screen_limit(CODEX_SWITCHED, {"agent": "codex", "model": None}) is None
 assert tick.screen_limit(CODEX_NEAR_LIMIT, {"agent": "codex", "model": "gpt-6.2-astra"}) is None
 assert tick.screen_limit(CLAUDE_AT_LIMIT, {"agent": "claude", "model": "claude-opus-5-5"}).startswith("Usage limit reached")
 assert tick.screen_limit(CLAUDE_AT_LIMIT[:2], {"agent": "claude", "model": "claude-opus-5-5"}).startswith("⎿  You've hit")
@@ -1714,8 +1715,8 @@ with TemporaryDirectory() as tmp:
     # Review discovery still finds exactly one "#553 coder" Task, whose newest Dispatch is the retry.
     assert [t["id"] for t in f.orca("orchestration", "task-list")["tasks"] if t["task_title"] == "#553 coder"] == ["task_coder"]
 
-# At the limit, on a model-switch menu, or after Codex switched models: stop it, then retry on another account.
-for agent, model, screen in (("codex", "gpt-6.2-astra", CODEX_AT_LIMIT), ("codex", "gpt-6.2-astra", CODEX_SWITCHED),
+# At the limit or on a model-switch menu: stop it, then retry on another account.
+for agent, model, screen in (("codex", "gpt-6.2-astra", CODEX_AT_LIMIT),
                              ("claude", "claude-opus-5-5", CLAUDE_AT_LIMIT), ("claude", "claude-opus-5-5", CLAUDE_CURRENT)):
     with TemporaryDirectory() as tmp:
         f = Fleet(tmp, agent, model, screen)
@@ -1724,6 +1725,13 @@ for agent, model, screen in (("codex", "gpt-6.2-astra", CODEX_AT_LIMIT), ("codex
         assert ("account", "select", "--agent", agent, "--account", "x2") in f.events
         assert [c[0] for c in f.cards] == ["Handed off", "Coding"]
         assert not any(e[:2] == ("terminal", "send") for e in f.events)  # never types into the pane
+
+# Bug 4 (#517, #485): a Codex status line naming another model is a healthy worker, not a limit.
+for model in ("gpt-6.2-astra", None):
+    with TemporaryDirectory() as tmp:
+        f = Fleet(tmp, "codex", model, CODEX_SWITCHED)
+        calls = f.tick()
+        assert ("orchestration", "worker-stop") not in calls and not f.sent() and f.cards == [], (calls, f.lines)
 
 # No hold ever recorded: the exhausted account cannot be excluded, so nothing is stopped and the Run decides.
 with TemporaryDirectory() as tmp:

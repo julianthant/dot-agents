@@ -339,9 +339,13 @@ def now_rows(snap, state):
         warning = status in ("stopped", "worker state unavailable")
 
         run = state.get("task_runs", {}).get(branch) if repo == "hr-relay" else None
+        run = run if head and run and run["head_sha"] == head else None
+        ci_complete = run is not None and run["status"] == "completed"
+        ci_failed = ci_complete and run["conclusion"] != "success"
+        pr_failed = pr is not None and pr["checks"] == "failing"
         if pr:
             stage = 3
-            if pr["checks"] == "failing":
+            if pr_failed:
                 warning = True
                 status = "PR checks failing" if status in ("finished", "no worker") else status + " · PR checks failing"
             elif status in ("finished", "no worker"):
@@ -350,19 +354,26 @@ def now_rows(snap, state):
             stage = 3
             if status in ("finished", "no worker"):
                 status = "waiting for PR"
-        elif head and run and run["head_sha"] == head and run["status"] == "completed" and run["conclusion"] == "success":
+        elif ci_complete and not ci_failed:
             stage = 0 if phase == "Fixing" and reviewed == head else 2
             if stage == 2 and status in ("finished", "no worker"):
                 status = "waiting for review"
         elif head and not (phase == "Fixing" and reviewed == head and status == "working"):
             stage = 1
-            if run and run["head_sha"] == head and run["status"] == "completed":
+            if ci_failed:
                 warning = True
                 status = "CI failed" if status in ("finished", "no worker") else status + " · CI failed"
             elif status in ("finished", "no worker"):
-                status = "CI running" if run and run["head_sha"] == head else "waiting for CI"
+                status = "CI running" if run else "waiting for CI"
         else:
             stage = 0
+        if t["blockers"] and all(worker_status(worker) in ("stopped", "finished") for _, worker in candidates):
+            status = "parked on " + ", ".join(f"#{blocker}" for blocker in t["blockers"])
+            warning = ci_failed or pr_failed
+            if ci_failed:
+                status += " · CI failed"
+            if pr_failed:
+                status += " · PR checks failing"
         rows[n] = dict(stage=stage, status=status, who=who, warning=warning, pr={**pr, "repo": repo} if pr else None)
     return rows
 

@@ -569,6 +569,27 @@ with TemporaryDirectory() as temp, ExitStack() as stack:
         tick.fill_tick(args, None)
     start.assert_called_once()
 
+    # A sleeping WSL host at discovery or at prelaunch refresh only removes overflow.
+    raced = False
+    host = "Juzzark-WSL"
+    for failure in ("checkout", "inventory", "refresh"):
+        start.reset_mock()
+        scans = []
+        def scan(path, items, repo, emit, target, counts):
+            if target == host:
+                scans.append(target)
+                if failure == "inventory" or len(scans) == 2:
+                    raise TimeoutError("inventory unavailable")
+            return set()
+        with (patch.object(pick.account_usage, "load_config", return_value={"hosts": {host: {"target_tickets": 1}}}),
+              patch.object(pick.account_usage, "host_checkout", return_value="/remote/relay",
+                           side_effect=OSError("checkout unavailable") if failure == "checkout" else None),
+              patch.object(tick, "inventory", side_effect=scan), redirect_stdout(io.StringIO()) as output):
+            tick.fill_tick(args, None)
+        start.assert_called_once()
+        assert start.call_args.args[1] == root.resolve() and start.call_args.args[3] == account
+        assert host in output.getvalue() and "unavailable" in output.getvalue()
+
 
 # An unresolved attempt still holds its seat. A Bug can start alongside live work on overlapping paths.
 with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory:") as db:
@@ -581,7 +602,7 @@ with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory
     raced = False
     stack.enter_context(patch.object(tick, "tickets", side_effect=lambda fresh=False: [dict(t) for t in (stuck, overlap_ticket, ticket)]))
     stack.enter_context(patch.object(tick, "supervisor", return_value=([], "own")))
-    def live_inventory(path, issues, repo, emit):
+    def live_inventory(path, issues, repo, emit, host, counts):
         next(t for t in issues if t["number"] == 40)["live"] = True
         return set()
     stack.enter_context(patch.object(tick, "inventory", side_effect=live_inventory))
@@ -2698,3 +2719,63 @@ with TemporaryDirectory() as home:
     finally:
         holder.stdin.close()
         holder.wait(timeout=10)
+
+# A dry run spends the remaining local ticket first and spills the next one to
+# the remote host. At the remote target another ticket must remain queued.
+with TemporaryDirectory() as tmp, ExitStack() as stack:
+    root = Path(tmp)
+    args = SimpleNamespace(repo_path=root, dry_run=True, issue=None, holds=root / "holds.json")
+    work = [dict(base, base="origin/main", number=n, branch=f"task/test/{n}", paths=[str(n)]) for n in range(1, 4)]
+    stack.enter_context(patch.object(tick, "tickets", return_value=work))
+    stack.enter_context(patch.object(tick, "command", side_effect=["git@github.com:julianthant/hr-relay.git", "",
+                                                                   "abc refs/heads/main"]))
+    stack.enter_context(patch.object(pick.account_usage, "load_config", return_value={
+        "local_target_tickets": 1, "hosts": {"Juzzark-WSL": {"target_tickets": 1}}}))
+    stack.enter_context(patch.object(pick.account_usage, "host_checkout", return_value="/remote/relay"))
+    stack.enter_context(patch.object(tick, "inventory", return_value=set()))
+    stack.enter_context(patch.object(pick, "pick", side_effect=lambda cfg, a, m, e, host, now, holds:
+                                    (dict(account, host=host), [])))
+    with redirect_stdout(io.StringIO()) as result:
+        tick.fill_tick(args, None)
+    starts = [line for line in result.getvalue().splitlines() if "would start" in line]
+    assert len(starts) == 2 and '"host": "local"' in starts[0] and '"host": "Juzzark-WSL"' in starts[1]
+
+# A coordinator-side mirror has no terminal. Confirm the Dispatch and hold the
+# physical terminal in the execution-host checkout, including on receipt recovery.
+with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory:") as db:
+    root = Path(tmp)
+    host = "Juzzark-WSL"
+    work = dict(base, number=99, sha="abc", base="origin/main")
+    wt = {"id": "wsl-tree", "branch": work["branch"], "head": "abc", "path": "/remote/worktree"}
+    dispatch = {"id": "ctx", "taskId": "task", "runId": "run"}
+    def home_rpc(*args):
+        if args[:2] == ("orchestration", "worker-start"):
+            assert args[args.index("--on") + 1] == host
+            assert args[args.index("--worktree") + 1] == "path:/remote/worktree"
+            raise tick.OrcaError("start response lost")
+        return {"task-create": {"task": {"id": "task"}}, "dispatch-show": {"dispatch": dispatch},
+                "worker-show": {"dispatch": dispatch, "worker": {"worktreeId": None}}}[args[1]]
+
+    def remote_rpc(target, *args):
+        assert target == host
+        if args[:2] == ("worktree", "create"):
+            assert args[args.index("--repo") + 1] == "path:/remote/relay"
+            return {"worktree": wt}
+        if args[:2] == ("orchestration", "worker-show"):
+            return {"dispatch": dict(dispatch, assigneeHandle="wsl-term"), "worker": {"state": "ready", "worktreeId": wt["id"]},
+                    "terminal": {"handle": "wsl-term"}}
+        assert args[:2] == ("terminal", "read") and "wsl-term" in args
+        return {"terminal": {"tail": ["ready"]}}
+
+    stack.enter_context(patch.object(tick, "runtime", side_effect=home_rpc))
+    stack.enter_context(patch.object(tick, "supervisor", return_value=([], "run")))
+    stack.enter_context(patch.object(tick, "project_fields", return_value=("p", [], ("field", "waiting"))))
+    stack.enter_context(patch.object(pick.account_usage, "remote_output", side_effect=["", work["branch"], "abc"]))
+    stack.enter_context(patch.object(pick.account_usage, "host_orca", side_effect=remote_rpc))
+    select = stack.enter_context(patch.object(pick.account_usage, "remote_account",
+                                             side_effect=[{}, {"codex": {"activeAccountId": "seat"}}]))
+    stack.enter_context(patch.object(tick, "remote_tree_settings"))
+    tick.launch(db, Path("/remote/relay"), work, dict(account, host=host), args, root / "holds.json")
+    assert select.call_args_list[0].args == (host, "select", "--agent", "codex", "--account", "seat")
+    assert json.loads((root / "holds.json").read_text())["wsl-term"]["host"] == host
+    assert db.execute("SELECT receipt FROM starts WHERE issue=99").fetchone() == ("done",)

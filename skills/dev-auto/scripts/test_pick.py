@@ -1,8 +1,12 @@
 import io
 import json
+import shlex
+import subprocess
+import sys
 from contextlib import redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import TestCase
 from unittest.mock import patch
 
 import pick
@@ -184,3 +188,51 @@ with patch.object(pick.account_usage, "orca_usage", return_value=orca), \
         patch.object(pick.account_usage, "orca_key", return_value=("codex", "seat")), \
         patch.object(pick.account_usage, "file_usage", return_value=weekly_only):
     assert pick.windows({}, dict(row, agent="claude"), now) == (10.0, 40.0)
+
+# The same Orca id may exist on two hosts. Remote usage, including inactive
+# accounts, must never pick up the local reading or a local CLI file.
+remote = {"agent": "codex", "host": "Juzzark-WSL", "id": "seat", "home": "", "plan": "plus"}
+remote_result = {"codex": {"activeAccountId": "other"}, "rateLimits": {"inactiveCodexAccounts": [
+    {"accountId": "seat", "rateLimits": {"updatedAt": 2000, "session": {"usedPercent": 36}}}]}}
+with patch.object(pick.account_usage, "remote_account", return_value=remote_result) as read:
+    pick.account_usage.ORCA_USAGE.clear()
+    assert pick.windows({}, remote, 3) == (36, 0)
+    assert pick.windows({}, remote, 3) == (36, 0)
+    read.assert_called_once_with("Juzzark-WSL", "list")
+
+# When inventory works but the WSL usage read fails, reject that seat with the usual reason.
+with patch.object(pick.account_usage, "remote_account", side_effect=TimeoutError("offline")) as read:
+    row = dict(remote, enabled=True, label="WSL seat")
+    seat, reasons = pick.pick({"account": [row]}, "codex", "gpt-6.2-sol", "medium", row["host"], 4, holds=[])
+    assert seat is None and reasons == ["WSL seat: usage never read; run it once by hand to read it"]
+    read.assert_called_once()
+
+# Run the actual receipt writer in a fake terminal, then read its tail through the host boundary.
+for case in ("success", "digest mismatch", "nonzero exit"):
+    output = bytes(range(32, 127)).decode()
+    argv = [sys.executable, "-c", "import sys; sys.stdout.write(sys.argv[1]); sys.exit(int(sys.argv[2]))",
+            output, "7" if case == "nonzero exit" else "0"]
+    tail = []
+    def terminal(host, group, verb, *args):
+        assert host == "Juzzark-WSL" and group == "terminal"
+        if verb == "create":
+            command = args[args.index("--command") + 1]
+            lines = subprocess.check_output(shlex.split(command), text=True).splitlines()
+            if case == "digest mismatch":
+                lines[-1] = lines[-1].rsplit(" ", 1)[0] + " " + "0" * 64
+            tail.extend([command, "stale-tag END 7 stale-digest", *lines])
+            return {"terminal": {"handle": "fixture"}}
+        assert args[:2] == ("--terminal", "fixture")
+        if verb == "read":
+            return {"terminal": {"tail": tail}}
+        assert verb == "close"
+        return {}
+
+    with patch.object(pick.account_usage, "host_orca", side_effect=terminal) as rpc:
+        if case == "success":
+            assert pick.account_usage.remote_output("Juzzark-WSL", "/checkout", argv) == output
+        else:
+            error, message = (ValueError, "incomplete command output") if case == "digest mismatch" else (OSError, "exited 7")
+            with TestCase().assertRaisesRegex(error, message):
+                pick.account_usage.remote_output("Juzzark-WSL", "/checkout", argv)
+        assert [call.args[2] for call in rpc.call_args_list] == ["create", "read", "close"]

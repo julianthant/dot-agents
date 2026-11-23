@@ -79,10 +79,19 @@ def poll(url, etag):
     return int(status[1]) if status else 0, tag[1].strip() if tag else etag, body
 
 
+ANCHOR_SECONDS = 600  # the issue poll's since= moves this rarely, so its ETag stays valid in between
+
+
 def changes(state):
-    """The polled endpoints that changed since the last run; issues count only updates after since=."""
+    """The polled endpoints that changed since the last run.
+
+    Issues compare (number, updated_at) after since=, so two updates in the same second still differ, and a
+    moved since= overlaps the old window by a minute, so its first unconditional reply compares cleanly too."""
     tags = state.setdefault("etags", {})
-    since = state.setdefault("since", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    if "since" not in state or not 0 <= time.time() - state.get("anchored", 0) < ANCHOR_SECONDS:
+        state["since"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 60))
+        state["anchored"], tags["issues"] = time.time(), None
+    since = state["since"]
     changed = set()
     for name, url in POLLS.items():
         try:
@@ -90,10 +99,11 @@ def changes(state):
             if status != 200:
                 continue
             if name == "issues":
-                newer = [i["updated_at"] for i in json.loads(body) if i["updated_at"] > since]
-                if not newer:
+                seen = sorted([i["number"], i["updated_at"]] for i in json.loads(body) if i["updated_at"] > since)
+                before = [s for s in state["seen"] if s[1] > since] if "seen" in state else None
+                state["seen"] = seen
+                if seen == before:
                     continue
-                state["since"], tags[name] = max(newer), None  # the next poll asks from here, so its ETag is new
             changed.add(name)
         except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
             pass  # an unreadable poll counts as unchanged; the once-a-minute refresh still runs
@@ -106,8 +116,11 @@ def render():
         state = json.loads(STATE.read_text())
     except (OSError, ValueError):
         state = {}
-    changed, now = changes(state), time.time()
-    snap = last_snapshot(fresh="issues" in changed)  # unchanged, it still refetches once a minute
+    changed, now = changes(state) | set(state.get("pending", [])), time.time()
+    try:
+        snap, state["pending"] = tick.snapshot("issues" in changed), []  # unchanged, it still refetches once a minute
+    except REFUSED:
+        snap, state["pending"] = json.loads(tick.SNAPSHOT.read_text()), sorted(changed & {"issues"})
     if changed or "pipeline" not in state or not 0 <= now - state.get("built", 0) < tick.SNAPSHOT_SECONDS:
         state.update(pipeline(), built=now)
     STATE.parent.mkdir(parents=True, exist_ok=True)

@@ -66,9 +66,23 @@ class Roadmap(unittest.TestCase):
         reply = self.replies.get(name) or R304.format(tag=name)
         return subprocess.CompletedProcess(argv, 1 if reply.startswith("HTTP/2.0 304") else 0, reply, "")
 
-    def warm(self, built=None):
+    def warm(self, built=None, anchored=None, seen=()):
         roadmap.STATE.write_text(json.dumps({"etags": {k: f'"{k}"' for k in roadmap.POLLS}, "since": SINCE,
+                                             "anchored": anchored or time.time(), "seen": list(seen),
                                              "built": built or time.time(), **GITHUB}))
+
+    def issues(self, *pairs, tag="i"):
+        self.replies["issues"] = R200.format(tag=tag, body=json.dumps([{"number": n, "updated_at": u} for n, u in pairs]))
+
+    def fetches(self, fail=False):
+        """Patch the snapshot read to record each fresh flag, failing as a refused refetch when asked."""
+        calls = []
+        def snapshot(fresh=False):
+            calls.append(fresh)
+            if fail and fresh:
+                raise tick.OrcaError("gh api failed: rate limit")
+            return json.loads(tick.SNAPSHOT.read_text())
+        return calls, patch.object(tick, "snapshot", side_effect=snapshot)
 
     def edit(self, field, *value, item="item1"):
         with patch.object(tick.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "{}", "")):
@@ -83,6 +97,16 @@ class Roadmap(unittest.TestCase):
         self.assertEqual((rows[1]["agent"], rows[1]["who"], rows[2]["agent"]), ("Coding", "coder m e @a", None))
         self.assertEqual(self.reads, [])
         self.assertGreater(json.loads(tick.SNAPSHOT.read_text())["fetched"], 0)  # still fresh: no refetch owed
+
+    def test_a_close_time_edit_reaches_the_cached_closed_card(self):
+        snap = json.loads(tick.SNAPSHOT.read_text())
+        done = dict(issue(3, "Reviewing"), state="CLOSED", stateReason="COMPLETED")
+        tick.SNAPSHOT.write_text(json.dumps({**snap, "closed": [done]}))
+        self.warm()
+        self.edit("f_stage", "--clear", item="item3")
+        rows = {r["n"]: r for r in roadmap.render()["issues"]}
+        self.assertEqual((rows[3]["agent"], self.reads), (None, []))
+        self.assertGreater(json.loads(tick.SNAPSHOT.read_text())["fetched"], 0)
 
     def test_an_edit_the_snapshot_cannot_place_marks_it_stale(self):
         self.edit("f_stage", "--single-select-option-id", "o_coding", item="elsewhere")
@@ -102,20 +126,48 @@ class Roadmap(unittest.TestCase):
         self.assertIn(f"since={SINCE}", self.sent[0][-1])
         self.assertEqual(self.reads, [])
 
-    def test_a_newer_issue_refetches_the_snapshot_and_moves_since(self):
+    def test_a_second_update_in_the_same_second_is_a_change_and_a_repeat_is_not(self):
+        t = "2026-11-23T13:05:00Z"
+        self.warm(seen=[[1, t]])
+        calls, snapshot = self.fetches()
+        with snapshot, patch.object(roadmap, "pipeline", return_value=GITHUB):
+            self.issues((1, t), (2, t), tag="i2")
+            roadmap.render()
+            self.issues((2, t), (1, t), tag="i2")  # the same updates again: no change
+            roadmap.render()
+        self.assertEqual(calls, [True, False])
+        state = json.loads(roadmap.STATE.read_text())
+        self.assertEqual((state["since"], state["etags"]["issues"]), (SINCE, 'W/"i2"'))  # the query stays stable
+
+    def test_a_moved_since_overlaps_the_old_window_and_keeps_its_new_etag(self):
+        t = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 10))
+        self.warm(anchored=time.time() - roadmap.ANCHOR_SECONDS - 1, seen=[[1, SINCE + "x"], [2, t]])
+        calls, snapshot = self.fetches()
+        with snapshot:
+            self.issues((2, t), tag="moved")
+            roadmap.render()
+            self.replies.clear()
+            roadmap.render()
+        self.assertEqual(calls, [False, False])  # the overlap repeats a known update: nothing changed
+        self.assertNotIn("-H", self.sent[0])  # only the first poll of the new window is unconditional
+        self.assertNotIn(f"since={SINCE}", self.sent[0][-1])
+        self.assertIn('If-None-Match: W/"moved"', self.sent[3])
+        self.assertEqual(self.reads, [])
+
+    def test_a_refused_refresh_stays_pending_until_it_succeeds(self):
         self.warm()
-        refetched = []
-        with patch.object(tick, "snapshot", side_effect=lambda fresh=False: refetched.append(fresh) or
-                          json.loads(tick.SNAPSHOT.read_text())), patch.object(roadmap, "pipeline", return_value=GITHUB):
-            self.replies["issues"] = R200.format(tag="i2", body=json.dumps([{"updated_at": "2026-11-23T13:05:00Z"}]))
+        calls, snapshot = self.fetches(fail=True)
+        with snapshot, patch.object(roadmap, "pipeline", return_value=GITHUB):
+            self.issues((1, "2026-11-23T13:05:00Z"))
+            rows = roadmap.render()["issues"]
+            self.replies.clear()
+            roadmap.render()  # every poll 304: the failed refresh is still owed
+        self.assertEqual((calls, len(rows)), ([True, True], 2))
+        calls, snapshot = self.fetches()
+        with snapshot, patch.object(roadmap, "pipeline", return_value=GITHUB):
             roadmap.render()
-            state = json.loads(roadmap.STATE.read_text())
-            self.assertEqual((refetched, state["since"], state["etags"]["issues"]), ([True], "2026-11-23T13:05:00Z", None))
-            # The moved since= returns that same issue again: no change, and its ETag is kept for the next 304.
-            self.replies["issues"] = R200.format(tag="i3", body=json.dumps([{"updated_at": "2026-11-23T13:05:00Z"}]))
             roadmap.render()
-            self.assertEqual(refetched, [True, False])
-            self.assertEqual(json.loads(roadmap.STATE.read_text())["etags"]["issues"], 'W/"i3"')
+        self.assertEqual(calls, [True, False])
 
     def test_pr_or_run_changes_and_the_minute_rebuild_the_pipeline_only(self):
         built = []

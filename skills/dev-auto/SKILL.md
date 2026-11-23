@@ -88,7 +88,8 @@ tick checks that same Dispatch before recording Coding.
 Every tick verb reads open issues from one snapshot,
 `~/.local/state/dev-auto/issues.json`, refetched at most once a minute. A
 Project write the tick makes is copied straight into the snapshot (a failed
-write, or one on a card or field the snapshot cannot place, marks it stale),
+write, or one on a card, open or closed, or field the snapshot cannot place,
+marks it stale),
 and fill's check right before a start always refetches. Closed issues (the
 newest 400) are read in full every ten minutes and only the recently updated
 ones in between.
@@ -96,8 +97,11 @@ ones in between.
 `scripts/roadmap.py > data.json` renders the roadmap from the same snapshot;
 launchd runs it every 15 seconds (`StartInterval` 15). Each run polls issues
 (`since=`), PRs and workflow runs with `If-None-Match` and keeps the ETags in
-`roadmap.json` beside the snapshot; a 304 costs no quota. A newer issue
-refetches the snapshot, any change rebuilds the release pipeline, and both
+`roadmap.json` beside the snapshot; a 304 costs no quota. The issue poll's
+`since=` moves every ten minutes with a minute of overlap, and a change is a
+different set of (number, `updated_at`) after it. A changed issue refetches
+the snapshot (a refused refetch stays owed to the next run), any change
+rebuilds the release pipeline, and both
 otherwise refresh once a minute, which also catches Project edits made outside
 the tick (they do not change an issue's `updated_at`). The Project's id and its field and
 option ids are cached in `project.json` beside it (`gh project field-list`

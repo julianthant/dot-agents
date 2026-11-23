@@ -142,9 +142,13 @@ def build(snap, github=None):
             area_order = areas(tick.project_meta(refresh=True))  # an Area option added since the ids were cached
     except REFUSED:
         pass  # GitHub refused the lookup (quota 0): the cache stays, and this render keeps what it read
+    try:
+        last_tick = json.loads(tick.SNAPSHOT.with_name("tick.json").read_text())
+    except (OSError, ValueError):
+        last_tick = None
     github = github or pipeline()
     return {"generated": datetime.datetime.now(datetime.timezone.utc).isoformat(), "areas": area_order,
-            "milestones": github["milestones"], "issues": rows, "pipeline": github["pipeline"]}
+            "milestones": github["milestones"], "issues": rows, "pipeline": github["pipeline"], "tick": last_tick}
 
 
 def pipeline():

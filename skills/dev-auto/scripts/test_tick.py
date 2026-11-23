@@ -8,6 +8,9 @@ from unittest.mock import patch
 
 import tick
 
+_snapshot_dir = TemporaryDirectory()  # never read or write the live issue snapshot
+tick.SNAPSHOT = tick.Path(_snapshot_dir.name) / "issues.json"
+
 L = tick.limited
 assert L(["⏺ working", "⎿  You've hit your 5-hour limit · resets 5pm"]) == "⎿  You've hit your 5-hour limit · resets 5pm"
 assert L(["■ You’ve hit your usage limit. Try again in 3 days"]).startswith("■ You’ve hit")
@@ -540,7 +543,7 @@ with TemporaryDirectory() as temp, ExitStack() as stack:
         return "abc"
 
     stack.enter_context(patch.object(tick, "command", git))
-    stack.enter_context(patch.object(tick, "tickets", side_effect=lambda: [dict(ticket)]))
+    stack.enter_context(patch.object(tick, "tickets", side_effect=lambda fresh=False: [dict(ticket)]))
     stack.enter_context(patch.object(tick, "inventory", return_value=set()))
     stack.enter_context(patch.object(pick.account_usage, "load_config", return_value={}))
     stack.enter_context(patch.object(pick, "pick", return_value=(account, [])))
@@ -564,7 +567,7 @@ with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory
     args = SimpleNamespace(repo_path=root, dry_run=False, issue=None, holds=root / "holds.json")
     stack.enter_context(patch.object(tick, "command", git))
     raced = False
-    stack.enter_context(patch.object(tick, "tickets", side_effect=lambda: [dict(t) for t in (stuck, overlap_ticket, ticket)]))
+    stack.enter_context(patch.object(tick, "tickets", side_effect=lambda fresh=False: [dict(t) for t in (stuck, overlap_ticket, ticket)]))
     stack.enter_context(patch.object(tick, "supervisor", return_value=([], "own")))
     stack.enter_context(patch.object(tick, "inventory", return_value=set()))
     stack.enter_context(patch.object(pick.account_usage, "load_config", return_value={}))
@@ -592,7 +595,7 @@ with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory
             tick.reserve(db, 60, {"task": "t60", "run": "own", "coordinator": "coord"})
             raise tick.OrcaError("timed out")
     stack.enter_context(patch.object(tick, "command", git))
-    stack.enter_context(patch.object(tick, "tickets", side_effect=lambda: [dict(t) for t in (first, second, claude)]))
+    stack.enter_context(patch.object(tick, "tickets", side_effect=lambda fresh=False: [dict(t) for t in (first, second, claude)]))
     stack.enter_context(patch.object(tick, "inventory", return_value=set()))
     stack.enter_context(patch.object(pick.account_usage, "load_config", return_value={}))
     stack.enter_context(patch.object(pick, "pick", return_value=(account, [])))
@@ -738,10 +741,46 @@ def issue_row(number, title, body=""):
 rows = [issue_row(473, "dashboard-frontend-speed / clock-tick-in-leaves: render labels"),
         issue_row(497, "driver-reads / CRM SSO route recovery: recover sign-in"),
         issue_row(506, "tests-reliability / timing-guesses: condition waits", "Branch: task/tests/explicit")]
-with patch.object(tick, "command", return_value=json.dumps([{"data": {"repository": {"issues": {"nodes": rows}}}}])):
-    parsed = tick.tickets()
+def issue_page(nodes, more=False):
+    return json.dumps({"data": {"repository": {"issues": {"nodes": nodes,
+                                                          "pageInfo": {"hasNextPage": more, "endCursor": "c"}}}}})
+
+
+with patch.object(tick, "command", side_effect=lambda *a: issue_page(rows if "states=OPEN" in a else [])):
+    parsed = tick.tickets(fresh=True)
 check.assertEqual([row["branch"] for row in parsed], ["task/dashboard-frontend-speed/clock-tick-in-leaves",
                   "task/driver-reads/crm-sso-route-recovery", "task/tests/explicit"])
+
+# Bug 8: one issue read a minute across processes; closed issues are read incrementally between full reads.
+with TemporaryDirectory() as tmp:
+    calls, closed_rows = [], [dict(issue_row(n, f"c / {n}"), updatedAt=f"2026-11-23T10:0{n % 10}:00Z") for n in (1, 2)]
+
+    def gh(*a):
+        calls.append(("OPEN" if "states=OPEN" in a else "CLOSED", next((x for x in a if x.startswith("since=")), None)))
+        if "states=OPEN" in a:
+            return issue_page(rows[:2] if "endCursor=c" in a else rows[2:], more="endCursor=c" not in a)
+        return issue_page(closed_rows if not calls[-1][1] else [dict(closed_rows[0], title="edited"), dict(rows[0], updatedAt="2026-11-23T11:00:00Z")])
+
+    clock = [1_795_400_000]
+    with patch.object(tick, "SNAPSHOT", Path(tmp) / "issues.json"), patch.object(tick, "command", gh), \
+            patch.object(tick.time, "time", lambda: clock[0]):
+        check.assertEqual(len(tick.tickets()), 3)
+        check.assertEqual(calls, [("OPEN", None), ("OPEN", None), ("CLOSED", None)])  # two open pages, one full closed read
+        tick.tickets(), tick.snapshot()  # another verb, or the roadmap, within the minute
+        check.assertEqual(len(calls), 3)
+        clock[0] += 61
+        snap = tick.snapshot()
+        check.assertEqual(calls[3:], [("OPEN", None), ("OPEN", None), ("CLOSED", "since=2026-11-23T02:11:20Z")])
+        # An edited closed issue is replaced; one still open is never listed as closed.
+        check.assertEqual([(i["number"], i["title"]) for i in snap["closed"]], [(2, "c / 2"), (1, "edited")])
+        tick.stale_snapshot()  # a Project write: the next read refetches open issues and still reads closed ones since
+        tick.tickets()
+        check.assertEqual(calls[6:], [("OPEN", None), ("OPEN", None), ("CLOSED", "since=2026-11-23T02:12:21Z")])
+        tick.tickets(fresh=True)  # fill's refresh before side effects never uses a cached read
+        check.assertEqual(len(calls), 12)
+        clock[0] += 600
+        tick.snapshot()
+        check.assertEqual(calls[-1], ("CLOSED", None))  # ten minutes on: a full closed read again
 
 # Orca identifies agent terminals separately from plain shells and links recovery worktrees to issues.
 items = [dict(base, number=row["number"], branch=row["branch"], paths=[str(row["number"])]) for row in parsed]

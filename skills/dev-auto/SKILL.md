@@ -17,6 +17,8 @@ default host is `local` and the default effort is `medium`.
 1. **Pick an account** before starting a worker. The JSON output includes the
    account ID, label, plan, and selection command for the caller to run. When no
    account qualifies, the picker exits 1 and writes skip reasons to stderr.
+   It skips an account with under 10% of its 5-hour window or 5% of its week
+   left, so no start or restart lands on an account about to hand off.
 
    ```sh
    python3 scripts/pick.py pick --agent codex --model gpt-6.2-sol

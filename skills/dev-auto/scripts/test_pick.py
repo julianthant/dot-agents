@@ -75,6 +75,16 @@ with TemporaryDirectory() as temp:
         assert output.getvalue().splitlines()[-1] == "Fixture worker 5-hour 96%"
 
 
+# Bug 2: starts and restarts skip an account nearly out (under 10% of 5 hours or 5% of the week left).
+accounts = {"account": [dict(id=i, label=i, agent="codex", plan=p, host="local", enabled=True)
+                        for i, p in (("ais", "plus"), ("jzaw", "prolite"), ("free", "plus"))]}
+use = {"ais": (91, 10), "jzaw": (0, 97), "free": (20, 20)}
+with patch.object(pick, "windows", lambda cfg, row, now: use[row["id"]]):
+    chosen, why = pick.pick(accounts, "codex", "gpt-6.2-sol", "medium", "local", 0, holds=[])
+    assert chosen["id"] == "free" and why == ["ais: 5-hour 91%: under 10% left", "jzaw: weekly 97%: under 5% left"], why
+    use["jzaw"] = (99, 50)  # Pro Lite has no 5-hour window to run out of
+    assert pick.pick(accounts, "codex", "gpt-6.2-sol", "medium", "local", 0, holds=[])[0]["id"] == "jzaw"
+
 # Coordinator: keep the selected Codex account while under its handoff point, else switch.
 row = {"id": "a", "label": "a", "agent": "codex", "plan": "plus"}
 other = {"id": "b", "label": "b", "agent": "codex", "plan": "plus"}

@@ -569,6 +569,27 @@ with TemporaryDirectory() as temp, ExitStack() as stack:
         tick.fill_tick(args, None)
     start.assert_called_once()
 
+    # A sleeping WSL host at discovery or at prelaunch refresh only removes overflow.
+    raced = False
+    host = "Juzzark-WSL"
+    for failure in ("checkout", "inventory", "refresh"):
+        start.reset_mock()
+        scans = []
+        def scan(path, items, repo, emit, target, counts):
+            if target == host:
+                scans.append(target)
+                if failure == "inventory" or len(scans) == 2:
+                    raise TimeoutError("inventory unavailable")
+            return set()
+        with (patch.object(pick.account_usage, "load_config", return_value={"hosts": {host: {"target_tickets": 1}}}),
+              patch.object(pick.account_usage, "host_checkout", return_value="/remote/relay",
+                           side_effect=OSError("checkout unavailable") if failure == "checkout" else None),
+              patch.object(tick, "inventory", side_effect=scan), redirect_stdout(io.StringIO()) as output):
+            tick.fill_tick(args, None)
+        start.assert_called_once()
+        assert start.call_args.args[1] == root and start.call_args.args[3] == account
+        assert host in output.getvalue() and "unavailable" in output.getvalue()
+
 
 # An unresolved attempt still holds its seat. A Bug can start alongside live work on overlapping paths.
 with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory:") as db:

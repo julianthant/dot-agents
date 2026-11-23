@@ -195,3 +195,10 @@ with patch.object(pick.account_usage, "remote_account", return_value=remote_resu
     assert pick.windows({}, remote, 3) == (36, 0)
     assert pick.windows({}, remote, 3) == (36, 0)
     read.assert_called_once_with("Juzzark-WSL", "list")
+
+# When inventory works but the WSL usage read fails, reject that seat with the usual reason.
+with patch.object(pick.account_usage, "remote_account", side_effect=TimeoutError("offline")) as read:
+    row = dict(remote, enabled=True, label="WSL seat")
+    seat, reasons = pick.pick({"account": [row]}, "codex", "gpt-6.2-sol", "medium", row["host"], 4, holds=[])
+    assert seat is None and reasons == ["WSL seat: usage never read; run it once by hand to read it"]
+    read.assert_called_once()

@@ -102,6 +102,9 @@ ones in between.
 for each open Task and Bug it adds `ready` and `holdReason` from the same
 read-only plan used by fill. Readiness is computed per checkout for the next
 fill of `~/Projects/hr-relay` or `~/.agents`.
+The roadmap page in `skills/dev-auto/roadmap-app/` polls this JSON. From that
+folder on the Mac, run `pnpm install && pnpm run publish` to deploy the page
+to `~/.orca/bots/subaru-2/roadmap/`.
 Launchd runs it every 15 seconds (`StartInterval` 15). Each run polls issues
 (`since=`), PRs and workflow runs with `If-None-Match` and keeps the ETags in
 `roadmap.json` beside the snapshot; a 304 costs no quota. The issue poll's

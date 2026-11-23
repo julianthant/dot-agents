@@ -2293,13 +2293,13 @@ def watch_pass(args, db, actions, errors):
                 review = review_state(db, run, number) if number is not None else None
                 coder = review and review.get("coder") == note["to"]
                 reviewer = review and (review.get("reviewer") or {}).get("dispatch") == note["to"]
-                if coder or reviewer:
-                    # The follow-up may run in a fresh pane, so review takes its verified terminal with its Dispatch.
-                    show = runtime("orchestration", "worker-show", "--dispatch", new, "--full")
-                    if (show["dispatch"]["id"] != new or show["dispatch"]["runId"] != run
-                            or start_identity(show.get("worker") or {})[0] != new):
-                        raise OrcaError(f"unverified follow-up {new} of {note['to']}")
-                    terminal = start_identity(show["worker"])[1]
+                # The follow-up may run in a fresh pane: review, the hold and this row move with its verified terminal.
+                show = runtime("orchestration", "worker-show", "--dispatch", new, "--full")
+                verified = (show["dispatch"]["id"] == new and show["dispatch"]["runId"] == run
+                            and start_identity(show.get("worker") or {})[0] == new)
+                if (coder or reviewer) and not verified:
+                    raise OrcaError(f"unverified follow-up {new} of {note['to']}")
+                terminal = start_identity(show["worker"])[1] if verified else handle
                 if coder:
                     review.update(coder=new, expected=new, coder_terminal=terminal)
                 elif reviewer:
@@ -2308,6 +2308,14 @@ def watch_pass(args, db, actions, errors):
                 else:
                     review = None
                 actions.append({"issue": number, "followed up": note["to"], "as": new})
+            moved = None
+            if receipt.get("delivery") in ("follow_up", "reopened", "started_fresh") and terminal != handle:
+                moved = terminal
+                with pick.edit_holds(holds_path) as edit:
+                    if handle in edit:
+                        edit[moved] = edit.pop(handle)
+                if handle in holds:
+                    holds[moved] = holds.pop(handle)
             # One transaction: review stays gated on the note until it expects the Dispatch that received it.
             with db:
                 if review:
@@ -2317,7 +2325,12 @@ def watch_pass(args, db, actions, errors):
                     db.execute("CREATE TABLE IF NOT EXISTS followups (run TEXT, issue INTEGER, dispatch TEXT,"
                                " PRIMARY KEY(run,issue))")
                     db.execute("INSERT OR REPLACE INTO followups VALUES (?,?,?)", (run, number, new))
-                db.execute("INSERT OR REPLACE INTO watch VALUES (?,?,?)", (run, handle, json.dumps(row)))
+                if moved:
+                    db.execute("DELETE FROM watch WHERE run=? AND terminal=?", (run, handle))
+                db.execute("INSERT OR REPLACE INTO watch VALUES (?,?,?)", (run, moved or handle, json.dumps(row)))
+            if moved:
+                saved.pop(handle, None)
+                handle = moved
             saved[handle] = json.dumps(row)
             actions.append({"note": receipt.get("delivery"), "to": note["to"]})
         if row.get("card"):

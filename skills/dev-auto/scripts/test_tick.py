@@ -1668,6 +1668,8 @@ class Fleet:
         self.superseded = False
         self.task_status = "dispatched"
         self.follow_row = False
+        # The follow-up's own worker in its fresh pane, listed once it exists.
+        self.follow_status, self.follow_liveness = "succeeded", "exited"
         self.effort = "medium" if model else None  # a follow-up Dispatch records no model or effort
         self.follow_of = None  # the Dispatch this one follows up
         self.started_retry = None  # whether the restart passed --retry-of
@@ -1715,7 +1717,12 @@ class Fleet:
             # A settled follow-up Task's newer Dispatch on the same pane.
             follow = [dict(row, dispatchId="ctx_follow", taskId="task_follow", dispatchStatus="succeeded",
                            workerState="succeeded", resource={"ownerDispatchId": "ctx_follow"})] if self.follow_row else []
-            return {"workers": [*follow, *before, row, old, retried, *replaced], "page": {"hasMore": False, "nextCursor": None}}
+            fresh = [dict(row, dispatchId="ctx_follow", taskId="task_follow", agentTerminalHandle=self.follow_terminal,
+                          dispatchStatus=self.follow_status, workerState="ready" if self.follow_status == "dispatched" else "succeeded",
+                          resource={"ownerDispatchId": "ctx_follow"},
+                          projection={"host": {"kind": "local"}, "liveness": {"verdict": self.follow_liveness}})
+                     ] if self.followups and self.follow_terminal and self.follow_terminal != self.terminal else []
+            return {"workers": [*fresh, *follow, *before, row, old, retried, *replaced], "page": {"hasMore": False, "nextCursor": None}}
         if verb == ("orchestration", "dispatch-show") and args[3] == "task_follow":
             current = "ctx_follow_retry" if self.follow_retried else "ctx_follow"
             return {"dispatch": {"id": current, "status": "dispatched", "taskId": None, "assigneeHandle": None}}
@@ -1724,7 +1731,9 @@ class Fleet:
                                  "retryOfDispatchId": "ctx_follow", "followUpOf": None},
                     **self.follow_worker("ctx_follow_retry")}
         if verb == ("orchestration", "worker-show") and args[3] == "ctx_follow":
-            return {"dispatch": {"id": "ctx_follow", "runId": "run", "taskId": "task_follow", "followUpOf": "ctx_restart"},
+            return {"dispatch": {"id": "ctx_follow", "runId": "run", "taskId": "task_follow", "followUpOf": "ctx_restart",
+                                 "status": self.follow_status, "assigneeHandle": self.follow_terminal, "lastFailure": None},
+                    "projection": {"liveness": {"verdict": self.follow_liveness}},
                     **self.follow_worker("ctx_follow")}
         if verb == ("orchestration", "dispatch-show"):
             # Recorded shape: only the newest Dispatch's id and status.
@@ -1746,6 +1755,9 @@ class Fleet:
                     "terminal": {"handle": self.terminal, "agentWait": self.wait}, "observation": {"agentWait": self.wait}}
         if verb == ("terminal", "read"):
             return {"terminal": {"handle": self.terminal, "tail": self.screen, "source": "screen"}}
+        if verb == ("orchestration", "worker-stop") and args[3] == "ctx_follow":
+            self.follow_status = "failed"
+            return {"dispatchId": "ctx_follow", "processAction": "closed_agent_terminal"}
         if verb == ("orchestration", "worker-stop"):
             self.state, self.status, self.failure = "stopped", "failed", "stopped"
             if self.stop_lost:
@@ -1762,6 +1774,11 @@ class Fleet:
         if verb == ("orchestration", "worker-start"):
             if self.start_error:
                 raise self.start_error
+            if args[args.index("--task") + 1] == "task_follow":
+                # The follow-up Task retries in its own pane's worktree.
+                assert args[args.index("--retry-of") + 1] == "ctx_follow" and self.follow_status == "failed", args
+                self.follow_status, self.followups = "retried", []
+                return full_start("ctx_follow2", "term_follow2")
             # The same Task retries: no second same-titled Task for review discovery to refuse.
             assert args[args.index("--task") + 1] == "task_coder"
             # Orca refuses --retry-of for a ready Task (task_not_startable).
@@ -1800,8 +1817,10 @@ class Fleet:
 
     def follow_worker(self, dispatch):
         """Orca's worker record for a follow-up, omitted while it has none."""
-        return {"worker": {"dispatchId": dispatch, "effects": [
-            {"kind": "terminal", "role": "agent", "action": "created", "id": self.follow_terminal}]}} if self.follow_terminal else {}
+        return {"worker": {"dispatchId": dispatch, "state": "ready", "worktreeId": "repo::/wt",
+                           "startOptions": {"launch": {"effective": {"agent": self.agent, "model": None, "effort": None}}},
+                           "effects": [{"kind": "terminal", "role": "agent", "action": "created", "id": self.follow_terminal}]}
+                } if self.follow_terminal else {}
 
     def tick(self, minutes=0):
         self.now += minutes * 60
@@ -1963,6 +1982,30 @@ with TemporaryDirectory() as tmp:
     assert review["coder_terminal"] == "term_follow"
     f.tick(1)
     assert not f.db.execute("SELECT * FROM watch").fetchall() and len(f.notes) == 1
+
+# #588 item C: a follow-up in a fresh pane takes the account hold and the watch row with it, so its own usage limit
+# restarts it on another account instead of escalating "limit account unknown".
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    f.ticket["route"] = ("codex", "gpt-6.2-astra", "medium", None)
+    tick.review_state(f.db, "run", 553)
+    tick.save_review(f.db, "run", 553, {"coder": "ctx_coder", "expected": "ctx_coder", "coder_terminal": "term_coder"})
+    f.note_error = tick.OrcaError("mailbox busy")
+    with check.assertRaises(tick.OrcaError):
+        f.tick()
+    f.status, f.state, f.liveness, f.note_error = "completed", "succeeded", "exited", None
+    f.follow_status, f.follow_liveness = "dispatched", "live"
+    f.tick(1)
+    holds = json.loads(f.holds.read_text())
+    assert "term_restart" not in holds and holds["term_follow"]["account"] == "x2", holds
+    rows = dict(f.db.execute("SELECT terminal,state FROM watch"))
+    assert list(rows) == ["term_follow"] and json.loads(rows["term_follow"])["account"] == "x2", rows
+    f.screen = CODEX_AT_LIMIT  # the follow-up hits its own limit
+    f.tick(1)
+    start = next(e for e in f.events if e[:2] == ("orchestration", "worker-start"))
+    assert start[start.index("--task") + 1] == "task_follow" and ("account", "select", "--agent", "codex", "--account", "jzaw") in f.events
+    assert not [s for s in f.sent() if "limit account unknown" in s[1]] and f.cards[-1][0] != "Needs you", (f.sent(), f.cards)
+    assert json.loads(f.holds.read_text())["term_follow2"]["account"] == "jzaw"
 
 # A reviewer's settled replacement gets its note as a follow-up in a fresh pane. Review takes the pane with the
 # Dispatch, so a handoff there is not read as a review failure.

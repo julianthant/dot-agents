@@ -897,6 +897,24 @@ with TemporaryDirectory() as tmp:
             tick.command("gh", "project", "item-edit", "--id", "card")
     check.assertFalse(cache.exists())
 
+# The roadmap survives a 0-remaining GraphQL quota: a cold Project lookup renders without Areas, a warm cache keeps
+# its order and stays on disk, and a refused issue refetch renders the last good snapshot.
+with TemporaryDirectory() as tmp:
+    cache, snap = Path(tmp) / "project.json", Path(tmp) / "issues.json"
+    def refused(*a):
+        if a[:2] == ("gh", "project"):
+            raise tick.OrcaError("gh project failed: API rate limit already exceeded")
+        return json.dumps(rm_answer(list(a[1:])))
+    with patch.object(roadmap, "gh", lambda *a: rm_answer(list(a))), patch.object(tick, "PROJECT_CACHE", cache), \
+            patch.object(tick, "SNAPSHOT", snap), patch.object(tick, "command", refused):
+        check.assertEqual(roadmap.build({"open": RM_OPEN, "closed": RM_CLOSED})["areas"], [])
+        cache.write_text(json.dumps({"id": "proj", "fields": {"Area": {"options": [{"name": "Driver"}]}}}))
+        check.assertEqual(roadmap.build({"open": RM_OPEN, "closed": RM_CLOSED})["areas"], ["Driver"])
+        check.assertTrue(cache.exists())
+        snap.write_text(json.dumps({"open": RM_OPEN, "closed": RM_CLOSED}))
+        with patch.object(tick, "snapshot", side_effect=tick.OrcaError("gh api failed: rate limit")):
+            check.assertEqual(roadmap.last_snapshot()["open"], RM_OPEN)
+
 # Orca identifies agent terminals separately from plain shells and links recovery worktrees to issues.
 items = [dict(base, number=row["number"], branch=row["branch"], paths=[str(row["number"])]) for row in parsed]
 items.append(dict(base, number=484, branch="task/speed/read", paths=["disjoint"]))

@@ -48,13 +48,28 @@ def checks(roll):
     return "running" if any(x in ("IN_PROGRESS", "QUEUED", "PENDING", "") for x in st) else "green"
 
 
+REFUSED = (tick.OrcaError, OSError, ValueError, KeyError, subprocess.TimeoutExpired)
+
+
+def last_snapshot():
+    """The shared snapshot, or its last good copy when GitHub refuses the refetch."""
+    try:
+        return tick.snapshot()
+    except REFUSED:
+        return json.loads(tick.SNAPSHOT.read_text())
+
+
 def build(snap):
     issues = sorted(snap["open"], key=lambda n: n["updatedAt"], reverse=True) + snap["closed"]
     rows = [row(n) for n in issues]
     areas = lambda meta: [o["name"] for o in meta["fields"]["Area"]["options"]]
-    area_order = tick.with_project(areas)
-    if {r["area"] for r in rows} - {None, *area_order}:
-        area_order = areas(tick.project_meta(refresh=True))  # an Area option added since the ids were cached
+    area_order = []
+    try:
+        area_order = tick.with_project(areas)
+        if {r["area"] for r in rows} - {None, *area_order}:
+            area_order = areas(tick.project_meta(refresh=True))  # an Area option added since the ids were cached
+    except REFUSED:
+        pass  # GitHub refused the lookup (quota 0): the cache stays, and this render keeps what it read
     dev_prs = [dict(n=p["number"], t=p["title"], head=p["headRefName"], auto=p["autoMergeRequest"] is not None,
                     draft=p["isDraft"], checks=checks(p["statusCheckRollup"]),
                     issues=[i["number"] for i in p["closingIssuesReferences"]], updated=p["updatedAt"])
@@ -82,4 +97,4 @@ def build(snap):
 
 
 if __name__ == "__main__":
-    json.dump(build(tick.snapshot()), sys.stdout, separators=(",", ":"))
+    json.dump(build(last_snapshot()), sys.stdout, separators=(",", ":"))

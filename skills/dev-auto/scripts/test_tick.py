@@ -1,6 +1,7 @@
 import io
 import os
 import subprocess
+import sys
 from contextlib import redirect_stderr, redirect_stdout
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -1536,3 +1537,24 @@ with TemporaryDirectory() as tmp:
     assert json.loads(f.lines[0].split(None, 1)[1]) == [{"tick": "gh: project unavailable"}]
 
 print("ok")
+
+# A concurrent tick: while another process holds fill.lock, fill skips and release refuses, through the real CLI.
+with TemporaryDirectory() as home:
+    env = dict(os.environ, HOME=home)
+    lock = Path(home) / ".local/state/dev-auto/fill.lock"
+    lock.parent.mkdir(parents=True)
+    holder = subprocess.Popen([sys.executable, "-c", "import fcntl, sys\nf = open(sys.argv[1], 'a+')\n"
+                               "fcntl.flock(f, fcntl.LOCK_EX)\nprint('locked', flush=True)\nsys.stdin.read()", str(lock)],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "locked"
+        script = str(Path(tick.__file__).resolve())
+        skipped = subprocess.run([sys.executable, script, "fill", "--repo-path", home, "--issue", "1"],
+                                 env=env, capture_output=True, text=True, timeout=60)
+        assert skipped.returncode == 0 and "another tick is active" in skipped.stdout, skipped
+        refused = subprocess.run([sys.executable, script, "fill", "--release", "1"],
+                                 env=env, capture_output=True, text=True, timeout=60)
+        assert refused.returncode == 1 and "another tick is active" in refused.stderr, refused
+    finally:
+        holder.stdin.close()
+        holder.wait(timeout=10)

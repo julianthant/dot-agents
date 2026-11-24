@@ -155,6 +155,18 @@ class Roadmap(unittest.TestCase):
         self.assertEqual(self.reads, [])
         self.assertGreater(json.loads(tick.SNAPSHOT.read_text())["fetched"], 0)  # still fresh: no refetch owed
 
+    def test_local_render_with_stale_snapshot_and_cold_caches_stays_offline(self):
+        snap = json.loads(tick.SNAPSHOT.read_text())
+        tick.SNAPSHOT.write_text(json.dumps({**snap, "fetched": 0}))
+        tick.PROJECT_CACHE.unlink()
+        with (patch.object(roadmap, "readiness", READINESS),
+              patch.object(roadmap.subprocess, "run", side_effect=AssertionError("unexpected subprocess")),
+              patch.object(roadmap, "pull_requests", side_effect=AssertionError("unexpected PR query"))):
+            data = roadmap.render()
+        self.assertEqual({r["n"] for r in data["issues"]}, {1, 2})
+        self.assertIsNone(data["githubFetchedAt"])
+        self.assertEqual(self.reads, [])
+
     def test_each_render_reads_the_latest_tick_even_when_github_is_unchanged(self):
         self.warm()
         self.assertIsNone(roadmap.render()["tick"])

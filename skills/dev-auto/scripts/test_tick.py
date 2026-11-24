@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import subprocess
 import sys
@@ -252,6 +253,11 @@ assert tick.coder_route("Coder: codex / gpt-6.2-sol / high + opus advisor") is N
 assert tick.coder_route("Coder: grok / grok-4.7 / xhigh") == ("grok", "grok-4.7", "xhigh", None)
 assert tick.coder_route("Coder: cursor / grok-4.7-high / high") == ("cursor", "grok-4.7-high", "high", None)
 assert tick.coder_route("Coder: cursor / grok-4.7-high / xhigh") is None
+coding_body = "Coder: cursor / grok-4.7-high / high\nReviewer: claude / claude-sonnet-5-5 / medium"
+cursor_ticket = dict(base, number=25, body=coding_body, route=tick.coder_route(coding_body))
+assert next(tick.fill_plan([cursor_ticket], seat))[1] == account
+assert next(tick.fill_plan([dict(cursor_ticket, body=coding_body.replace("claude-sonnet", "claude-opus"))],
+                           seat))[2] == "Grok coding needs a Sonnet reviewer"
 check.assertEqual(tick.owned_paths(body), ["src/backend/logs/", "tests/backend/logs*.ts"])
 check.assertEqual(tick.owned_paths("Owned paths: selected service code and fixtures."), ["*"])
 
@@ -274,10 +280,15 @@ def full_start(dispatch, terminal):
                         {"kind": "terminal", "role": "agent", "action": "created", "id": terminal, "surface": "visible"},
                         {"kind": "dispatch_input", "role": "agent", "id": terminal, "state": "accepted"}]}
 
+receipt = dict(full_start("grok-dispatch", "grok-pane"), state="outcome_unknown", turnStart="unobserved",
+               stage="turn_start_unobserved")
+with patch.object(tick.subprocess, "run", return_value=subprocess.CompletedProcess(
+        [], 1, json.dumps({"ok": True, "result": receipt}), "")):
+    assert tick.runtime("orchestration", "worker-start", "--agent", "grok", "--full") == receipt
+
 
 # Exercise launch through the real advisor file, journal, hold and Project-edit boundary.
 from types import SimpleNamespace
-import json
 with TemporaryDirectory() as tmp, sqlite3.connect(":memory:") as db:
     root = Path(tmp)
     card = []

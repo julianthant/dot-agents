@@ -591,7 +591,7 @@ def tickets(fresh=False, *, rows=None):
         research = research_brief(body)
         branch_section = section(body, "Branch")
         m = re.search(r"\btask/([\w-]+)/([\w-]+)", branch_section)
-        branch = m[0] if m else None
+        branch = m[0] if m and not research else None
         if not branch and not research:
             slug = re.fullmatch(r"([\w-]+)\s*/\s*([\w-]+(?:[ \t]+[\w-]+)*)(?:\s*:.*)?", i["title"].strip())
             if slug:
@@ -665,6 +665,17 @@ def fill_plan(tickets, seat, issue=None, owed=lambda: ()):
         if reason:
             yield t, None, reason
             continue
+        if t["route"][0] in ("grok", "cursor"):
+            effort = "xhigh" if research else "high"
+            if t["route"][2] != effort:
+                yield t, None, f"needs {effort} for this Grok route"
+                continue
+            if not research:
+                try:
+                    review_route(t["body"])
+                except OrcaError as e:
+                    yield t, None, str(e)
+                    continue
         restores = owed() if t["route"][0] == "codex" else ()
         if restores:
             yield t, None, f"coordinator restore still owed by {sorted(restores)}"
@@ -1259,8 +1270,9 @@ def launch(db, repo_path, t, acct, args, holds_path):
             raise OrcaError("created worktree has a different base commit")
         if remote:
             settings_change = remote_tree_settings(host, repo_path, wt, route)
-        elif not research:
-            settings_change = worker_settings(path, route)
+        else:
+            if not research:
+                settings_change = worker_settings(path, route)
             prior = codex_active(route)
         # Owed before the selection: if this start fails and its restore too, the next fill restores it.
         reserve(db, number, {"not_applied": True, "coordinator": prior})
@@ -1433,7 +1445,6 @@ def grok_turn_observed(dispatch):
 
 
 def startup_needs_you(db, number, rec, actor, prompt):
-    post_overlap_note(db, number, rec)
     notice = {"issue": number, "task": rec["task"], "dispatch": rec["dispatch"], "prompt": prompt}
     if rec.get("notice") != notice:
         runtime("orchestration", "send", *actor, "--to", "run:" + rec["run"], "--type", "status",
@@ -1445,9 +1456,10 @@ def startup_needs_you(db, number, rec, actor, prompt):
         field, option = rec.get("waiting_field") or project_fields()[2]
         command("gh", "project", "item-edit", "--project-id", rec["project"], "--id", rec["item"],
                 "--field-id", field, "--single-select-option-id", option)
+        rec["waiting_card"] = True
         with db:
-            db.execute("UPDATE starts SET receipt=? WHERE issue=?",
-                       (json.dumps(dict(rec, waiting_card=True)), number))
+            db.execute("UPDATE starts SET receipt=? WHERE issue=?", (json.dumps(rec), number))
+    post_overlap_note(db, number, rec)
     log("waiting for operator input", notice)
 
 
@@ -1581,9 +1593,13 @@ def fill(args, *, issues=None, emit=log):
 def review_route(body):
     match = re.search(r"(?im)\bReviewer:[ \t]*([^\n·]+)", body)
     value = re.split(r"(?i)\bTier:", match[1])[0].strip(" .") if match else ""
+    coder = coder_route(body)
+    route = coder_route("Coder: " + value)
+    if coder and coder[0] in ("grok", "cursor") and not research_brief(body):
+        if not route or route[0] != "claude" or not route[1].startswith("claude-sonnet-"):
+            raise OrcaError("Grok coding needs a Sonnet reviewer")
     if re.match(r"(?i)^none\b", value) and re.search(r"(?i)\bTier:\s*UI,?\s+simple\b", body):
         return None
-    route = coder_route("Coder: " + value)
     if not route or route[0] not in ("claude", "codex"):
         raise OrcaError("issue needs a reviewer route or an explicit simple UI exemption")
     return route

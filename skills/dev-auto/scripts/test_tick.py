@@ -1651,6 +1651,73 @@ with patch.object(tick, "runtime", side_effect=ancestry), patch.object(tick, "gr
         tick.review_step(sqlite3.connect(":memory:"), "run", [], ticket, state, [new, old])
     assert sha in verify.call_args.args[1]
 
+# A Run's unrelated successes cannot delay Fixing or recovery of an uncertain reviewer start.
+with sqlite3.connect(":memory:") as db:
+    ticket, state = review_fixture()
+    ticket["stage"] = "Fixing"
+    state.update(stage="Fixing", host="local", coder_terminal="coder-pane")
+    pending = dict(report("pending-coder", sha, msg_id="pending"), sequence=0, created_at="2026-11-22T22:35:40Z")
+    other = dict(ticket, number=42)
+    tick.review_state(db, "run", 41)
+    tick.save_review(db, "run", 41, state)
+    tick.save_review(db, "run", 42, dict(state, pending="pending", sha=sha, path="/other",
+                                        coder="pending-coder", expected="pending-coder", coder_terminal="other-pane"))
+    chained = dict(report("retry", sha, msg_id="chained"), from_handle="fresh-pane", sequence=2)
+    messages = [pending, recorded, chained, *[
+        dict(report(f"history-{i}", "unrelated", msg_id=f"old-{i}"), from_handle=f"pane-{i}", sequence=i + 3,
+             payload={"dispatchId": f"history-{i}", "taskId": f"old-task-{i}", "outcome": "succeeded"})
+        for i in range(700)
+    ]]
+
+    def report_worker(dispatch, task, workspace, terminal, **ancestry):
+        row = {"dispatchId": dispatch, "taskId": task, "runId": "run", "agentTerminalHandle": terminal,
+               "terminalState": "released", "dispatchStatus": "completed",
+               "projection": {"workspace": {"id": workspace}}}
+        show = {"dispatch": {"id": dispatch, "runId": "run", "taskId": task, "status": "completed", **ancestry},
+                "projection": {"resource": {"releaseState": "released"}}}
+        return row, show
+
+    history = [
+        report_worker("coder", "task", "repo::/fixture", "coder-pane"),
+        report_worker("pending-coder", "pending-task", "repo::/other", "other-pane"),
+        report_worker("manual", "manual-task", "repo::/fixture", "manual-pane", followUpOf="coder"),
+        report_worker("retry", "manual-task", "repo::/fixture", "fresh-pane", retryOfDispatchId="manual"),
+        *(report_worker(f"history-{i}", f"old-task-{i}", f"repo::/old-{i}", f"pane-{i}") for i in range(700)),
+    ]
+    workers = [row for row, _ in history]
+    details = {row["dispatchId"]: show for row, show in history}
+    calls = []
+
+    def review_runtime(*args):
+        calls.append(args)
+        match args[1]:
+            case "inbox":
+                return {"messages": messages}
+            case "task-list":
+                return {"tasks": []}
+            case "worker-list":
+                return {"workers": workers, "page": {"hasMore": False}}
+            case "worker-show":
+                return details[args[3]]
+        raise AssertionError(args)
+
+    with patch.object(tick, "runtime", review_runtime), patch.object(tick, "supervisor", return_value=([], "run")), \
+            patch.object(tick, "tickets", return_value=[other, ticket]), patch.object(tick, "held_label", return_value="coder"), \
+            patch.object(tick, "green_report", return_value=sha) as verify, patch.object(tick, "log") as captured, \
+            patch.object(tick, "review_account", side_effect=tick.UncertainReview("simulated unavailable seat")):
+        for expected_reads in ({"retry", "manual"}, set()):
+            calls.clear()
+            verify.reset_mock()
+            tick.review_tick(SimpleNamespace(issue=None, coder=None), db)
+            verify.assert_called_once_with(ticket, chained["subject"] + "\n" + chained["body"])
+            assert [args[1] for args in calls].count("inbox") == 1
+            shows = [args[3] for args in calls if args[1] == "worker-show"]
+            assert len(shows) <= 30, f"700 unrelated successes produced {len(shows)} worker-show calls"
+            assert set(shows) == expected_reads, shows
+        assert any(args.args[1]["issue"] == 42 and "inspect uncertain Orca action" in args.args[1]["reason"]
+                   for args in captured.call_args_list)
+        assert tick.review_state(db, "run", 42)["pending"] == "pending"
+
 def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncertain=False, remote_race=False,
                   released_projection=False, release_race=False,
                   release_unknown=False, ticks=1, card_fails=False, send_lost=False, rewritten=False, pre_upgrade=None,

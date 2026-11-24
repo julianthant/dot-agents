@@ -1918,6 +1918,7 @@ class Fleet:
         self.superseded = False
         self.task_status = "dispatched"
         self.follow_row = False
+        self.replacement = None
         self.transferred = False  # the follow-up owns the current attempt's pane, which lists no older attempt
         # The follow-up's own worker in its fresh pane, listed once it exists.
         self.follow_status, self.follow_liveness = "succeeded", "exited"
@@ -1953,6 +1954,9 @@ class Fleet:
         if verb == ("orchestration", "task-list"):
             return {"tasks": [{"id": "task_coder", "run_id": "run", "task_title": self.title, "status": self.task_status,
                                "spec": "/goal Implement julianthant/hr-relay#553 and report a green SHA."},
+                              *([dict(id="task_replacement", run_id="run", task_title=self.replacement["title"],
+                                      spec=self.replacement["spec"])]
+                                if self.replacement else []),
                               *self.followups,
                               *([{"id": "task_orig", "run_id": "run", "task_title": self.orig_title}] if self.follow_of else []),
                               *([{"id": "task_root", "run_id": "run", "task_title": "#553 reviewer"}] if self.orig_parent else [])]}
@@ -1960,7 +1964,19 @@ class Fleet:
             row = dict(dispatchId=self.dispatch, taskId="task_coder", runId="run", workerState=self.state,
                        dispatchStatus=self.status, agentTerminalHandle=self.terminal,
                        resource={"ownerDispatchId": "ctx_follow" if self.transferred else self.dispatch},
-                       projection={"host": {"kind": "local"}, "liveness": {"verdict": self.liveness}})
+                       projection={"host": {"kind": "local"}, "workspace": {"id": "repo::/wt"},
+                                   "liveness": {"verdict": self.liveness}})
+            manual = []
+            if self.replacement:
+                manual = [dict(row, dispatchId="ctx_manual", taskId="task_replacement", agentTerminalHandle="term_manual",
+                               dispatchStatus=self.replacement["status"], workerState="ready",
+                               resource={"ownerDispatchId": "ctx_manual"},
+                               projection=dict(row["projection"], workspace={"id": self.replacement["worktree"]},
+                                               liveness={"verdict": self.replacement["liveness"]}))]
+                if self.replacement["remote"] and "--include-remote" in args:
+                    manual[0].update(server={"name": "peer"}, projection=None)
+                elif self.replacement["remote"]:
+                    manual = []
             # An older attempt on the same pane is history.
             old = dict(row, dispatchId="ctx_older", dispatchStatus="failed", resource={"ownerDispatchId": "ctx_older"})
             # A follow-up's predecessor can be listed while the pane belongs to the newer Dispatch.
@@ -1985,7 +2001,10 @@ class Fleet:
                 newest = dict(row, dispatchId="ctx_newest", dispatchStatus="succeeded", workerState="succeeded",
                               agentTerminalHandle=None, resource=None)
                 return {"workers": [newest, retried], "page": {"hasMore": False, "nextCursor": None}}
-            return {"workers": [*fresh, *follow, *before, row, *olds, retried, *replaced], "page": {"hasMore": False, "nextCursor": None}}
+            manual_is_newer = self.replacement and self.replacement["newer"]
+            peers = [*manual, row] if manual_is_newer else [row, *manual]
+            return {"workers": [*fresh, *follow, *before, *peers, *olds, retried, *replaced],
+                    "page": {"hasMore": False, "nextCursor": None}}
         if verb == ("worktree", "show"):
             assert args[2:] == ("--worktree", "id:repo::/wt"), args
             return {"worktree": {"id": "repo::/wt", "path": str(self.tmp), "branch": "task/test/work"}}
@@ -2009,6 +2028,12 @@ class Fleet:
         if verb == ("orchestration", "worker-show") and args[3] == "ctx_orig":
             return {"dispatch": {"id": "ctx_orig", "taskId": "task_orig", "followUpOf": self.orig_parent}, "worker": {"startOptions": {"launch": {
                 "effective": {"agent": "codex", "model": "gpt-6.2-sol", "effort": "xhigh"}}}}}
+        if verb == ("orchestration", "worker-show") and args[3] == "ctx_manual":
+            return {"dispatch": {"id": "ctx_manual", "runId": "run", "taskId": "task_replacement",
+                                 "status": self.replacement["status"]},
+                    "worker": {"state": "ready", "worktreeId": self.replacement["worktree"],
+                               "startOptions": {"launch": {"effective": {}}}},
+                    "projection": {"liveness": {"verdict": self.replacement["liveness"]}}}
         if verb == ("orchestration", "worker-show"):
             assert args[3] == self.dispatch, args
             retry = "ctx_coder" if self.dispatch == "ctx_restart" and self.started_retry is not False else None
@@ -2022,6 +2047,8 @@ class Fleet:
                     "projection": {"liveness": {"verdict": self.liveness}},
                     "terminal": {"handle": self.terminal, "agentWait": self.wait}, "observation": {"agentWait": self.wait}}
         if verb == ("terminal", "read"):
+            if args[3] == "term_manual":
+                return {"terminal": {"handle": "term_manual", "tail": CLAUDE_WORKING, "source": "screen"}}
             return {"terminal": {"handle": self.terminal, "tail": self.screen, "source": "screen"}}
         if verb == ("orchestration", "worker-stop") and args[3] == "ctx_follow":
             self.follow_status = "failed"
@@ -2082,6 +2109,14 @@ class Fleet:
                 return receipt
             return {"delivery": "queued"}
         raise AssertionError(args)
+
+    def add_replacement(self, title="#553 coder", *, worktree="repo::/wt", live=True, newer=True, spec="", remote=False):
+        self.replacement = dict(title=title, worktree=worktree, newer=newer, spec=spec, remote=remote,
+                                status="dispatched" if live else "completed", liveness="live" if live else "exited")
+
+    def checkpoint_failure(self):
+        self.status, self.state, self.liveness = "failed", "failed", "exited"
+        self.failure = json.dumps({"provenance": "worker_report", "outcome": "failed", "reportPath": "/wt/.handoff-553.md"})
 
     def follow_worker(self, dispatch):
         """Orca's worker record for a follow-up, omitted while it has none."""
@@ -2198,6 +2233,48 @@ for role, stage in (("coder", "Fixing"), ("reviewer", "Reviewing")):
         assert "/wt/.handoff-553.md" in f.notes[0] and f.cards[-1][0] == stage
         assert ("account", "select", "--agent", "codex", "--account", "jzaw") in f.events
         f.usage_handoff.assert_not_called()
+        assert ("orchestration", "worker-start") not in f.tick(1) and len(f.notes) == 1, f.lines
+
+# A hand-started replacement makes the old checkpoint history across branch heads and inventory changes.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.tick()
+    f.checkpoint_failure()
+    f.add_replacement()
+    assert ("orchestration", "worker-start") not in f.tick(1), f.lines
+    f.head = "b" * 40
+    assert ("orchestration", "worker-start") not in f.tick(1), f.lines
+    f.replacement = None
+    assert ("orchestration", "worker-start") not in f.tick(1), f.lines
+
+# An unsaved checkpoint predating the worktree's latest Dispatch is history on upgrade.
+# With watch history, a different role can share the worktree without blocking recovery.
+for watched in (False, True):
+    with TemporaryDirectory() as tmp:
+        f = Fleet(tmp, screen=CLAUDE_WORKING)
+        if watched:
+            f.tick()
+        f.checkpoint_failure()
+        f.add_replacement("#553 reviewer", live=watched)
+        assert (("orchestration", "worker-start") in f.tick(1)) == watched, f.lines
+        if not watched:
+            f.replacement = None
+            assert ("orchestration", "worker-start") not in f.tick(1), f.lines
+
+# An older live owner of the worktree blocks a usage-limit restart in the same role.
+# A newer settled Dispatch for this ticket and role blocks a crash retry even on another host.
+for at_limit in (False, True):
+    with TemporaryDirectory() as tmp:
+        f = Fleet(tmp, screen=CODEX_AT_LIMIT if at_limit else CLAUDE_WORKING)
+        if at_limit:
+            f.add_replacement("#554 coder", newer=False)
+        else:
+            f.liveness = "exited"
+            f.add_replacement("Continue checkpoint", worktree="repo::/elsewhere", live=False, remote=True,
+                              spec="/goal Implement julianthant/hr-relay#553 from the checkpoint.")
+        calls = f.tick()
+        assert ("orchestration", "worker-start") not in calls and ("orchestration", "worker-stop") not in calls, f.lines
+        assert "replaced by" in f.lines[0] and not f.cards, (f.lines, f.cards)
 
 # A second checkpoint at the same branch head needs the operator, once.
 for progressed in (False, True):
@@ -2266,6 +2343,31 @@ with TemporaryDirectory() as tmp:
     calls = f.tick(5)
     assert ("orchestration", "worker-stop") in calls and ("orchestration", "worker-start") in calls
     assert f.cards[-1][0] == "Coding"
+
+# A checkpoint queued for a seat is discarded when a replacement appears before the seat frees.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.checkpoint_failure()
+    f.seats = []
+    assert ("orchestration", "worker-start") not in f.tick() and "waiting for seat" in f.lines[0]
+    f.add_replacement()
+    f.seats = ["jzaw"]
+    calls = f.tick(5)
+    assert ("orchestration", "worker-start") not in calls and ("account", "select") not in calls, f.lines
+    f.replacement = None
+    assert ("orchestration", "worker-start") not in f.tick(5), f.lines
+
+# The review row leaves a restart parked while the operator manages the ticket.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    f.seats = ["jzaw"]
+    assert ("orchestration", "worker-start") not in f.tick() and "waiting for seat" in f.lines[0]
+    tick.review_state(f.db, "run", 553)
+    tick.save_review(f.db, "run", 553, {"stage": "Needs you"})
+    f.seats.append("x2")
+    assert ("orchestration", "worker-start") not in f.tick(5) and not f.sent(), f.lines
+    tick.save_review(f.db, "run", 553, {"stage": "Fixing"})
+    assert f.tick(5).count(("orchestration", "worker-start")) == 1, f.lines
 
 # A lost worker-start response is never replayed: the coordinator inspects it.
 with TemporaryDirectory() as tmp:

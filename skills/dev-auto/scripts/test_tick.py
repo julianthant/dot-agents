@@ -1652,6 +1652,7 @@ with patch.object(tick, "runtime", side_effect=ancestry), patch.object(tick, "gr
     assert sha in verify.call_args.args[1]
 
 def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncertain=False, remote_race=False,
+                  released_projection=False, release_race=False,
                   release_unknown=False, ticks=1, card_fails=False, send_lost=False, rewritten=False, pre_upgrade=None,
                   rollback=False, remote_worker=False):
     root = Path(tmp)
@@ -1671,11 +1672,13 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
                  projectItems={"totalCount": 1, "nodes": [card]},
                  closedByPullRequestsReferences={"totalCount": int(merged), "nodes": [pr] if merged else []})
     # Projected fields from the #551 worker-list and worker-show receipts.
-    workers = [dict(dispatchId=dispatch, runId="run", agentTerminalHandle=terminal if owns else None,
+    workers = [dict(dispatchId=dispatch, runId="run", taskId=dispatch + "-task", agentTerminalHandle=terminal if owns else None,
                     dispatchStatus="completed", projection={"workspace": {"id": worktree}, "host": {"kind": "local"}})
                for dispatch, terminal, owns in (("ctx_merge", "term_coder", True),
                                                 ("ctx_review", "term_reviewer", True),
                                                 ("ctx_initial", "term_coder", False))]
+    if released_projection:
+        workers[1]["terminalState"] = "released"
     if remote_worker:
         workers.insert(1, {
             "agentTerminalHandle": "term_wsl",
@@ -1745,9 +1748,13 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
                 return {"workers": workers[2:], "page": {"hasMore": False, "nextCursor": None}}
             return {"workers": workers[:2], "page": {"hasMore": True, "nextCursor": "recorded-cursor"}}
         if args[:2] == ("orchestration", "worker-show"):
-            return {"dispatch": {"id": "ctx_initial", "runId": "run", "assigneeHandle": "term_coder"},
-                    "worker": {"dispatchId": "ctx_initial", "worktreeId": worktree, "effects": [
-                        {"kind": "terminal", "role": "agent", "action": "reused", "id": "term_coder"}]}}
+            worker = next(w for w in workers if w["dispatchId"] == args[3])
+            terminal = worker["agentTerminalHandle"] or "term_coder"
+            status = "dispatched" if release_race and args[3] == "ctx_review" else worker["dispatchStatus"]
+            return {"dispatch": {"id": args[3], "runId": "run", "taskId": worker["taskId"],
+                                 "assigneeHandle": terminal, "status": status},
+                    "worker": {"dispatchId": args[3], "worktreeId": worktree, "effects": [
+                        {"kind": "terminal", "role": "agent", "action": "reused", "id": terminal}]}}
         if args[:2] == ("orchestration", "worker-release"):
             if release_uncertain and args[3] == "ctx_review":
                 return {"state": "release_pending", "reason": pending}
@@ -1826,12 +1833,15 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
             tick.close_tick(args, db)
         notice = db.execute("SELECT sent,carded,request FROM close_notice LEFT JOIN close_request USING (run,issue,reason)"
                             " WHERE run='run' AND issue=41").fetchone()
-    assert [event[3] for event in events if event[:2] == REL] == ["ctx_merge", "ctx_review", "ctx_initial"] * (
-        ticks + rollback)
-    expected_holds = {"term_other", "term_reviewer"} if release_uncertain else {"term_other"}
+    expected_releases = ["ctx_merge", "ctx_initial"] if released_projection or release_race else [
+        "ctx_merge", "ctx_review", "ctx_initial"]
+    assert [event[3] for event in events if event[:2] == REL] == expected_releases * (ticks + rollback)
+    if released_projection:
+        assert not any(e[:4] == ("orchestration", "worker-show", "--dispatch", "ctx_review") for e in events)
+    expected_holds = {"term_other", "term_reviewer"} if release_uncertain or release_race else {"term_other"}
     assert set(json.loads(holds.read_text())) == expected_holds
     edits = [event[-3:] for event in events if event[:3] == ("gh", "project", "item-edit")]
-    if merged and not dirty and not refused and not release_uncertain:
+    if merged and not dirty and not refused and not release_uncertain and not release_race:
         assert not present and not local_ref
         assert edits == [("--field-id", "agent", "--clear"), ("--field-id", "stage", "--clear")]
         assert any(event[0] == "git" and event[3] == "push" for event in events) == remote_race
@@ -1868,6 +1878,7 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
 
 
 for scenario in ({}, {"remote_worker": True}, {"merged": False}, {"dirty": True}, {"refused": True},
+                 {"released_projection": True}, {"release_race": True},
                  {"release_uncertain": True}, {"remote_race": True}, {"release_unknown": True},
                  {"release_uncertain": True, "ticks": 2}, {"release_uncertain": True, "ticks": 3, "card_fails": True},
                  {"release_uncertain": True, "ticks": 3, "send_lost": True},
@@ -1932,6 +1943,7 @@ class Fleet:
         self.holds.write_text(json.dumps({"term_coder": {"account": "jzaw", "label": "jzaw", "host": "local"}}))
         self.agent, self.model, self.screen = agent, model, screen
         self.dispatch, self.terminal, self.status, self.state = "ctx_coder", "term_coder", "dispatched", "ready"
+        self.terminal_state = None
         self.liveness, self.failure, self.wait = "live", None, None
         self.seats = ["jzaw", "x2"]  # the limited account is first in accounts.toml order
         self.superseded = False
@@ -1985,7 +1997,7 @@ class Fleet:
                               *([{"id": "task_root", "run_id": "run", "task_title": "#553 reviewer"}] if self.orig_parent else [])]}
         if verb == ("orchestration", "worker-list"):
             row = dict(dispatchId=self.dispatch, taskId="task_coder", runId="run", workerState=self.state,
-                       dispatchStatus=self.status, agentTerminalHandle=self.terminal,
+                       dispatchStatus=self.status, agentTerminalHandle=self.terminal, terminalState=self.terminal_state,
                        resource={"ownerDispatchId": "ctx_follow" if self.transferred else self.dispatch},
                        projection={"host": {"kind": "local"}, "workspace": {"id": self.worktree},
                                    "liveness": {"verdict": self.liveness}})
@@ -2067,7 +2079,8 @@ class Fleet:
                                "effects": [{"kind": "terminal", "role": "agent", "action": "created", "id": self.terminal}],
                                "startOptions": {"launch": {"effective": {"agent": self.agent, "model": self.model,
                                                                          "effort": self.effort}}}},
-                    "projection": {"liveness": {"verdict": self.liveness}},
+                    "projection": {"liveness": {"verdict": self.liveness},
+                                   "resource": {"releaseState": self.terminal_state}},
                     "terminal": {"handle": self.terminal, "agentWait": self.wait}, "observation": {"agentWait": self.wait}}
         if verb == ("terminal", "read"):
             if args[3] == "term_manual":
@@ -2955,8 +2968,8 @@ with TemporaryDirectory() as tmp:
     f = Fleet(tmp, screen=CLAUDE_WORKING)
     f.ticket["stage"] = "Merging"
     f.status, f.state, f.liveness, f.failure = "failed", "failed", "exited", "agent process exited"
-    assert f.tick() == [("orchestration", "task-list"), ("orchestration", "worker-list"),
-                        ("orchestration", "worker-show")] and f.lines == ['watch        "no action"']
+    assert f.tick() == [("orchestration", "task-list"), ("orchestration", "worker-list")]
+    assert f.lines == ['watch        "no action"']
 
 # Hundreds of distinct historical Tasks must not delay watching the current worker.
 with TemporaryDirectory() as tmp:
@@ -2987,6 +3000,29 @@ with TemporaryDirectory() as tmp:
     assert ("terminal", "read") in calls
     shows = calls.count(("orchestration", "worker-show"))
     assert shows <= 30, f"700 settled Dispatches produced {shows} worker-show calls"
+
+# A settled released report is read once across passes even while its card still says Coding.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.status, f.state, f.terminal_state = "failed", "failed", "released"
+    f.failure = json.dumps({"provenance": "worker_report", "outcome": "failed"})
+    assert f.tick().count(("orchestration", "worker-show")) == 1
+    assert ("orchestration", "worker-show") not in f.tick(1)
+
+# A worker changed after the parallel observation. Its old limit screen cannot authorize a restart.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    underlying = f.orca
+
+    def settle_before_restart(*args):
+        if args[:2] == ("orchestration", "worker-show") and args in f.events:
+            f.status, f.state = "completed", "succeeded"
+        return underlying(*args)
+
+    with patch.object(f, "orca", settle_before_restart), check.assertRaises(tick.OrcaError):
+        f.tick()
+    assert "Dispatch identity changed before restart" in f.lines[0]
+    assert not any(e[:2] in (("orchestration", "worker-stop"), ("orchestration", "worker-start")) for e in f.events)
 
 # A Merging coder that failed is still current when the review state names it: relaunched.
 with TemporaryDirectory() as tmp:
@@ -3135,6 +3171,7 @@ with TemporaryDirectory() as tmp:
             assert (options.anchor, options.run) == ("term_anchor", "run_live")
             assert json.loads(db.execute("SELECT receipt FROM starts WHERE issue=555").fetchone()[0]) == {
                 "run": "run_live", "dispatch": "ctx_existing"}
+            assert list(tick.pass_workers(options.run, options.workers)) == [{"dispatchId": "ctx_existing"}]
             calls.append((name, options.repo_path))
             if name == "review":
                 raise tick.OrcaError("private CLI error")
@@ -3142,18 +3179,22 @@ with TemporaryDirectory() as tmp:
 
     with patch.object(tick, "SNAPSHOT", root / "issues.json"), \
             patch.object(tick, "supervisor", return_value=(["--from", args.anchor, "--run", args.run], args.run)) as bind, \
+            patch.object(tick, "fleet_workers", return_value=iter([{"dispatchId": "ctx_existing"}])) as roster, \
             patch.object(tick, "watch_tick", phase("watch")), patch.object(tick, "review_tick", phase("review")), \
             patch.object(tick, "close_tick", phase("close")), patch.object(tick, "fill_tick", phase("fill")), \
             patch.object(tick, "full_run_tick", phase_full := Mock()), \
             redirect_stdout(io.StringIO()) as output:
         assert tick.scheduled_tick(args) == 1
         bind.assert_called_once()
+        roster.assert_called_once_with(args.run)
         phase_full.assert_called_once_with()
         status = json.loads((root / "tick.json").read_text())
         assert status["lastRun"] and status["errors"] == [{"phase": "review", "error": "OrcaError"}], status
         assert "private CLI error" in output.getvalue()
         assert calls == [("watch", None), ("review", None), ("close", args.repo_paths[0]),
                          ("close", args.repo_paths[1]), ("fill", args.repo_paths[0]), ("fill", args.repo_paths[1])]
+        assert [line.split(None, 2)[2] for line in output.getvalue().splitlines() if line.startswith("phase start")] == [
+            '"adopt"', '"state"', '"watch"', '"review"', '"close"', '"close"', '"fill"', '"fill"', '"full-run"']
         calls.clear()
         bind.side_effect = tick.OrcaError("wrong Run")
         other_run = [{"truncated": False, "terminals": [{"handle": args.anchor}]},

@@ -16,8 +16,10 @@ Coordinator verbs refuse a sender with no stable Orca pane, so the script opens 
 
 from pathlib import Path
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 import datetime
+from functools import cached_property
 import hashlib
 import inspect
 import shlex
@@ -856,7 +858,7 @@ def fill_tick(args, db, *, issues=None, emit=log):
                     actor, run = supervisor(args)
                     if rec["run"] != run:
                         raise OrcaError(f"reconcile from its owning Run {rec['run']}")
-                    reconcile_start(db, n, rec, actor)
+                    reconcile_start(db, n, rec, actor, getattr(args, "workers", None))
                 else:
                     record_hold(rec)
                     publish_start(db, n, rec)
@@ -1343,7 +1345,7 @@ def launch(db, repo_path, t, acct, args, holds_path):
         raise OrcaError(f"#{number}: Orca confirmed no start effects; inspect prepared worktree {path}: {e}") from e
     except (OrcaError, OSError, ValueError, subprocess.TimeoutExpired) as e:
         log("start receipt unavailable", {"issue": number, "task": task, "reason": str(e)})
-    reconcile_start(db, number, rec, actor)
+    reconcile_start(db, number, rec, actor, getattr(args, "workers", None))
 
 
 def drop_unapplied(db, number, rec):
@@ -1375,11 +1377,11 @@ def return_coordinator(db, number, rec):
             db.execute("UPDATE starts SET receipt=? WHERE issue=?", (json.dumps(rec), number))
 
 
-def fleet_workers(run):
+def fleet_workers(run, *, include_remote=True):
     cursor = []
     seen = set()
     while True:
-        inventory = runtime("orchestration", "worker-list", "--run", run, "--include-remote",
+        inventory = runtime("orchestration", "worker-list", "--run", run, *(("--include-remote",) if include_remote else ()),
                             "--full", "--limit", "100", *cursor)
         yield from inventory["workers"]
         page = inventory["page"]
@@ -1392,13 +1394,47 @@ def fleet_workers(run):
         cursor = ["--cursor", next_cursor]
 
 
+class WorkerInventory:
+    def __init__(self, run):
+        self.run = run
+
+    @cached_property
+    def _listing(self):
+        try:
+            return tuple(fleet_workers(self.run))
+        except (OrcaError, OSError, KeyError, ValueError, subprocess.TimeoutExpired) as error:
+            return error
+
+    @property
+    def rows(self):
+        if isinstance(self._listing, Exception):
+            raise self._listing
+        return self._listing
+
+
+def pass_workers(run, inventory):
+    if inventory is None:
+        return fleet_workers(run)
+    if inventory.run != run:
+        raise OrcaError("worker inventory belongs to a different Run")
+    return inventory.rows
+
+
 def worker_host(worker):
     return (worker.get("server") or {}).get("name") or worker.get("host") or "local"
 
 
-def remote_start_dispatch(run, task, host):
-    return next((w["dispatchId"] for w in fleet_workers(run)
-                 if w.get("taskId") == task and worker_host(w) == host), None)
+def inspect_worker(dispatch):
+    return runtime("orchestration", "worker-show", "--dispatch", dispatch, "--full")
+
+
+def released_worker(worker):
+    return worker.get("terminalState") == "released" and worker["dispatchStatus"] in ("completed", "failed")
+
+
+def remote_start_dispatch(run, task, host, inventory=None):
+    return next((w["dispatchId"] for w in pass_workers(run, inventory)
+                 if w.get("runId", run) == run and w.get("taskId") == task and worker_host(w) == host), None)
 
 
 def execution_worker_show(host, path, dispatch_id):
@@ -1463,7 +1499,7 @@ def startup_needs_you(db, number, rec, actor, prompt):
     log("waiting for operator input", notice)
 
 
-def reconcile_start(db, number, rec, actor):
+def reconcile_start(db, number, rec, actor, inventory=None):
     task, run = rec["task"], rec["run"]
     host = rec.get("host", "local")
     worker_rpc = runtime
@@ -1477,7 +1513,7 @@ def reconcile_start(db, number, rec, actor):
             lookup = runtime("orchestration", "dispatch-show", "--task", task, "--full")
             dispatch_id = (lookup.get("dispatch") or {}).get("id")
         else:
-            dispatch_id = rec.get("dispatch") or remote_start_dispatch(run, task, host)
+            dispatch_id = rec.get("dispatch") or remote_start_dispatch(run, task, host, inventory)
         if not dispatch_id:
             raise OrcaError("no Dispatch is visible")
         show = runtime("orchestration", "worker-show", "--dispatch", dispatch_id, "--full")
@@ -1725,14 +1761,14 @@ def assign_reviewer(state, dispatch, terminal, hold):
     state["card_agent"] = f"{state['agent']} · reviewer {route[1]} {route[2]}{advisor} @{hold['label']}"
 
 
-def review_dispatch(run, task, state):
+def review_dispatch(run, task, state, inventory=None):
     host = state.get("host", "local")
     if host != "local":
-        return remote_start_dispatch(run, task, host)
+        return remote_start_dispatch(run, task, host, inventory)
     return (runtime("orchestration", "dispatch-show", "--task", task, "--full").get("dispatch") or {}).get("id")
 
 
-def adopt_reviewer(db, run, ticket, state, messages):
+def adopt_reviewer(db, run, ticket, state, messages, inventory=None):
     import pick
     number = ticket["number"]
     error = UncertainReview(f"inspect uncertain Orca action for message {state['pending']} before continuing")
@@ -1762,7 +1798,7 @@ def adopt_reviewer(db, run, ticket, state, messages):
     if len(matches) != 1:
         raise error
     task = matches[0]["id"]
-    dispatch = review_dispatch(run, task, state)
+    dispatch = review_dispatch(run, task, state, inventory)
     if not dispatch:
         raise error
     show = runtime("orchestration", "worker-show", "--dispatch", dispatch, "--full")
@@ -1927,7 +1963,7 @@ def review_coordinator(db, run, number, state):
         save_review(db, run, number, state)
 
 
-def review_step(db, run, actor, ticket, initial, messages):
+def review_step(db, run, actor, ticket, initial, messages, *, inventory=None):
     import account_usage
     import pick
     number = ticket["number"]
@@ -1941,7 +1977,7 @@ def review_step(db, run, actor, ticket, initial, messages):
             state.pop("released", None)
             save_review(db, run, number, state)
         elif state.get("pending"):
-            adopt_reviewer(db, run, ticket, state, messages)
+            adopt_reviewer(db, run, ticket, state, messages, inventory)
         else:
             state.pop("released")
             state.pop("followup", None)
@@ -2096,6 +2132,7 @@ def review_step(db, run, actor, ticket, initial, messages):
 
 def review_tick(args, db):
     actor, run = supervisor(args)
+    inventory = getattr(args, "workers", None) or WorkerInventory(run)
     inbox = runtime("orchestration", "inbox", "--terminal", "run:" + run, "--limit", "10000", "--full")
     messages = inbox["messages"]
     if len(messages) >= 10000 or inbox.get("truncated"):
@@ -2168,12 +2205,13 @@ def review_tick(args, db):
                          "path": tree["path"], "host": "local", "model": model,
                          "agent": agent, "history": [], "stage": "Coding"}
             elif "host" not in state and state["stage"] not in ("Merging", "Needs you"):
-                worker = next((w for w in fleet_workers(run) if w["dispatchId"] == state["coder"]), None)
+                worker = next((w for w in pass_workers(run, inventory)
+                               if w.get("runId", run) == run and w["dispatchId"] == state["coder"]), None)
                 if worker is None:
                     raise OrcaError(f"cannot locate coder Dispatch {state['coder']} in the Run's worker inventory")
                 state["host"] = worker_host(worker)
                 save_review(db, run, number, state)
-            review_step(db, run, actor, ticket, state, messages)
+            review_step(db, run, actor, ticket, state, messages, inventory=inventory)
         except UncertainReview as e:
             log("Needs you", {"issue": number, "reason": str(e)})
         except (OrcaError, OSError, KeyError, ValueError, subprocess.TimeoutExpired) as e:
@@ -2254,29 +2292,18 @@ def close_cards(repo, issue):
             yield row, card, branch
 
 
-def close_workers(run):
-    cursor = []
-    seen = set()
-    while True:
-        inventory = runtime("orchestration", "worker-list", "--run", run, "--full", "--limit", "100", *cursor)
-        for worker in inventory["workers"]:
-            if worker.get("server") or worker.get("host") not in (None, "local"):
-                continue
-            if worker["runId"] != run:
-                raise OrcaError("worker-list returned a different Run")
-            host = (worker.get("projection") or {}).get("host") or {}
-            if not host.get("kind"):
-                raise OrcaError("worker-list row has no projected host")
-            if host["kind"] == "local":
-                yield worker
-        page = inventory["page"]
-        if not page["hasMore"]:
-            return
-        next_cursor = page["nextCursor"]
-        if not next_cursor or next_cursor in seen:
-            raise OrcaError("incomplete Orca worker inventory")
-        seen.add(next_cursor)
-        cursor = ["--cursor", next_cursor]
+def close_workers(run, inventory):
+    workers = pass_workers(run, inventory) if inventory is not None else fleet_workers(run, include_remote=False)
+    for worker in workers:
+        if worker.get("server") or worker.get("host") not in (None, "local"):
+            continue
+        if worker["runId"] != run:
+            raise OrcaError("worker-list returned a different Run")
+        host = (worker.get("projection") or {}).get("host") or {}
+        if not host.get("kind"):
+            raise OrcaError("worker-list row has no projected host")
+        if host["kind"] == "local":
+            yield worker
 
 
 def release_close_workers(workers, workspace, run, paths):
@@ -2286,18 +2313,26 @@ def release_close_workers(workers, workspace, run, paths):
         dispatch = worker["dispatchId"]
         terminal = worker["agentTerminalHandle"]
         try:
-            if not terminal:
-                # Predecessors can lose their resource row when a follow-up reuses the pane.
-                show = runtime("orchestration", "worker-show", "--dispatch", dispatch, "--full")
-                attempt, receipt = show["dispatch"], show.get("worker")
-                if attempt["id"] != dispatch or attempt["runId"] != run:
-                    raise OrcaError("Dispatch identity changed")
-                terminal = attempt.get("assigneeHandle")
-                if receipt and receipt["worktreeId"] != workspace:
-                    raise OrcaError("Dispatch worktree changed")
-                if receipt and any(e.get("kind") == "terminal" and e.get("role") == "agent" for e in receipt["effects"]):
-                    if start_identity(receipt) != (dispatch, terminal):
-                        raise OrcaError("Dispatch terminal changed")
+            if terminal and released_worker(worker):
+                # No release to send. The terminal inventory below still fences hold and worktree cleanup.
+                releases.append((worker, terminal, {"state": "already_released"}))
+                continue
+            show = inspect_worker(dispatch)
+            attempt, receipt = show["dispatch"], show.get("worker") or {}
+            if (attempt["id"] != dispatch or attempt["runId"] != run or attempt["taskId"] != worker["taskId"]
+                    or attempt["status"] != worker["dispatchStatus"]):
+                raise OrcaError("Dispatch identity changed")
+            projected = ((show.get("projection") or {}).get("workspace") or {}).get("id")
+            if (receipt.get("worktreeId") or projected) != workspace:
+                raise OrcaError("Dispatch worktree changed")
+            # Predecessors can lose their resource row when a follow-up reuses the pane.
+            assignee = attempt.get("assigneeHandle")
+            if terminal and terminal != assignee:
+                raise OrcaError("Dispatch terminal changed")
+            terminal = assignee
+            if any(e.get("kind") == "terminal" and e.get("role") == "agent" for e in receipt.get("effects", ())):
+                if start_identity(receipt) != (dispatch, terminal):
+                    raise OrcaError("Dispatch terminal changed")
             try:
                 result = runtime("orchestration", "worker-release", "--dispatch", dispatch, "--full")
             except OrcaError as e:
@@ -2392,7 +2427,7 @@ def close_tick(args, db):
         return
     actor, run = supervisor(args)
     roster = {}
-    for worker in close_workers(run):
+    for worker in close_workers(run, getattr(args, "workers", None)):
         workspace = (worker.get("projection") or {}).get("workspace")
         if workspace:
             roster.setdefault(workspace["id"], []).append(worker)
@@ -2568,7 +2603,8 @@ def watch_tick(args, db):
     """One pass over the Run's live workers; always logs exactly one watch line."""
     actions, errors = [], []
     try:
-        watch_pass(args, db, actions, errors)
+        with ThreadPoolExecutor(max_workers=4) as reads:
+            watch_pass(args, db, actions, errors, reads)
     except (OrcaError, OSError, ValueError, KeyError, TypeError, sqlite3.Error, subprocess.SubprocessError) as e:
         errors.append({"tick": str(e)})
     finally:
@@ -2577,7 +2613,7 @@ def watch_tick(args, db):
         raise OrcaError(f"{len(errors)} watch error(s); see the watch line")
 
 
-def watch_pass(args, db, actions, errors):
+def watch_pass(args, db, actions, errors, reads):
     import contextlib
     import io
     import pick
@@ -2614,6 +2650,47 @@ def watch_pass(args, db, actions, errors):
     saved = dict(db.execute("SELECT terminal,state FROM watch WHERE run=?", (run,)))
     db.execute("CREATE TABLE IF NOT EXISTS watch_replaced (run TEXT, dispatch TEXT, PRIMARY KEY(run,dispatch))")
     replaced = {row[0] for row in db.execute("SELECT dispatch FROM watch_replaced WHERE run=?", (run,))}
+    db.execute("CREATE TABLE IF NOT EXISTS released_dispatches (run TEXT, dispatch TEXT, status TEXT, facts TEXT,"
+               " PRIMARY KEY(run,dispatch,status))")
+    settled = {(dispatch, status): json.loads(facts) for dispatch, status, facts in
+               db.execute("SELECT dispatch,status,facts FROM released_dispatches WHERE run=?", (run,))}
+
+    def remember_released(w, show):
+        dispatch = show["dispatch"]
+        worker = show.get("worker") or {}
+        if (not released_worker(w) or dispatch["status"] != w["dispatchStatus"]
+                or ((show.get("projection") or {}).get("resource") or {}).get("releaseState") != "released"):
+            return
+        key = (dispatch["id"], dispatch["status"])
+        report = failure_of(show)
+        reported = isinstance(report, dict) and report.get("provenance") == "worker_report"
+        checkpoint = reported and report.get("outcome") == "failed" and report.get("reportPath")
+        effective = ((worker.get("startOptions") or {}).get("launch") or {}).get("effective") or {}
+        facts = {
+            "dispatch": {k: dispatch.get(k) for k in ("id", "runId", "taskId", "followUpOf", "retryOfDispatchId")},
+            "worker": {"startOptions": {"launch": {"effective":
+                {k: effective.get(k) for k in ("agent", "model", "effort")}}}},
+            "finished": not checkpoint and (dispatch["status"] != "failed" or reported or worker.get("state") == "stopped"),
+        }
+        if settled.get(key) != facts:
+            with db:
+                db.execute("INSERT OR REPLACE INTO released_dispatches VALUES (?,?,?,?)",
+                           (run, *key, json.dumps(facts)))
+            settled[key] = facts
+
+    def history_of(dispatch):
+        w = roster_by_dispatch.get(dispatch)
+        if w and released_worker(w):
+            key = (dispatch, w["dispatchStatus"])
+            if key in settled:
+                return settled[key]
+            show = inspect_worker(dispatch)
+            attempt = show["dispatch"]
+            if (attempt["id"], attempt["runId"], attempt["taskId"]) != (dispatch, run, w["taskId"]):
+                raise OrcaError("Dispatch identity changed")
+            remember_released(w, show)
+            return show
+        return inspect_worker(dispatch)
 
     def save(terminal, state, *, replaced_dispatch=None):
         with db:
@@ -2666,7 +2743,7 @@ def watch_pass(args, db, actions, errors):
             up = d.get("retryOfDispatchId") or d.get("followUpOf")
             if not up:
                 return None
-            d = runtime("orchestration", "worker-show", "--dispatch", up, "--full")["dispatch"]
+            d = history_of(up)["dispatch"]
         return None
 
     def replacement_for(w, show, number, fresh_handoff, recorded_coder):
@@ -2701,7 +2778,7 @@ def watch_pass(args, db, actions, errors):
             if fresh_history or (role and (live_on_tree or same_ticket)):
                 other_role = task_role(other_task_id)
                 if not other_role:
-                    d = runtime("orchestration", "worker-show", "--dispatch", found, "--full")["dispatch"]
+                    d = history_of(found)["dispatch"]
                     if d["id"] != found or d["runId"] != run or d["taskId"] != other_task_id:
                         raise OrcaError("Dispatch identity changed")
                     other_role = role_of(d)
@@ -2716,7 +2793,7 @@ def watch_pass(args, db, actions, errors):
         for _ in range(10):
             if not d.get("followUpOf"):
                 break
-            prev = runtime("orchestration", "worker-show", "--dispatch", d["followUpOf"], "--full")
+            prev = history_of(d["followUpOf"])
             effective = (((prev.get("worker") or {}).get("startOptions") or {}).get("launch") or {}).get("effective") or {}
             route = tuple(effective.get(k) for k in ("agent", "model", "effort"))
             if None not in route:
@@ -2804,6 +2881,23 @@ def watch_pass(args, db, actions, errors):
         if owed:
             actions.append({"issue": number, "dispatch": dispatch, "waiting for coordinator restore": sorted(owed)})
             return
+        fresh = inspect_worker(dispatch)
+        attempt = fresh["dispatch"]
+        original = show["dispatch"]
+        owner = ((fresh.get("projection") or {}).get("resource") or {}).get("ownerDispatchId")
+        if (any(attempt.get(key) != original.get(key) for key in
+                ("id", "runId", "taskId", "assigneeHandle", "status", "lastFailure"))
+                or attempt.get("assigneeHandle") != terminal
+                or owner not in (None, dispatch)
+                or (fresh.get("worker") or {}).get("worktreeId") != show["worker"]["worktreeId"]):
+            raise OrcaError("Dispatch identity changed before restart")
+        if attempt["status"] == "dispatched":
+            if crash and not worker_exited(fresh):
+                raise OrcaError("worker is no longer exited")
+            if usage and not crash:
+                tail = runtime("terminal", "read", "--terminal", terminal, "--screen")["terminal"]["tail"]
+                if f"usage limit ({screen_limit(tail, launch)})" != why:
+                    raise OrcaError("usage limit changed before restart")
         # An unconfirmed restore from an earlier start is still the coordinator's account.
         prior = state.get("coordinator") or codex_active(route)
         if prior:
@@ -3036,7 +3130,7 @@ def watch_pass(args, db, actions, errors):
     seen_terminals, seen_tasks = set(), set()
     # Remote Dispatches can supersede a local worker, but the watch only controls local workers.
     roster, workers = [], []
-    for w in fleet_workers(run):
+    for w in pass_workers(run, getattr(args, "workers", None)):
         if w.get("server") or w.get("host") not in (None, "local"):
             if w.get("runId") == run:
                 roster.append(w)
@@ -3049,9 +3143,12 @@ def watch_pass(args, db, actions, errors):
         roster.append(w)
         if host == "local":
             workers.append(w)
+    roster_by_dispatch = {w["dispatchId"]: w for w in roster}
     worker_order = {w["dispatchId"]: pos for pos, w in enumerate(workers)}
     task_of = {w["dispatchId"]: w["taskId"] for w in workers}
     research = research_root()
+    candidates = []
+    live_reads = {}
     for w in workers:
         terminal, dispatch, task_id = w["agentTerminalHandle"], w["dispatchId"], w["taskId"]
         task, number = issue_of(task_id)
@@ -3077,20 +3174,39 @@ def watch_pass(args, db, actions, errors):
         live = w["dispatchStatus"] == "dispatched"
         if not live and unwatched and (w["dispatchStatus"] != "failed" or w.get("workerState") == "stopped"):
             continue
+        ticket = cards.get(number)
+        review = (review_state(db, run, number) or {}) if number is not None else {}
+        named = {review.get("coder"), review.get("expected"), (review.get("reviewer") or {}).get("dispatch")}
+        if not live and unwatched and not (ticket and (ticket["stage"] in ACTIVE or dispatch in named)):
+            continue  # Only a ticket still in work can have a current crash.
+        candidates.append((w, task, number, state))
+        if live:
+            live_reads[dispatch] = reads.submit(inspect_worker, dispatch)
+
+    for w, task, number, state in candidates:
+        terminal, dispatch = w["agentTerminalHandle"], w["dispatchId"]
+        live = dispatch in live_reads
+        unwatched = state is None
+        state = state or {}
+        title = task.get("task_title") or ""
+        ticket = cards.get(number)
         try:
-            show = runtime("orchestration", "worker-show", "--dispatch", dispatch, "--full")
-            if show["dispatch"]["id"] != dispatch or show["dispatch"]["runId"] != run:
+            facts = settled.get((dispatch, w["dispatchStatus"])) if released_worker(w) else None
+            if facts and facts["finished"] and not (state.get("pending") or state.get("handoff")):
+                restore_prompt(ticket, state, title)
+                keep = state.get("coordinator") or state.get("note") or state.get("card")
+                save(terminal, state if keep else None)
+                continue
+            show = live_reads[dispatch].result() if live else inspect_worker(dispatch)
+            attempt = show["dispatch"]
+            if (attempt["id"], attempt["runId"], attempt["taskId"]) != (dispatch, run, w["taskId"]):
                 raise OrcaError("Dispatch identity changed")
+            if attempt["status"] != w["dispatchStatus"]:
+                continue  # The inventory crossed a transition. Let the next pass classify the new state.
             worktree = (show.get("worker") or {}).get("worktreeId") or ""
             if Path(worktree.partition("::")[2]).parent == research:
                 continue
-            title = task.get("task_title") or ""
-            ticket = cards.get(number)
-            review = (review_state(db, run, number) or {}) if number is not None else {}
-            named = {review.get("coder"), review.get("expected"), (review.get("reviewer") or {}).get("dispatch")}
-            if not live and unwatched and not (ticket and (ticket["stage"] in ACTIVE or dispatch in named)):
-                continue  # history: only a ticket still in work can have a current crash
-            state = state or {}
+            remember_released(w, show)
             hold = (holds.get(terminal) or {}).get("account")
             if hold and state.get("account") != hold:
                 state["account"] = hold
@@ -3098,8 +3214,7 @@ def watch_pass(args, db, actions, errors):
             report = failure_of(show)
             reported = isinstance(report, dict) and report.get("provenance") == "worker_report"
             stopped = (show.get("worker") or {}).get("state") == "stopped"
-            exited = (show["projection"]["liveness"]["verdict"] == "exited"
-                      or (show.get("observation") or {}).get("status") == "exited")
+            exited = worker_exited(show)
             pending = state.get("pending")
             # A limit restart waiting for a seat stops the worker only if the limit is still on screen.
             if pending and not (live and pending["why"].startswith("usage limit") and not pending.get("starting")):
@@ -3199,6 +3314,11 @@ def failure_of(show):
         return json.loads(failure) if failure.startswith("{") else failure
     except ValueError:
         return failure
+
+
+def worker_exited(show):
+    return (show["projection"]["liveness"]["verdict"] == "exited"
+            or (show.get("observation") or {}).get("status") == "exited")
 
 
 def watch_workers(args):
@@ -3302,6 +3422,7 @@ def scheduled_tick(args):
         log("tick start", started)
 
         def step(phase, action, *params):
+            log("phase start", phase)
             try:
                 action(*params)
             except Exception as e:
@@ -3312,7 +3433,7 @@ def scheduled_tick(args):
             return True
 
         opts = argparse.Namespace(anchor=args.anchor, run=args.run, issue=None, holds=None, coder=None,
-                                  dry_run=False, repo_path=None)
+                                  dry_run=False, repo_path=None, workers=WorkerInventory(args.run))
         # The existing Run and state contain the dispatches, holds and card reservations to adopt.
         if step("adopt", scheduled_supervisor, opts, state / "anchor.json", args.repo_paths[0]):
             def advance():

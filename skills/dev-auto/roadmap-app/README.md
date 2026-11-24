@@ -5,29 +5,10 @@ generates. For local development, put sample data in `public/data.json` and
 run `pnpm dev`. The sample file is ignored and the production build fetches
 the live feed.
 
-From this directory, use Node.js 22.18+ and pnpm to install and verify:
+The `roadmap-app` CI job installs from the frozen lockfile, runs lint and the
+model check, and uploads the compiled site as the `roadmap-app` artifact.
 
-```sh
-pnpm install --frozen-lockfile
-pnpm check
-pnpm lint
-pnpm build
-```
-
-On the Mac that serves the roadmap, run `pnpm run publish` from this directory
-after installing dependencies. It builds the app and deploys its HTML and
-assets to `~/.orca/bots/subaru-2/roadmap/`.
-
-Use the `com.relay.roadmap-serve.plist` template in the parent directory.
-Set `ROADMAP_SCRIPT` to the absolute path to the deployed `scripts/roadmap.py`,
-`ROADMAP_DIRECTORY` to the absolute directory containing the published app,
-and `ROADMAP_TAILNET_IP` to the Mac's Tailscale IPv4 address. Set the log
-placeholder to an absolute path outside the served directory. The server also
-listens on loopback. It uses the Mac's authenticated `gh` CLI.
-
-Boot out the old serve and render LaunchAgents. Bootstrap the updated serve
-job in the user GUI domain and confirm `/status` shows fresh source ages
-before enabling central reads in the tick and workers.
+## API
 
 The board polls `/data.json` every five seconds. The API also serves
 `GET /status`, `/issues` (or `/issues?number=...`), `/project`, `/prs`, `/heads`,
@@ -37,13 +18,129 @@ The board polls `/data.json` every five seconds. The API also serves
 The server sends conditional GitHub REST GETs where an ETag is available.
 GitHub GraphQL queries use POST and branch-head reads use Git.
 
-On Mac, run `~/.agents/skills/dev-auto/scripts/ci-wait <sha-or-branch>` from
-the task checkout. Set `ROADMAP_URL=http://<mac-tailnet-ip>:8790` in the WSL
-worker environment and run the same command there. Use the full SHA after a
-push. HR Relay tasks wait for the push workflow and dot-agents tasks wait for
-the PR workflow.
+## Mac cutover
 
-After the shared API is live, merge the PreToolUse entry from
-`../../../hooks/ci-wait.json` into the Claude user settings and the Codex
-account's `hooks.json`, preserving other entries. Reload the agent sessions
-and trust the hook in Codex.
+Use the reviewed full SHA and its successful Actions run ID. Set
+`ROADMAP_RELEASE_SHA` and `ROADMAP_CI_RUN`, then stage the release from a plain
+shell. Keep the existing checkout available for rollback.
+
+```sh
+release="$HOME/.local/share/dev-auto/roadmap-$ROADMAP_RELEASE_SHA"
+agents="$HOME/Library/LaunchAgents"
+domain="gui/$(id -u)"
+mkdir -p "$(dirname "$release")"
+git -C "$HOME/.agents" fetch origin "$ROADMAP_RELEASE_SHA"
+git -C "$HOME/.agents" worktree add --detach "$release" "$ROADMAP_RELEASE_SHA"
+gh run view "$ROADMAP_CI_RUN" -R julianthant/dot-agents --json headSha,conclusion \
+  | jq -e --arg sha "$ROADMAP_RELEASE_SHA" '.headSha == $sha and .conclusion == "success"'
+gh run download "$ROADMAP_CI_RUN" -R julianthant/dot-agents -n roadmap-app -D "$release/board"
+
+backup=$(mktemp -d "$HOME/.local/share/dev-auto/roadmap-backup.XXXXXX")
+for label in com.relay.roadmap-serve com.relay.roadmap-render com.relay.dev-auto; do
+  cp -p "$agents/$label.plist" "$backup/$label.plist"
+done
+printf 'Keep this backup for rollback: %s\n' "$backup"
+
+serve="$backup/new-roadmap-serve.plist"
+cp "$release/skills/dev-auto/com.relay.roadmap-serve.plist" "$serve"
+plutil -replace ProgramArguments.2 -string "$release/skills/dev-auto/scripts/roadmap.py" "$serve"
+plutil -replace ProgramArguments.5 -string "$release/board" "$serve"
+plutil -replace ProgramArguments.7 -string "$(tailscale ip -4)" "$serve"
+plutil -replace StandardErrorPath -string "$backup/roadmap.log" "$serve"
+
+tick="$backup/new-dev-auto.plist"
+cp "$backup/com.relay.dev-auto.plist" "$tick"
+plutil -replace ProgramArguments.1 -string "$release/skills/dev-auto/scripts/tick.py" "$tick"
+```
+
+Pause manual ticks and worker starts. Unload the three old jobs and take the
+render plist out of the LaunchAgents directory so it stays unloaded after
+login. Keep the existing Run, anchor, account settings and state directory.
+
+```sh
+launchctl bootout "$domain/com.relay.dev-auto"
+launchctl bootout "$domain/com.relay.roadmap-render"
+launchctl bootout "$domain/com.relay.roadmap-serve"
+mv "$agents/com.relay.roadmap-render.plist" "$backup/unloaded-roadmap-render.plist"
+cp "$serve" "$agents/com.relay.roadmap-serve.plist"
+launchctl bootstrap "$domain" "$agents/com.relay.roadmap-serve.plist"
+```
+
+Wait for both loopback and the tailnet address to serve the API. Use the same
+Mac session and authenticated `gh` CLI as the previous service.
+
+```sh
+curl -fsS http://127.0.0.1:8790/status | jq -e 'all(.sources[]; .stale == false)'
+curl -fsS "http://$(tailscale ip -4):8790/data.json" | jq -e '.githubFetchedAt != null'
+```
+
+After the worker checks below pass, install the updated tick plist and resume
+manual operation. Check the next tick and the board before resuming worker starts.
+
+```sh
+cp "$tick" "$agents/com.relay.dev-auto.plist"
+launchctl bootstrap "$domain" "$agents/com.relay.dev-auto.plist"
+```
+
+## Worker install and proof
+
+On WSL, set the same `ROADMAP_RELEASE_SHA` and stage the code.
+
+```sh
+release="$HOME/.local/share/dev-auto/roadmap-$ROADMAP_RELEASE_SHA"
+mkdir -p "$(dirname "$release")"
+git -C "$HOME/.agents" fetch origin "$ROADMAP_RELEASE_SHA"
+git -C "$HOME/.agents" worktree add --detach "$release" "$ROADMAP_RELEASE_SHA"
+```
+
+On both hosts, install the client and its Python module together, plus the
+hook script.
+
+```sh
+scripts="$HOME/.agents/skills/dev-auto/scripts"
+install -d "$scripts" "$HOME/.agents/hooks"
+install -m 755 "$release/skills/dev-auto/scripts/ci-wait" "$scripts/ci-wait"
+install -m 644 "$release/skills/dev-auto/scripts/github_poller.py" "$scripts/github_poller.py"
+install -m 644 "$release/hooks/ci-wait.py" "$HOME/.agents/hooks/ci-wait.py"
+```
+
+On WSL, set `ROADMAP_URL=http://<mac-tailnet-ip>:8790` in the Orca worker
+environment and open a worker shell that inherits it. Check `$ROADMAP_URL/status`
+and run the client against the deployed dot-agents SHA. Record the output and
+exit status from WSL. Mac workers use loopback by default.
+
+```sh
+curl -fsS "$ROADMAP_URL/status" | jq -e 'all(.sources[]; .stale == false)'
+"$HOME/.agents/skills/dev-auto/scripts/ci-wait" --repo dot-agents "$ROADMAP_RELEASE_SHA"
+```
+
+Use full SHAs after pushes. HR Relay waits for the push workflow and dot-agents
+waits for the PR workflow.
+
+Once the service is reachable, add the PreToolUse entry from
+[`hooks/ci-wait.json`](../../../hooks/ci-wait.json) to the `hooks.PreToolUse` array
+in each Claude user `settings.json` and each active Codex account's `hooks.json`.
+Keep existing entries. Reload the sessions and trust the new hook in Codex.
+
+## Rollback
+
+In the same Mac shell, use the saved `backup`, `agents` and `domain` values.
+Pause worker starts and unload any new tick or serve job. Restore the saved
+plists before bootstrapping the original serve, render and tick jobs in order.
+The saved plists point at the original scripts and board files.
+
+```sh
+for label in com.relay.dev-auto com.relay.roadmap-serve; do
+  if launchctl print "$domain/$label" >/dev/null 2>&1; then
+    launchctl bootout "$domain/$label"
+  fi
+done
+for label in com.relay.roadmap-serve com.relay.roadmap-render com.relay.dev-auto; do
+  cp -p "$backup/$label.plist" "$agents/$label.plist"
+  launchctl bootstrap "$domain" "$agents/$label.plist"
+done
+```
+
+On both clients, remove the added PreToolUse entry and reload the sessions.
+Remove the WSL `ROADMAP_URL` setting. Confirm the old board loads and its
+Refresh works before resuming worker starts with the prior workflow.

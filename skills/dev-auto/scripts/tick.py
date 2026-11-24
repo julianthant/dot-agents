@@ -751,8 +751,7 @@ def record_hold(rec):
                                       model=tier[1], effort=tier[2], host=rec.get("host", "local"), at=rec["time"])
 
 
-def record_start(db, number, rec):
-    record_hold(rec)
+def publish_start(db, number, rec):
     tier = rec["route"]
     agent = f"coder {tier[1]} {tier[2]}" + ("+advisor" if tier[3] else "") + " @" + rec["label"]
     for field, value in rec["fields"]:
@@ -820,7 +819,8 @@ def fill_tick(args, db, *, issues=None, emit=log):
                         raise OrcaError(f"reconcile from its owning Run {rec['run']}")
                     reconcile_start(db, n, rec, actor)
                 else:
-                    record_start(db, n, rec)
+                    record_hold(rec)
+                    publish_start(db, n, rec)
             except (OrcaError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as e:
                 emit("pending", {"issue": n, "reason": str(e)})
         previous = dict(db.execute("SELECT issue,receipt FROM starts"))
@@ -1212,7 +1212,7 @@ def launch(db, repo_path, t, acct, args, holds_path):
         selected = account("account", "list")[route[0]]["activeAccountId"]
         if selected != acct["id"]:
             raise OrcaError("selected account changed before worker start")
-        rec = dict(host=host, task=task, run=run, worktree=wt["id"], account=acct["id"], label=acct["label"],
+        rec = dict(host=host, task=task, run=run, worktree=wt["id"], path=str(path), account=acct["id"], label=acct["label"],
                    route=route, project=project, item=t["item"], fields=fields, time=int(time.time()),
                    holds=str(holds_path), waiting_field=waiting_field, coordinator=prior)
         if t.get("overlap_note"):
@@ -1333,15 +1333,20 @@ def execution_worker_show(host, path, dispatch_id):
     return response["result"]
 
 
-def record_remote_review(db, number, rec, path):
+def record_fill_worker(db, number, rec, path):
     run = rec["run"]
-    if review_state(db, run, number):
+    current = review_state(db, run, number)
+    if current and current["coder"] != rec["dispatch"]:
+        return
+    record_hold(rec)
+    if current:
         return
     _, model, effort, advisor = rec["route"]
     agent = f"coder {model} {effort}" + ("+advisor" if advisor else "") + " @" + rec["label"]
-    save_review(db, run, number,
-                dict(coder=rec["dispatch"], expected=rec["dispatch"], coder_terminal=rec["terminal"],
-                     path=path, host=rec["host"], model=model, agent=agent, history=[], stage="Coding"))
+    state = dict(path=path, host=rec.get("host", "local"), holds=rec["holds"], model=model, agent=agent,
+                 history=[], stage="Coding")
+    assign_coder(state, rec["dispatch"], rec["terminal"])
+    save_review(db, run, number, state)
 
 
 def reconcile_start(db, number, rec, actor):
@@ -1365,7 +1370,7 @@ def reconcile_start(db, number, rec, actor):
         bound = show["dispatch"]
         if (bound["id"], bound["taskId"], bound["runId"]) != (dispatch_id, task, run):
             raise OrcaError("coordinator Dispatch identity changed")
-        path = None
+        path = rec.get("path")
         if host != "local":
             tree = worker_rpc("worktree", "show", "--worktree", "id:" + rec["worktree"])["worktree"]
             if tree["id"] != rec["worktree"]:
@@ -1373,6 +1378,11 @@ def reconcile_start(db, number, rec, actor):
             path = tree["path"]
             if (show.get("worker") or {}).get("stage") == "server_record":
                 show = execution_worker_show(host, path, dispatch_id)
+        elif path is None:
+            tree = worker_rpc("worktree", "show", "--worktree", "id:" + rec["worktree"])["worktree"]
+            if tree["id"] != rec["worktree"]:
+                raise OrcaError("worker worktree changed")
+            path = tree["path"]
     except (OrcaError, OSError, ValueError, subprocess.TimeoutExpired) as e:
         raise OrcaError(f"#{number} reserved: inspect Task {task} in Run {run}: {e}") from e
     dispatch = show["dispatch"]
@@ -1395,12 +1405,11 @@ def reconcile_start(db, number, rec, actor):
     rec = dict(rec, terminal=terminal, dispatch=dispatch_id)
     resource = (show.get("projection") or {}).get("resource") or {}
     released_failure = worker["state"] == "failed" and resource.get("terminalState") == "released"
+    if terminal and not released_failure:
+        record_fill_worker(db, number, rec, path)
     if released_failure or dispatch.get("status") == "completed":
         if terminal and (show.get("terminal") or {}).get("handle") == terminal and not released_failure:
             post_overlap_note(db, number, rec)
-            record_hold(rec)
-        if host != "local" and terminal and not released_failure:
-            record_remote_review(db, number, rec, path)
         log("already settled", {"issue": number, "task": task, "dispatch": dispatch_id, "state": worker["state"]})
         with db:
             db.execute("UPDATE starts SET receipt='done' WHERE issue=?", (number,))
@@ -1421,7 +1430,6 @@ def reconcile_start(db, number, rec, actor):
             raise OrcaError(f"#{number} reserved: no Codex startup observation for {dispatch_id}")
         if prompt or wait:
             post_overlap_note(db, number, rec)
-            record_hold(rec)
             notice = {"issue": number, "task": task, "dispatch": dispatch_id, "prompt": prompt or wait}
             if rec.get("notice") != notice:
                 runtime("orchestration", "send", *actor, "--to", "run:" + rec["run"], "--type", "status",
@@ -1441,9 +1449,7 @@ def reconcile_start(db, number, rec, actor):
     if worker["state"] != "ready":
         raise OrcaError(f"#{number} reserved: inspect {dispatch_id}, worker state {worker['state']}")
     post_overlap_note(db, number, rec)
-    if host != "local":
-        record_remote_review(db, number, rec, path)
-    record_start(db, number, rec)
+    publish_start(db, number, rec)
     log("started", {"issue": number, "dispatch": dispatch_id})
 
 
@@ -1596,7 +1602,14 @@ def reviewer_spec(ticket, sha, same_model):
                if same_model else ""))
 
 
+def assign_coder(state, dispatch, terminal):
+    state.update(coder=dispatch, expected=dispatch, coder_terminal=terminal)
+
+
 def assign_reviewer(state, dispatch, terminal, hold):
+    if hold.get("account"):
+        record_hold(dict(hold, terminal=terminal))
+    state.pop("hold", None)
     state["expected"] = dispatch
     state["reviewer"] = {"dispatch": dispatch, "terminal": terminal, "holds": hold["holds"]}
     route = hold["route"]
@@ -1658,9 +1671,7 @@ def adopt_reviewer(db, run, ticket, state, messages):
             or tuple(effective.get(k) for k in ("agent", "model", "effort")) != route[:3]):
         raise error
     hold = state.get("hold")
-    if hold:
-        hold["terminal"] = terminal
-    else:
+    if not hold:
         with pick.edit_holds(pick.HOLDS) as holds:
             entry = holds.get(terminal)
         if (entry and entry.get("host", "local") == host
@@ -1689,8 +1700,39 @@ def coder_spec(ticket, stage, instructions):
             f"Issue {OWNER}/hr-relay#{ticket['number']}. Branch {ticket['branch']}, base {ticket['base']}.\n{instructions}")
 
 
-def finish_followup(state, stage, dispatch):
-    state["coder"] = state["expected"] = dispatch
+def followup_attempt(run, state, dispatch):
+    attempt = runtime("orchestration", "worker-show", "--dispatch", dispatch, "--full")["dispatch"]
+    if (attempt["id"], attempt["runId"]) != (dispatch, run):
+        raise OrcaError(f"unverified follow-up Dispatch {dispatch} in Run {run}")
+    host = state.get("host", "local")
+    if host != "local" and not attempt.get("assigneeHandle"):
+        execution = execution_worker_show(host, state["path"], dispatch)["dispatch"]
+        if (execution["id"], execution["taskId"]) != (dispatch, attempt["taskId"]):
+            raise OrcaError(f"unverified follow-up Dispatch {dispatch} on {host}")
+        attempt = dict(attempt, assigneeHandle=execution.get("assigneeHandle"))
+    return attempt
+
+
+def finish_followup(run, state, stage, attempt, previous):
+    import pick
+    dispatch = attempt["id"]
+    terminal = attempt.get("assigneeHandle")
+    if not terminal:
+        raise OrcaError(f"no terminal assigned to follow-up Dispatch {dispatch}")
+    if attempt.get("followUpOf") not in (None, previous):
+        raise OrcaError(f"follow-up Dispatch {dispatch} changed predecessor")
+    if previous == state["coder"]:
+        source = state.get("coder_terminal")
+        saved_hold = (state.get("followup") or {}).get("hold")
+    else:
+        source = followup_attempt(run, state, previous).get("assigneeHandle")
+        saved_hold = None
+    if source or saved_hold:
+        with pick.edit_holds(Path(state.get("holds") or pick.HOLDS)) as holds:
+            hold = holds.get(source) or saved_hold
+            if hold and hold.get("account") and hold.get("host", "local") == state.get("host", "local"):
+                holds.setdefault(terminal, hold)
+    assign_coder(state, dispatch, terminal)
     state["card_agent"] = state["agent"]
     if stage == "Fixing" and state.get("reviewer"):
         state["release"] = state.pop("reviewer")
@@ -1719,11 +1761,11 @@ def recover_followup(run, ticket, state, messages, message_id):
     dispatch = review_dispatch(run, task, state)
     if not dispatch:
         return False
-    attempt = runtime("orchestration", "worker-show", "--dispatch", dispatch, "--full")["dispatch"]
-    if (attempt["id"] != dispatch or attempt["taskId"] != task or attempt["runId"] != run
+    attempt = followup_attempt(run, state, dispatch)
+    if (attempt["taskId"] != task
             or not in_coder_chain(attempt.get("followUpOf"), state["coder"], run)):
         return False
-    finish_followup(state, stage, dispatch)
+    finish_followup(run, state, stage, attempt, attempt["followUpOf"])
     state.update(stage=stage, publish=True)
     return True
 
@@ -1888,7 +1930,8 @@ def review_step(db, run, actor, ticket, initial, messages):
     else:
         spec = coder_spec(ticket, stage, instructions)
         if stage != "Needs you":
-            state["followup"] = {"stage": stage, "spec": spec}
+            hold = (pick.account_usage.load_json(state.get("holds") or pick.HOLDS) or {}).get(state.get("coder_terminal"))
+            state["followup"] = {"stage": stage, "spec": spec, "hold": hold}
     # A lost response may already have launched a worker. Reserve before issuing the command.
     state["pending"] = message["id"]
     with db:
@@ -1911,7 +1954,6 @@ def review_step(db, run, actor, ticket, initial, messages):
             review_coordinator(db, run, number, state)
             raise OrcaError(f"#{number}: Orca confirmed no reviewer start effects: {e}") from e
         dispatch, terminal = start_identity(result)
-        state["hold"]["terminal"] = terminal
         assign_reviewer(state, dispatch, terminal, state["hold"])
         state.pop("review_title")
     elif stage == "Needs you":
@@ -1923,7 +1965,8 @@ def review_step(db, run, actor, ticket, initial, messages):
         # The Run home relays Dispatch-addressed mail to the coder's execution server.
         result = runtime("orchestration", "send", *actor, "--to", "dispatch:" + state["coder"],
                          "--subject", f"#{number}: {stage}", "--body", spec)
-        finish_followup(state, stage, followup_dispatch(result, state["coder"], run))
+        dispatch = followup_dispatch(result, state["coder"], run)
+        finish_followup(run, state, stage, followup_attempt(run, state, dispatch), result["followUpOf"])
     if stage == "Needs you" and state.get("reviewer"):
         state["release"] = state.pop("reviewer")
     state.pop("pending")
@@ -2604,11 +2647,11 @@ def watch_pass(args, db, actions, errors):
                                 effort=route[2], host="local", at=int(now))
         review = review_state(db, run, number) if number is not None else None
         if review and review.get("coder") == p["dispatch"]:
-            review.update(coder=new, expected=new, coder_terminal=handle)
+            assign_coder(review, new, handle)
             if review.get("agent"):
                 review["agent"] = card_agent(review["agent"], False, p["label"])
         elif review and (review.get("reviewer") or {}).get("dispatch") == p["dispatch"]:
-            review["reviewer"].update(dispatch=new, terminal=handle)
+            review["reviewer"].update(dispatch=new, terminal=handle, holds=str(holds_path))
             review["expected"] = new
         else:
             review = None
@@ -2687,7 +2730,7 @@ def watch_pass(args, db, actions, errors):
                     raise OrcaError(f"unverified follow-up {new} of {note['to']}")
                 terminal = start_identity(show["worker"])[1] if verified else handle
                 if coder:
-                    review.update(coder=new, expected=new, coder_terminal=terminal)
+                    assign_coder(review, new, terminal)
                 elif reviewer:
                     review["reviewer"].update(dispatch=new, terminal=terminal)
                     review["expected"] = new

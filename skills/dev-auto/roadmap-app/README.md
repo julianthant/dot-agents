@@ -30,7 +30,7 @@ job in the user GUI domain and confirm `/status` shows fresh source ages
 before enabling central reads in the tick and workers.
 
 The board polls `/data.json` every five seconds. The API also serves
-`GET /status`, `/issues`, `/project`, `/prs`, `/heads`,
+`GET /status`, `/issues` (or `/issues?number=...`), `/project`, `/prs`, `/heads`,
 `/runs?repo=hr-relay&sha=...` (or `branch`, or `id`), and
 `/jobs?repo=hr-relay&id=...&attempt=...`. The GitHub endpoints report
 `ageSeconds` and `stale`. A lookup may return `data: null` while pending.

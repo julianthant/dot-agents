@@ -5,8 +5,9 @@ ask it, not the operator.
 
 ## Start
 
-- Read the issue (`gh issue view <n>`), the repository's AGENTS.md and the nearest module
-  instructions. Load exactly the skills the issue names.
+- Read the issue from the roadmap's `GET /issues?number=<n>` endpoint and check that
+  `stale` is false. Read the repository's AGENTS.md and the nearest module instructions.
+  Load exactly the skills the issue names.
 - Work only in your worktree on your branch. Never edit another worktree, the main checkout or
   the live `~/.agents` checkout.
 - Stay inside the issue's owned paths. When the change needs a file outside them, keep that

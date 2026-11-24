@@ -2957,6 +2957,37 @@ with TemporaryDirectory() as tmp:
     f.status, f.state, f.liveness, f.failure = "failed", "failed", "exited", "agent process exited"
     assert f.tick() == [("orchestration", "task-list"), ("orchestration", "worker-list"),
                         ("orchestration", "worker-show")] and f.lines == ['watch        "no action"']
+
+# Hundreds of distinct historical Tasks must not delay watching the current worker.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    history = [{
+        "dispatchId": f"history-{i}", "taskId": f"old-task-{i}", "runId": "run",
+        "workerState": "failed", "dispatchStatus": "failed", "terminalState": "released",
+        "agentTerminalHandle": f"old-pane-{i}", "projection": {"host": {"kind": "local"}},
+    } for i in range(700)]
+    underlying = f.orca
+
+    def long_run(*args):
+        if args[:2] == ("orchestration", "worker-list") and "--cursor" in args:
+            f.events.append(args)
+            start = int(args[-1])
+            end = start + 100
+            return {"workers": history[start:end],
+                    "page": {"hasMore": end < len(history), "nextCursor": str(end)}}
+        if args[:2] == ("orchestration", "worker-list"):
+            return {**underlying(*args), "page": {"hasMore": True, "nextCursor": "0"}}
+        if args[:2] == ("orchestration", "worker-show") and args[3].startswith("history-"):
+            f.events.append(args)
+            return {"dispatch": {"id": args[3], "runId": "run"}}
+        return underlying(*args)
+
+    with patch.object(f, "orca", long_run):
+        calls = f.tick()
+    assert ("terminal", "read") in calls
+    shows = calls.count(("orchestration", "worker-show"))
+    assert shows <= 30, f"700 settled Dispatches produced {shows} worker-show calls"
+
 # A Merging coder that failed is still current when the review state names it: relaunched.
 with TemporaryDirectory() as tmp:
     f = Fleet(tmp, screen=CLAUDE_WORKING)

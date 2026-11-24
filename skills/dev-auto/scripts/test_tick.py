@@ -5,7 +5,7 @@ import subprocess
 import sys
 from contextlib import redirect_stderr, redirect_stdout
 from tempfile import TemporaryDirectory
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, patch
 
 import tick
 
@@ -840,7 +840,7 @@ with TemporaryDirectory() as tmp:
         check.assertEqual(calls, [("OPEN", None), ("OPEN", None), ("CLOSED", None)])  # two open pages, one full closed read
         with patch.object(tick.github_poller, "read", return_value=snap) as shared:
             tick.tickets(), tick.snapshot()
-            check.assertEqual(shared.call_args_list, [call("issues"), call("issues")])
+            check.assertEqual([request.args for request in shared.call_args_list], [("issues",), ("issues",)])
         check.assertEqual(len(calls), 3)
         clock[0] += 61
         snap = tick.refresh_snapshot()

@@ -501,6 +501,45 @@ class Roadmap(unittest.TestCase):
         clock[0] = 3701
         self.assertEqual((rest.budget()["callsLastHour"], rest.slowdown()), (0, 1))
 
+    def test_virtual_hour_with_ten_waiters_counts_upstream_calls(self):
+        now = 1_000
+        start = now
+        counts = {"calls": 0, "modified": 0}
+        waiters = {(repo, f"{i + 10:040x}") for repo in github_poller.REPOS for i in range(5)}
+
+        def upstream(argv, **_):
+            counts["calls"] += 1
+            path = argv[-1]
+            repo = next((repo for repo, url in RUNS.items() if url == path), None)
+            if repo:
+                tag = f"{repo}-{(now - start) // 30}"
+                payload = {"workflow_runs": [{"id": i, "head_sha": sha, "status": "in_progress"}
+                                             for i, (name, sha) in enumerate(sorted(waiters), 1) if name == repo]}
+            else:
+                tag = "release"
+                payload = {"total_count": 7} if path == SEARCH else REST[path.split("/", 3)[-1]]
+            if "-H" in argv and argv[argv.index("-H") + 1] == f'If-None-Match: W/"{tag}"':
+                return subprocess.CompletedProcess(argv, 1, "HTTP/2.0 304 Not Modified\r\n\r\n", "")
+            counts["modified"] += 1
+            return subprocess.CompletedProcess(argv, 0, R200.format(tag=tag, body=json.dumps(payload)), "")
+
+        poller = github_poller.Poller(clock=lambda: now, rest=github_poller.Rest(clock=lambda: now, run=upstream))
+        for elapsed in range(0, 3600, 5):
+            now = start + elapsed
+            poller.poll_runs()
+            poller.poll_details()
+            if elapsed % 30 == 0:
+                roadmap.pipeline(poller)
+            for repo, sha in waiters:
+                answer = poller.read("runs", {"repo": repo, "sha": sha})
+                self.assertFalse(answer["stale"])
+                self.assertEqual(answer["data"][0]["head_sha"], sha)
+        self.assertEqual(counts, {"calls": 2040, "modified": 245})
+        status = poller.status()
+        self.assertEqual((status["callsLastHour"], status["notModifiedLastHour"]), (2040, 1795))
+        print("Quota fixture, 10 waiting workers over 1 virtual hour: "
+              "2040 shared REST GETs, 1795 HTTP 304s, 245 HTTP 200s.")
+
     def test_ci_wait_fails_closed_on_stale_and_unreachable(self):
         script = Path(tick.__file__).with_name("ci-wait")
         command = [sys.executable, script, "--repo", "hr-relay", "a" * 40]

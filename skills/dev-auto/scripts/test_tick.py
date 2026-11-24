@@ -920,7 +920,11 @@ with TemporaryDirectory() as tmp:
 built.pop("generated")
 check.assertIsNotNone(built.pop("githubFetchedAt"))
 for card in built["issues"]:
-    check.assertIsNone(card.pop("now"))
+    live = card.pop("now")
+    if card["n"] == 11:
+        check.assertEqual((live["stage"], live["pr"]["n"]), (3, 21))
+    else:
+        check.assertIsNone(live)
     if card["open"] and card["type"] == "Task":
         check.assertFalse(card.pop("ready"))
         check.assertEqual(card.pop("holdReason"), "readiness unavailable")

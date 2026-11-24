@@ -14,6 +14,7 @@ type NowState = {
 }
 export type Data = {
   generated?: string; githubFetchedAt?: string | null; areas: string[]; milestones?: string[]; issues: Issue[]
+  githubStatus?: { limitedUntil: number | null }
   pipeline: {
     devPrs?: DevPr[]; mergedSinceRelease?: number; devAheadOfStaging?: number | null; devAheadOfMain?: number | null
     stagingPr?: { n: number; head: string; checks: string }[]; release?: { tagName: string | null; publishedAt: string | null }

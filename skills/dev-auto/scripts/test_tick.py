@@ -1035,9 +1035,8 @@ def report(dispatch, body, kind="worker_done", msg_id="report"):
                 "payload": json.dumps({"taskId": "task", "dispatchId": dispatch, "outcome": "succeeded"})}
 
 recorded = report("coder", f"I pushed {sha} with host-local account selection.")
-assert tick.review_mail([recorded], "coder") == [recorded]
-assert not tick.review_mail([report("coder", sha, "question"), recorded], "other")
-assert not tick.review_mail([report("coder", sha, "question")], "coder")
+mailbox = tick.ReviewMailbox(sqlite3.connect(":memory:"), "run", [report("other", sha, "question"), recorded])
+assert mailbox.successes == {"coder": [recorded]}
 
 assert tick.review_route("Coder: codex / gpt-6.2-sol / medium. Reviewer: none (UI, simple; green task CI clears it). Tier: UI, simple.") is None
 check.assertEqual(tick.review_route("Reviewer: Claude Sonnet 5.5 medium with Opus advisor"),
@@ -1423,7 +1422,7 @@ with patch.object(tick, "tickets", return_value=[ticket]), patch.object(tick, "s
                            "worker": {"worktreeId": "tree", "startOptions": {"launch": {"effective": {"model": "gpt-6.2-sol"}}}}},
                        {"worktree": {"id": "tree", "path": "/fixture", "branch": "refs/heads/task/ui/header"}}]
     tick.review_tick(args, sqlite3.connect(":memory:"))
-    assert step.call_args.args[-1] == [recorded] and step.call_args.args[-2]["expected"] == "coder"
+    assert step.call_args.args[-1].successes["coder"] == [recorded] and step.call_args.args[-2]["expected"] == "coder"
     assert cli.call_args_list[0].args == ("orchestration", "inbox", "--terminal", "run:run", "--limit", "10000", "--full")
 
 # Bug 3 (#488, #517): restarts left two "#41 coder" Tasks; the one whose attempt reported is reviewed.
@@ -1461,7 +1460,7 @@ for pending in (False, True):
     ticket, state = review_fixture()
     state.update(coder_terminal="old-pane")
     original = dict(recorded, created_at="2026-11-23T08:00:00Z")
-    manual = dict(report("manual", "red at the old head", msg_id="manual-report"), sequence=3,
+    manual = dict(report("manual", "red at the old head", msg_id="manual-report"), sequence=3, subject="#41 follow-up",
                   from_handle="manual-pane",
                   payload={"taskId": "manual-task", "dispatchId": "manual", "outcome": "succeeded"})
 
@@ -1535,6 +1534,21 @@ for tier, accepted in [("backend, hard", False), ("UI, multi-step", True)]:
         else:
             with check.assertRaisesRegex(tick.OrcaError, "different model"):
                 tick.review_step(db, "run", [], trial, state, [recorded])
+
+# Close and fill must see a worker started after watch loaded the Run's inventory.
+ticket, state = review_fixture()
+workers = tick.WorkerInventory("run")
+reader = {"dispatchId": "reader"}
+with sqlite3.connect(":memory:") as db, patch.object(tick, "green_report", return_value=sha), \
+        patch.object(tick, "review_account", return_value={"id": "seat", "label": "review"}), \
+        patch.object(tick, "held_label", return_value="coder"), patch.object(tick, "worker_settings"), \
+        patch.object(tick, "record_hold"), patch.object(tick, "review_card"), patch.object(tick, "runtime", side_effect=[
+            {"workers": [], "page": {"hasMore": False}}, {}, {"claude": {"activeAccountId": "seat"}},
+            full_start("reader", "pane"), {"workers": [reader], "page": {"hasMore": False}},
+        ]):
+    assert workers.rows == ()
+    tick.review_step(db, "run", [], ticket, state, [recorded], inventory=workers)
+    assert workers.rows == (reader,)
 
 # Recover a pre-upgrade reservation whose start succeeded, then retire that reviewer on FIX.
 import pick
@@ -2674,7 +2688,8 @@ with TemporaryDirectory() as tmp:
     f.db.execute("INSERT OR REPLACE INTO watch VALUES ('run','term_follow',?)", (json.dumps({"handoff": 1}),))
     done = {"type": "worker_done", "id": "m1", "sequence": 9,
             "payload": json.dumps({"dispatchId": "ctx_follow", "outcome": "failed"})}
-    assert tick.failed_reviews(f.db, "run", tick.review_state(f.db, "run", 553), [done]) == []
+    assert tick.failed_reviews(f.db, "run", tick.review_state(f.db, "run", 553),
+                               tick.ReviewMailbox(f.db, "run", [done])) == []
 
 # The settled-worker send applies but its reply is lost: the next tick adopts the follow-up Orca started instead of
 # sending again, even after Orca retried that Task. With no review state yet, the follow-up is recorded for review's
@@ -2771,7 +2786,7 @@ for current in ("follow", "follow_retry"):
             patch.object(tick, "command", return_value="https://github.com/julianthant/hr-relay.git\n"), \
             patch.object(tick, "review_step") as step, patch.object(tick, "runtime", discovery):
         tick.review_tick(args, db)
-        assert step.call_args.args[-2]["expected"] == current and step.call_args.args[-1] == [followed_report]
+        assert step.call_args.args[-2]["expected"] == current and step.call_args.args[-1].successes[current] == [followed_report]
 
 # Bug 3: an older coder Task's success report does not outrank the follow-up's root, which has no report; a
 # Task with no Dispatch is skipped, and the next issue still runs.
@@ -3002,6 +3017,49 @@ for title, follow_of, orig, parent, want in (("#553 coder", None, None, None, ("
         f.tick()
         start = next(e for e in f.events if e[:2] == ("orchestration", "worker-start"))
         assert (start[start.index("--model") + 1], start[start.index("--effort") + 1]) == want, start
+
+# The original's cached route and its parent's cached role survive release, while a changed status forces a new read.
+for status, expected_route in (("completed", ("gpt-6.2-sol", "xhigh")), ("failed", ("gpt-6.2-astra", "high"))):
+    with TemporaryDirectory() as tmp:
+        f = Fleet(tmp, "codex", None, CODEX_AT_LIMIT)
+        f.title, f.follow_of, f.orig_title, f.orig_parent = "#553: resume", "ctx_orig", "#553: resume", "ctx_root"
+        f.ticket["route"] = ("codex", "gpt-6.2-astra", "medium", None)
+        underlying = f.orca
+        originals = [
+            {"dispatchId": "ctx_orig", "taskId": "task_orig", "runId": "run", "agentTerminalHandle": None,
+             "terminalState": "released", "dispatchStatus": status, "projection": {"host": {"kind": "local"}}},
+            {"dispatchId": "ctx_root", "taskId": "task_root", "runId": "run", "agentTerminalHandle": None,
+             "terminalState": "released", "dispatchStatus": "completed", "projection": {"host": {"kind": "local"}}},
+        ]
+
+        def released_fact(row, state, route=()):
+            dispatch = {"id": row["dispatchId"], "taskId": row["taskId"], "runId": "run", "status": state}
+            if row["dispatchId"] == "ctx_orig":
+                dispatch["followUpOf"] = "ctx_root"
+            return {"dispatch": dispatch, "projection": {"resource": {"releaseState": "released"}},
+                    "worker": {"startOptions": {"launch": {"effective":
+                        dict(zip(("agent", "model", "effort"), route))}}}}
+
+        history = tick.ReleasedDispatchHistory(f.db, "run")
+        for row in originals:
+            completed = dict(row, dispatchStatus="completed")
+            history.remember(completed, released_fact(completed, "completed", ("codex", "gpt-6.2-sol", "xhigh")))
+
+        def history_runtime(*args):
+            if args[:2] == ("orchestration", "worker-list"):
+                out = underlying(*args)
+                return {**out, "workers": [*out["workers"], *originals]}
+            if args[:2] == ("orchestration", "worker-show") and args[3] == "ctx_orig":
+                f.events.append(args)
+                return released_fact(originals[0], status, ("codex", "gpt-6.2-astra", "high"))
+            return underlying(*args)
+
+        with patch.object(f, "orca", history_runtime):
+            f.tick()
+        reads = [e[3] for e in f.events if e[:2] == ("orchestration", "worker-show")]
+        assert "ctx_root" not in reads and reads.count("ctx_orig") == int(status == "failed"), reads
+        start = next(e for e in f.events if e[:2] == ("orchestration", "worker-start"))
+        assert (start[start.index("--model") + 1], start[start.index("--effort") + 1]) == expected_route, start
 
 # Bug 1: after an Orca restart the crashed worker's Task is ready again; it starts without --retry-of and is adopted.
 with TemporaryDirectory() as tmp:

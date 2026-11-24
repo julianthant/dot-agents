@@ -284,7 +284,7 @@ def start(repo, path):
         finish(st, e)
 
 
-def in_coder_chain(dispatch, previous, run):
+def in_coder_chain(dispatch, previous, run, *, read=None):
     seen = set()
     while dispatch and dispatch not in seen:
         if dispatch == previous:
@@ -292,7 +292,7 @@ def in_coder_chain(dispatch, previous, run):
         if not run:
             break
         seen.add(dispatch)
-        attempt = runtime("orchestration", "worker-show", "--dispatch", dispatch, "--full")["dispatch"]
+        attempt = (read or inspect_worker)(dispatch)["dispatch"]
         if attempt["id"] != dispatch or attempt["runId"] != run:
             break
         dispatch = attempt.get("retryOfDispatchId") or attempt.get("followUpOf")
@@ -1411,6 +1411,9 @@ class WorkerInventory:
             raise self._listing
         return self._listing
 
+    def invalidate(self):
+        self.__dict__.pop("_listing", None)
+
 
 def pass_workers(run, inventory):
     if inventory is None:
@@ -1430,6 +1433,61 @@ def inspect_worker(dispatch):
 
 def released_worker(worker):
     return worker.get("terminalState") == "released" and worker["dispatchStatus"] in ("completed", "failed")
+
+
+class ReleasedDispatchHistory:
+    def __init__(self, db, run):
+        self.db = db
+        self.run = run
+
+    @cached_property
+    def facts(self):
+        self.db.execute("CREATE TABLE IF NOT EXISTS released_dispatches (run TEXT, dispatch TEXT, status TEXT, facts TEXT,"
+                        " PRIMARY KEY(run,dispatch,status))")
+        return {(dispatch, status): json.loads(facts) for dispatch, status, facts in self.db.execute(
+            "SELECT dispatch,status,facts FROM released_dispatches WHERE run=?", (self.run,))}
+
+    def cached(self, worker):
+        if worker and released_worker(worker):
+            facts = self.facts.get((worker["dispatchId"], worker["dispatchStatus"]))
+            if facts and (facts["dispatch"]["id"], facts["dispatch"]["runId"], facts["dispatch"]["taskId"]) == (
+                    worker["dispatchId"], self.run, worker["taskId"]):
+                return facts
+        return None
+
+    def remember(self, worker, show):
+        dispatch = show["dispatch"]
+        receipt = show.get("worker") or {}
+        if (not released_worker(worker) or dispatch.get("status") != worker["dispatchStatus"]
+                or ((show.get("projection") or {}).get("resource") or {}).get("releaseState") != "released"):
+            return
+        key = (dispatch["id"], dispatch["status"])
+        report = failure_of(show)
+        reported = isinstance(report, dict) and report.get("provenance") == "worker_report"
+        checkpoint = reported and report.get("outcome") == "failed" and report.get("reportPath")
+        effective = ((receipt.get("startOptions") or {}).get("launch") or {}).get("effective") or {}
+        facts = {
+            "dispatch": {k: dispatch.get(k) for k in ("id", "runId", "taskId", "followUpOf", "retryOfDispatchId")},
+            "worker": {"startOptions": {"launch": {"effective":
+                {k: effective.get(k) for k in ("agent", "model", "effort")}}}},
+            "finished": not checkpoint and (dispatch["status"] != "failed" or reported or receipt.get("state") == "stopped"),
+        }
+        if self.facts.get(key) != facts:
+            with self.db:
+                self.db.execute("INSERT OR REPLACE INTO released_dispatches VALUES (?,?,?,?)",
+                                (self.run, *key, json.dumps(facts)))
+            self.facts[key] = facts
+
+    def read(self, dispatch, worker):
+        if facts := self.cached(worker):
+            return facts
+        show = inspect_worker(dispatch)
+        if worker and released_worker(worker):
+            attempt = show["dispatch"]
+            if (attempt["id"], attempt["runId"], attempt["taskId"]) != (dispatch, self.run, worker["taskId"]):
+                raise OrcaError("Dispatch identity changed")
+            self.remember(worker, show)
+        return show
 
 
 def remote_start_dispatch(run, task, host, inventory=None):
@@ -1646,22 +1704,92 @@ def mail_payload(message):
     return json.loads(payload) if isinstance(payload, str) else payload
 
 
-def review_mail(messages, dispatch):
-    reports = []
-    for message in messages:
-        if message["type"] != "worker_done":
-            continue
-        payload = mail_payload(message)
-        if payload.get("dispatchId") == dispatch and payload.get("outcome") == "succeeded":
-            reports.append(message)
-    return sorted(reports, key=lambda m: m["sequence"])
+class ReviewMailbox:
+    def __init__(self, db, run, messages, tasks=(), inventory=None):
+        self.history = ReleasedDispatchHistory(db, run)
+        self.inventory = inventory
+        self.successes, self.failures = {}, {}
+        self.by_task, self.by_terminal, self.by_issue, self.issue_tasks = {}, {}, {}, {}
+        self.last_success = -1
+        for task in tasks:
+            title = task.get("task_title") or task.get("title") or ""
+            issue = re.search(r"#(\d+)\b", title) or re.search(r"hr-relay ?#(\d+)\b", task.get("spec") or "")
+            if issue:
+                self.issue_tasks.setdefault(int(issue[1]), set()).add(task["id"])
+        for message in sorted(messages, key=lambda m: m["sequence"]):
+            if message["type"] != "worker_done":
+                continue
+            payload = mail_payload(message)
+            dispatch, outcome = payload.get("dispatchId"), payload.get("outcome")
+            if not dispatch:
+                continue
+            if outcome == "failed":
+                self.failures.setdefault(dispatch, []).append(message)
+            if outcome != "succeeded":
+                continue
+            self.successes.setdefault(dispatch, []).append(message)
+            self.last_success = message["sequence"]
+            if task := payload.get("taskId"):
+                self.by_task.setdefault(task, set()).add(dispatch)
+            if terminal := message.get("from_handle"):
+                self.by_terminal.setdefault(terminal, set()).add(dispatch)
+            if issue := re.search(r"#(\d+)\b", message.get("subject") or ""):
+                self.by_issue.setdefault(int(issue[1]), set()).add(dispatch)
+
+    def related(self, state, number, latest):
+        run = self.history.run
+        workers = {w["dispatchId"]: w for w in (self.inventory.rows if self.inventory else ())
+                   if w.get("runId", run) == run}
+        coder = state["coder"]
+        task_ids = set(self.issue_tasks.get(number, ()))
+        coder_worker = workers.get(coder, {})
+        if task := coder_worker.get("taskId"):
+            task_ids.add(task)
+        if latest and (task := mail_payload(latest).get("taskId")):
+            task_ids.add(task)
+        terminals = {state.get("coder_terminal"), latest.get("from_handle")}
+        if terminal := coder_worker.get("agentTerminalHandle"):
+            terminals.add(terminal)
+        terminals.discard(None)
+        related = set(self.by_issue.get(number, ()))
+        for terminal in terminals:
+            related.update(self.by_terminal.get(terminal, ()))
+        for task in task_ids:
+            related.update(self.by_task.get(task, ()))
+
+        def worktree(worker):
+            return (((worker.get("projection") or {}).get("workspace") or {}).get("id")
+                    or (worker.get("resource") or {}).get("worktreeId"))
+
+        coder_worktree = worktree(coder_worker)
+        children = {}
+        for dispatch, worker in workers.items():
+            resource = worker.get("resource") or {}
+            workspace = worktree(worker)
+            if (worker.get("taskId") in task_ids or worker.get("agentTerminalHandle") in terminals
+                    or (workspace and (workspace == coder_worktree
+                                       or state.get("path") in (workspace, workspace.partition("::")[2])))):
+                related.add(dispatch)
+            facts = self.history.cached(worker)
+            attempt = facts["dispatch"] if facts else {}
+            parent = attempt.get("retryOfDispatchId") or attempt.get("followUpOf") or resource.get("originDispatchId")
+            if parent and parent != dispatch:
+                children.setdefault(parent, set()).add(dispatch)
+        # The inventory and saved lineage only nominate candidates. Orca's ancestry still decides ownership.
+        known, pending = {coder}, [coder]
+        while pending:
+            for child in children.get(pending.pop(), ()):
+                if child not in known:
+                    known.add(child)
+                    pending.append(child)
+        return workers, (related | known) - {coder}
 
 
 CHECKPOINT_HANDOFF = "handed off with a checkpoint"
 USAGE_REPORT = re.compile(r"\b(?:usage|rate|5[- ]?hour|5h|weekly|session)\s+limit\b", re.IGNORECASE)
 
 
-def failed_reviews(db, run, state, messages):
+def failed_reviews(db, run, state, mailbox):
     """The reviewer's failed reports, except while watch restarts it from a handoff."""
     terminal = (state.get("reviewer") or {}).get("terminal")
     if db.execute("SELECT 1 FROM sqlite_master WHERE name='watch'").fetchone():
@@ -1670,26 +1798,33 @@ def failed_reviews(db, run, state, messages):
         pending = watch.get("pending")
         if watch.get("handoff") or (pending and not pending.get("crash")):
             return []
-    return [m for m in messages if m["type"] == "worker_done" and mail_payload(m).get("outcome") == "failed"
-            and mail_payload(m).get("dispatchId") == state["expected"]]
+    return mailbox.failures.get(state["expected"], [])
 
 
-def latest_coder_report(state, run, messages, handled=()):
-    reports = review_mail(messages, state["coder"])
+def latest_coder_report(state, number, mailbox, handled, *, after=-1):
+    reports = mailbox.successes.get(state["coder"], ())
     latest = reports[-1] if reports else {}
-    terminal = latest.get("from_handle") or state.get("coder_terminal")
-    for message in sorted(messages, key=lambda m: m["sequence"], reverse=True):
-        if latest and message["sequence"] <= latest["sequence"]:
-            break
-        payload = mail_payload(message) if message["type"] == "worker_done" else {}
-        dispatch = payload.get("dispatchId")
-        if not dispatch or payload.get("outcome") != "succeeded" or dispatch == state["coder"] or message["id"] in handled:
-            continue
-        if in_coder_chain(dispatch, state["coder"], run):
-            state["coder"] = state["expected"] = dispatch
-            state["coder_terminal"] = message.get("from_handle") or terminal
-            return [message]
-    return [latest] if latest else []
+    cutoff = max(after, latest.get("sequence", -1))
+    if mailbox.last_success > cutoff:
+        workers, related = mailbox.related(state, number, latest)
+        candidates = []
+        for dispatch in related:
+            for message in reversed(mailbox.successes.get(dispatch, ())):
+                if message["sequence"] <= cutoff:
+                    break
+                if message["id"] not in handled:
+                    candidates.append((dispatch, message))
+                    break
+
+        def read(dispatch):
+            return mailbox.history.read(dispatch, workers.get(dispatch))
+
+        for dispatch, message in sorted(candidates, key=lambda row: row[1]["sequence"], reverse=True):
+            if in_coder_chain(dispatch, state["coder"], mailbox.history.run, read=read):
+                terminal = message.get("from_handle") or latest.get("from_handle") or state.get("coder_terminal")
+                assign_coder(state, dispatch, terminal)
+                return [message]
+    return [latest] if latest and latest["sequence"] > after else []
 
 
 def green_report(ticket, body):
@@ -1768,11 +1903,11 @@ def review_dispatch(run, task, state, inventory=None):
     return (runtime("orchestration", "dispatch-show", "--task", task, "--full").get("dispatch") or {}).get("id")
 
 
-def adopt_reviewer(db, run, ticket, state, messages, inventory=None):
+def adopt_reviewer(db, run, ticket, state, mailbox, inventory=None):
     import pick
     number = ticket["number"]
     error = UncertainReview(f"inspect uncertain Orca action for message {state['pending']} before continuing")
-    report = next((m for m in review_mail(messages, state["coder"]) if m["id"] == state["pending"]), None)
+    report = next((m for m in mailbox.successes.get(state["coder"], ()) if m["id"] == state["pending"]), None)
     if not report or not state.get("sha") or state["stage"] not in ("Coding", "Fixing") or not report.get("created_at"):
         raise error
     # Older reservations stored only the message ID. Match the original task spec and creation time.
@@ -1787,10 +1922,9 @@ def adopt_reviewer(db, run, ticket, state, messages, inventory=None):
                and t["created_at"].replace(" ", "T")[:19] >= report["created_at"][:19]]
     if not matches:
         # A newer report can supersede the reservation once the Run shows no matching reviewer Task.
-        newer = [m for m in messages if m["sequence"] > report["sequence"]]
         handled = {i for (i,) in db.execute("SELECT id FROM review_mail WHERE run=?", (run,))}
         coder = state["coder"]
-        if latest_coder_report(state, run, newer, handled) and state["coder"] != coder:
+        if latest_coder_report(state, number, mailbox, handled, after=report["sequence"]) and state["coder"] != coder:
             for key in ("pending", "review_title", "hold", "followup"):
                 state.pop(key, None)
             save_review(db, run, number, state)
@@ -1893,8 +2027,8 @@ def finish_followup(run, state, stage, attempt, previous):
     state.pop("followup", None)
 
 
-def recover_followup(run, ticket, state, messages, message_id):
-    report = next((m for m in review_mail(messages, state["expected"]) if m["id"] == message_id), None)
+def recover_followup(run, ticket, state, mailbox, message_id):
+    report = next((m for m in mailbox.successes.get(state["expected"], ()) if m["id"] == message_id), None)
     if not report or not report.get("created_at"):
         return False
     followup = state.get("followup")
@@ -1969,15 +2103,16 @@ def review_step(db, run, actor, ticket, initial, messages, *, inventory=None):
     number = ticket["number"]
     state = review_state(db, run, number) or initial.copy()
     host = state.get("host", "local")
+    mailbox = messages if isinstance(messages, ReviewMailbox) else ReviewMailbox(db, run, messages, inventory=inventory)
     db.execute("CREATE TABLE IF NOT EXISTS review_mail (run TEXT, id TEXT, PRIMARY KEY(run,id))")
     reservation = state.get("pending") or state.get("released")
     if reservation:
-        if recover_followup(run, ticket, state, messages, reservation):
+        if recover_followup(run, ticket, state, mailbox, reservation):
             state.pop("pending", None)
             state.pop("released", None)
             save_review(db, run, number, state)
         elif state.get("pending"):
-            adopt_reviewer(db, run, ticket, state, messages, inventory)
+            adopt_reviewer(db, run, ticket, state, mailbox, inventory)
         else:
             state.pop("released")
             state.pop("followup", None)
@@ -1991,9 +2126,9 @@ def review_step(db, run, actor, ticket, initial, messages, *, inventory=None):
         return
     if resume_pending(db, run, number, {state["coder"], state["expected"]}):
         return
-    reports = (sorted(review_mail(messages, state["expected"]) + failed_reviews(db, run, state, messages),
+    reports = (sorted(mailbox.successes.get(state["expected"], []) + failed_reviews(db, run, state, mailbox),
                       key=lambda m: m["sequence"]) if state["stage"] == "Reviewing"
-               else latest_coder_report(state, run, messages,
+               else latest_coder_report(state, number, mailbox,
                                         {i for (i,) in db.execute("SELECT id FROM review_mail WHERE run=?", (run,))}))
     for message in reports:
         if not db.execute("SELECT 1 FROM review_mail WHERE run=? AND id=?", (run, message["id"])).fetchone():
@@ -2093,6 +2228,8 @@ def review_step(db, run, actor, ticket, initial, messages, *, inventory=None):
         db.execute("INSERT OR REPLACE INTO reviews VALUES (?,?,?)", (run, number, json.dumps(state)))
     state["card_agent"] = state["agent"]
     if account:
+        if inventory is not None:
+            inventory.invalidate()  # A lost response can still leave a new worker for close to see.
         try:
             result = runtime("orchestration", "worker-start", *actor, *(("--on", host) if host != "local" else ()),
                              "--worktree", "path:" + state["path"],
@@ -2117,6 +2254,8 @@ def review_step(db, run, actor, ticket, initial, messages, *, inventory=None):
         state["card_agent"] = "coordinator"
     else:
         # The Run home relays Dispatch-addressed mail to the coder's execution server.
+        if inventory is not None:
+            inventory.invalidate()
         result = runtime("orchestration", "send", *actor, "--to", "dispatch:" + state["coder"],
                          "--subject", f"#{number}: {stage}", "--body", spec)
         dispatch = followup_dispatch(result, state["coder"], run)
@@ -2138,6 +2277,7 @@ def review_tick(args, db):
     if len(messages) >= 10000 or inbox.get("truncated"):
         raise OrcaError("incomplete Run mailbox")
     tasks = runtime("orchestration", "task-list", *(actor or ["--run", run]))["tasks"]
+    mailbox = ReviewMailbox(db, run, messages, tasks, inventory)
     failures = []
     for ticket in tickets():
         number = ticket["number"]
@@ -2169,7 +2309,7 @@ def review_tick(args, db):
                     if not attempts:
                         continue
                     # Restarts can leave several coder Tasks: the newest succeeded report names the current one.
-                    task_id = max(attempts, key=lambda i: max((m["sequence"] for m in review_mail(messages, attempts[i])),
+                    task_id = max(attempts, key=lambda i: max((m["sequence"] for m in mailbox.successes.get(attempts[i], ())),
                                                               default=-1))
                     dispatch = attempts[task_id]
                     if db.execute("SELECT 1 FROM sqlite_master WHERE name='followups'").fetchone():
@@ -2182,7 +2322,7 @@ def review_tick(args, db):
                             current = (runtime("orchestration", "dispatch-show", "--task", task, "--full")["dispatch"]
                                        or {}).get("id")
                             followed, dispatch = row[0], current
-                if not review_mail(messages, dispatch):
+                if not mailbox.successes.get(dispatch):
                     if args.coder:
                         log("review", {"issue": number, "waiting": f"no succeeded report from {dispatch}"})
                     continue
@@ -2211,7 +2351,7 @@ def review_tick(args, db):
                     raise OrcaError(f"cannot locate coder Dispatch {state['coder']} in the Run's worker inventory")
                 state["host"] = worker_host(worker)
                 save_review(db, run, number, state)
-            review_step(db, run, actor, ticket, state, messages, inventory=inventory)
+            review_step(db, run, actor, ticket, state, mailbox, inventory=inventory)
         except UncertainReview as e:
             log("Needs you", {"issue": number, "reason": str(e)})
         except (OrcaError, OSError, KeyError, ValueError, subprocess.TimeoutExpired) as e:
@@ -2650,47 +2790,10 @@ def watch_pass(args, db, actions, errors, reads):
     saved = dict(db.execute("SELECT terminal,state FROM watch WHERE run=?", (run,)))
     db.execute("CREATE TABLE IF NOT EXISTS watch_replaced (run TEXT, dispatch TEXT, PRIMARY KEY(run,dispatch))")
     replaced = {row[0] for row in db.execute("SELECT dispatch FROM watch_replaced WHERE run=?", (run,))}
-    db.execute("CREATE TABLE IF NOT EXISTS released_dispatches (run TEXT, dispatch TEXT, status TEXT, facts TEXT,"
-               " PRIMARY KEY(run,dispatch,status))")
-    settled = {(dispatch, status): json.loads(facts) for dispatch, status, facts in
-               db.execute("SELECT dispatch,status,facts FROM released_dispatches WHERE run=?", (run,))}
-
-    def remember_released(w, show):
-        dispatch = show["dispatch"]
-        worker = show.get("worker") or {}
-        if (not released_worker(w) or dispatch["status"] != w["dispatchStatus"]
-                or ((show.get("projection") or {}).get("resource") or {}).get("releaseState") != "released"):
-            return
-        key = (dispatch["id"], dispatch["status"])
-        report = failure_of(show)
-        reported = isinstance(report, dict) and report.get("provenance") == "worker_report"
-        checkpoint = reported and report.get("outcome") == "failed" and report.get("reportPath")
-        effective = ((worker.get("startOptions") or {}).get("launch") or {}).get("effective") or {}
-        facts = {
-            "dispatch": {k: dispatch.get(k) for k in ("id", "runId", "taskId", "followUpOf", "retryOfDispatchId")},
-            "worker": {"startOptions": {"launch": {"effective":
-                {k: effective.get(k) for k in ("agent", "model", "effort")}}}},
-            "finished": not checkpoint and (dispatch["status"] != "failed" or reported or worker.get("state") == "stopped"),
-        }
-        if settled.get(key) != facts:
-            with db:
-                db.execute("INSERT OR REPLACE INTO released_dispatches VALUES (?,?,?,?)",
-                           (run, *key, json.dumps(facts)))
-            settled[key] = facts
+    released_history = ReleasedDispatchHistory(db, run)
 
     def history_of(dispatch):
-        w = roster_by_dispatch.get(dispatch)
-        if w and released_worker(w):
-            key = (dispatch, w["dispatchStatus"])
-            if key in settled:
-                return settled[key]
-            show = inspect_worker(dispatch)
-            attempt = show["dispatch"]
-            if (attempt["id"], attempt["runId"], attempt["taskId"]) != (dispatch, run, w["taskId"]):
-                raise OrcaError("Dispatch identity changed")
-            remember_released(w, show)
-            return show
-        return inspect_worker(dispatch)
+        return released_history.read(dispatch, roster_by_dispatch.get(dispatch))
 
     def save(terminal, state, *, replaced_dispatch=None):
         with db:
@@ -3191,7 +3294,7 @@ def watch_pass(args, db, actions, errors, reads):
         title = task.get("task_title") or ""
         ticket = cards.get(number)
         try:
-            facts = settled.get((dispatch, w["dispatchStatus"])) if released_worker(w) else None
+            facts = released_history.cached(w)
             if facts and facts["finished"] and not (state.get("pending") or state.get("handoff")):
                 restore_prompt(ticket, state, title)
                 keep = state.get("coordinator") or state.get("note") or state.get("card")
@@ -3206,7 +3309,7 @@ def watch_pass(args, db, actions, errors, reads):
             worktree = (show.get("worker") or {}).get("worktreeId") or ""
             if Path(worktree.partition("::")[2]).parent == research:
                 continue
-            remember_released(w, show)
+            released_history.remember(w, show)
             hold = (holds.get(terminal) or {}).get("account")
             if hold and state.get("account") != hold:
                 state["account"] = hold

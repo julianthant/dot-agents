@@ -110,7 +110,7 @@ Do NOT close or modify any parent issue.
 Outcome: the end-to-end behaviour this ticket makes work, from the user's perspective, not a layer-by-layer implementation list.
 Stop when: the point at which the worker is done (for example: checks pass and the work is committed).
 Owned paths: the repo-relative paths this worker may change.
-Branch: `task/<feature>/<lane>` · Feature branch: `feature/<feature>`
+Branch: `task/<feature>/<lane>`
 Checks: the commands that prove the outcome.
 Do not touch: paths, systems and decisions outside this ticket.
 Acceptance:

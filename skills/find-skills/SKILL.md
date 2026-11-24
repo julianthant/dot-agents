@@ -1,6 +1,9 @@
 ---
 name: find-skills
-description: Helps users discover and install agent skills when they ask questions like "how do I do X", "find a skill for X", "is there a skill that can...", or express interest in extending capabilities. This skill should be used when the user is looking for functionality that might exist as an installable skill.
+description: >-
+  Use this skill when the user explicitly searches for an installable skill
+  ("find a skill", "is there a skill", "install a skill from skills.sh").
+  Not for doing the task (how, or the domain skill).
 ---
 
 # Find Skills
@@ -9,14 +12,12 @@ This skill helps you discover and install skills from the open agent skills ecos
 
 ## When to Use This Skill
 
-Use this skill when the user:
+Use this skill only when the user explicitly searches for an installable skill:
 
-- Asks "how do I do X" where X might be a common task with an existing skill
 - Says "find a skill for X" or "is there a skill for X"
-- Asks "can you do X" where X is a specialized capability
-- Expresses interest in extending agent capabilities
-- Wants to search for tools, templates, or workflows
-- Mentions they wish they had help with a specific domain (design, testing, deployment, etc.)
+- Asks to install a skill from skills.sh
+
+Not for doing the task (how, or the domain skill).
 
 ## What is the Skills CLI?
 
@@ -34,7 +35,7 @@ The Skills CLI (`npx skills`) is the package manager for the open agent skills e
 
 ### Step 1: Understand What They Need
 
-When a user asks for help with something, identify:
+When the user is searching for an installable skill, identify:
 
 1. The domain (e.g., React, testing, design, deployment)
 2. The specific task (e.g., writing tests, creating animations, reviewing PRs)
@@ -58,9 +59,9 @@ npx skills find [query] [--owner <owner>]
 
 For example:
 
-- User asks "how do I make my React app faster?" → `npx skills find react performance`
-- User asks "can you help me with PR reviews?" → `npx skills find pr review`
-- User asks "I need to create a changelog" → `npx skills find changelog`
+- User asks "find a skill for React performance" → `npx skills find react performance`
+- User asks "is there a skill for PR reviews?" → `npx skills find pr review`
+- User asks "install a skill for changelogs" → `npx skills find changelog`
 
 ### Step 4: Verify Quality Before Recommending
 

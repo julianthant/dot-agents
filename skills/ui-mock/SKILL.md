@@ -4,6 +4,7 @@ description: >-
   Use this skill when the user wants to see and pick between design variants of a screen, panel,
   component or control before it is built or changed: it builds several genuinely different
   versions in the real app with realistic data, behind a picker, and hands them over for a pick.
+  Not when the project ships its own `ui-mock` skill; load that one.
   Not for building the chosen design (ui-components, ui-polish), every state of one component
   (ui-states) or worst-case data (ui-stress).
 metadata:

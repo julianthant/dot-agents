@@ -3086,13 +3086,14 @@ with TemporaryDirectory() as tmp:
             tick.full_run_tick(now)
         return out.getvalue()
 
-    dispatch = ("gh", "workflow", "run", "development.yml", "-R", "julianthant/hr-relay", "--ref", "development")
+    listing = ("gh", "run", "list", "-R", "julianthant/hr-relay", "--workflow", "full.yml",
+               "--branch", "development", "--limit", "20", "--json", "status,event")
+    dispatch = ("gh", "workflow", "run", "full.yml", "-R", "julianthant/hr-relay", "--ref", "development")
     assert "dispatched" in lines(10_000, [{"status": "completed", "event": "push"}])
-    assert sent[-1] == dispatch and sent[0][:3] == ("gh", "run", "list") and "development" in sent[0]
+    assert sent == [listing, dispatch]
     sent.clear()
     assert "within 20 minutes" in lines(10_000 + 1199, []) and sent == []
     assert "dispatched" in lines(10_000 + 1200, [])
     sent.clear()
     assert "already queued or running" in lines(20_000, [{"status": "in_progress", "event": "schedule"}])
-    assert dispatch not in sent
-    assert all(a[:3] == ("gh", "run", "list") or a == dispatch for a in sent)
+    assert sent == [listing]

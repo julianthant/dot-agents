@@ -2939,7 +2939,7 @@ def watch_workers(args):
 
 
 FULL_RUN_REPO = "julianthant/hr-relay"
-FULL_RUN_WORKFLOW = "development.yml"
+FULL_RUN_WORKFLOW = "full.yml"
 FULL_RUN_BRANCH = "development"
 FULL_RUN_SECONDS = 20 * 60
 FULL_RUN_STAMP = SNAPSHOT.with_name("full-run.json")
@@ -2963,7 +2963,7 @@ def full_run_tick(now=None):
     command("gh", "workflow", "run", FULL_RUN_WORKFLOW, "-R", FULL_RUN_REPO, "--ref", FULL_RUN_BRANCH)
     FULL_RUN_STAMP.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     FULL_RUN_STAMP.write_text(json.dumps({"at": now}))
-    log("full-run", "dispatched development.yml on development")
+    log("full-run", f"dispatched {FULL_RUN_WORKFLOW} on {FULL_RUN_BRANCH}")
 
 
 def scheduled_tick(args):

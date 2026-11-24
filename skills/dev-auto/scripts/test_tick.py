@@ -1077,9 +1077,17 @@ def report(dispatch, body, kind="worker_done", msg_id="report"):
                 "payload": json.dumps({"taskId": "task", "dispatchId": dispatch, "outcome": "succeeded"})}
 
 recorded = report("coder", f"I pushed {sha} with host-local account selection.")
-assert tick.review_mail([recorded], "coder") == [recorded]
-assert not tick.review_mail([report("coder", sha, "question"), recorded], "other")
-assert not tick.review_mail([report("coder", sha, "question")], "coder")
+mailbox = tick.ReviewMailbox(sqlite3.connect(":memory:"), "run", [report("other", sha, "question"), recorded])
+assert mailbox.successes == {"coder": [recorded]}
+
+with sqlite3.connect(":memory:") as db:
+    mailbox = tick.ReviewMailbox(db, "run", [
+        dict(report("pr", sha), subject="PR #47 for #796"),
+        dict(report("fix", sha), sequence=2, subject="#796: Fixing"),
+        dict(report("resume", sha), sequence=3, subject="#796 resume"),
+    ], tasks=[{"id": "pr", "title": "PR #47 for #796"}, {"id": "coder", "title": "#796 coder"}])
+    assert mailbox.by_issue == {796: {"fix", "resume"}}
+    assert mailbox.issue_tasks == {796: {"coder"}}
 
 assert tick.review_route("Coder: codex / gpt-6.2-sol / medium. Reviewer: none (UI, simple; green task CI clears it). Tier: UI, simple.") is None
 check.assertEqual(tick.review_route("Reviewer: Claude Sonnet 5.5 medium with Opus advisor"),
@@ -1465,7 +1473,7 @@ with patch.object(tick, "tickets", return_value=[ticket]), patch.object(tick, "s
                            "worker": {"worktreeId": "tree", "startOptions": {"launch": {"effective": {"model": "gpt-6.2-sol"}}}}},
                        {"worktree": {"id": "tree", "path": "/fixture", "branch": "refs/heads/task/ui/header"}}]
     tick.review_tick(args, sqlite3.connect(":memory:"))
-    assert step.call_args.args[-1] == [recorded] and step.call_args.args[-2]["expected"] == "coder"
+    assert step.call_args.args[-1].successes["coder"] == [recorded] and step.call_args.args[-2]["expected"] == "coder"
     assert cli.call_args_list[0].args == ("orchestration", "inbox", "--terminal", "run:run", "--limit", "10000", "--full")
 
 # Bug 3 (#488, #517): restarts left two "#41 coder" Tasks; the one whose attempt reported is reviewed.
@@ -1529,6 +1537,48 @@ for pending in (False, True):
         tick.review_step(db, "run", [], ticket, state, [original, manual])
         assert tick.review_state(db, "run", 41)["coder"] == "fix"
 
+# An inventory row without a workspace can still report from a new Task and pane.
+ticket, state = review_fixture()
+state["coder_terminal"] = "old-pane"
+manual_report = dict(report("manual", sha, msg_id="manual-report"), sequence=3, from_handle="manual-pane",
+                     payload={"taskId": "manual-task", "dispatchId": "manual", "outcome": "succeeded"})
+old_report = dict(manual_report, id="old-report", sequence=0,
+                  payload={"taskId": "old-task", "dispatchId": "old", "outcome": "succeeded"})
+rows = [{"dispatchId": "coder", "taskId": "task", "agentTerminalHandle": "old-pane",
+         "projection": {"workspace": {"id": "repo::/fixture"}}},
+        {"dispatchId": "manual", "taskId": "manual-task", "agentTerminalHandle": "manual-pane", "projection": {}}]
+with sqlite3.connect(":memory:") as db, patch.object(tick, "inspect_worker",
+        return_value=followup_worker("manual", "manual-pane", task="manual-task")) as inspect:
+    mailbox = tick.ReviewMailbox(db, "run", [recorded, manual_report, old_report],
+                                 inventory=SimpleNamespace(rows=rows))
+    for _ in range(2):
+        review = state.copy()
+        assert tick.latest_coder_report(review, 41, mailbox, set()) == [manual_report]
+        assert (review["coder"], review["expected"], review["coder_terminal"]) == ("manual", "manual", "manual-pane")
+    assert tick.latest_coder_report(state.copy(), 41, mailbox, {manual_report["id"]}) == [recorded]
+    inspect.assert_called_once_with("manual")
+
+# A coder without a report can ignore mail from before its Task and still find an unplaced follow-up.
+manual_report = dict(manual_report, created_at="2026-11-23T08:00:00Z")
+old_report = dict(old_report, created_at="2026-11-23T07:59:59Z")
+unplaced = [dict(old_report, id=f"unplaced-{i}", sequence=i + 4, created_at="2026-11-23T08:00:01Z",
+                 payload={"taskId": f"task-{i}", "dispatchId": f"unplaced-{i}", "outcome": "succeeded"})
+            for i in range(13)]
+
+def unrelated_worker(dispatch):
+    return followup_worker(dispatch, "other-pane", previous="coder" if dispatch == "manual" else None)
+
+with sqlite3.connect(":memory:") as db, patch.object(tick, "inspect_worker", side_effect=unrelated_worker) as inspect:
+    mailbox = tick.ReviewMailbox(db, "run", [old_report, manual_report, *unplaced],
+                                 tasks=[{"id": "task", "title": "#41 coder", "created_at": "2026-11-23 08:00:00"}],
+                                 inventory=SimpleNamespace(rows=rows))
+    for _ in range(2):
+        assert tick.latest_coder_report(state.copy(), 41, mailbox, set()) == [manual_report]
+    assert tick.latest_coder_report(state.copy(), 41, mailbox, {manual_report["id"]}) == []
+    assert [call.args[0] for call in inspect.call_args_list] == [
+        *(f"unplaced-{i}" for i in reversed(range(13))), "manual",
+    ]
+
 # An explicit coder that reports to another Run fails loudly instead of exiting quietly.
 args = SimpleNamespace(issue=41, coder="ctx_elsewhere", run=None, anchor=None)
 with patch.object(tick, "tickets", return_value=[ticket]), patch.object(tick, "supervisor", return_value=([], "run")), \
@@ -1577,6 +1627,21 @@ for tier, accepted in [("backend, hard", False), ("UI, multi-step", True)]:
         else:
             with check.assertRaisesRegex(tick.OrcaError, "different model"):
                 tick.review_step(db, "run", [], trial, state, [recorded])
+
+# Close and fill must see a worker started after watch loaded the Run's inventory.
+ticket, state = review_fixture()
+workers = tick.WorkerInventory("run")
+reader = {"dispatchId": "reader"}
+with sqlite3.connect(":memory:") as db, patch.object(tick, "green_report", return_value=sha), \
+        patch.object(tick, "review_account", return_value={"id": "seat", "label": "review"}), \
+        patch.object(tick, "held_label", return_value="coder"), patch.object(tick, "worker_settings"), \
+        patch.object(tick, "record_hold"), patch.object(tick, "review_card"), patch.object(tick, "runtime", side_effect=[
+            {"workers": [], "page": {"hasMore": False}}, {}, {"claude": {"activeAccountId": "seat"}},
+            full_start("reader", "pane"), {"workers": [reader], "page": {"hasMore": False}},
+        ]):
+    assert workers.rows == ()
+    tick.review_step(db, "run", [], ticket, state, [recorded], inventory=workers)
+    assert workers.rows == (reader,)
 
 # Recover a pre-upgrade reservation whose start succeeded, then retire that reviewer on FIX.
 import pick
@@ -1693,7 +1758,78 @@ with patch.object(tick, "runtime", side_effect=ancestry), patch.object(tick, "gr
         tick.review_step(sqlite3.connect(":memory:"), "run", [], ticket, state, [new, old])
     assert sha in verify.call_args.args[1]
 
+# A Run's unrelated successes cannot delay Fixing or recovery of an uncertain reviewer start.
+with sqlite3.connect(":memory:") as db:
+    ticket, state = review_fixture()
+    ticket["stage"] = "Fixing"
+    state.update(stage="Fixing", host="local", coder_terminal="coder-pane")
+    pending = dict(report("pending-coder", sha, msg_id="pending"), sequence=0, created_at="2026-11-22T22:35:40Z",
+                   payload={"dispatchId": "pending-coder", "taskId": "pending-task", "outcome": "succeeded"})
+    other = dict(ticket, number=42)
+    tick.review_state(db, "run", 41)
+    tick.save_review(db, "run", 41, state)
+    tick.save_review(db, "run", 42, dict(state, pending="pending", sha=sha, path="/other",
+                                        coder="pending-coder", expected="pending-coder", coder_terminal="other-pane"))
+    chained = dict(report("retry", sha, msg_id="chained"), from_handle="fresh-pane", sequence=2,
+                   payload={"dispatchId": "retry", "taskId": "manual-task", "outcome": "succeeded"})
+    messages = [pending, recorded, chained, *[
+        dict(report(f"history-{i}", "unrelated", msg_id=f"old-{i}"), from_handle=f"pane-{i}", sequence=i + 3,
+             payload={"dispatchId": f"history-{i}", "taskId": f"old-task-{i}", "outcome": "succeeded"})
+        for i in range(700)
+    ]]
+
+    def report_worker(dispatch, task, workspace, terminal, **ancestry):
+        row = {"dispatchId": dispatch, "taskId": task, "runId": "run", "agentTerminalHandle": terminal,
+               "terminalState": "released", "dispatchStatus": "completed",
+               "projection": {"workspace": {"id": workspace}}}
+        show = {"dispatch": {"id": dispatch, "runId": "run", "taskId": task, "status": "completed", **ancestry},
+                "projection": {"resource": {"releaseState": "released"}}}
+        return row, show
+
+    history = [
+        report_worker("coder", "task", "repo::/fixture", "coder-pane"),
+        report_worker("pending-coder", "pending-task", "repo::/other", "other-pane"),
+        report_worker("manual", "manual-task", "repo::/fixture", "manual-pane", followUpOf="coder"),
+        report_worker("retry", "manual-task", "repo::/fixture", "fresh-pane", retryOfDispatchId="manual"),
+        *(report_worker(f"history-{i}", f"old-task-{i}", f"repo::/old-{i}", f"pane-{i}") for i in range(700)),
+    ]
+    workers = [row for row, _ in history]
+    details = {row["dispatchId"]: show for row, show in history}
+    calls = []
+
+    def review_runtime(*args):
+        calls.append(args)
+        match args[1]:
+            case "inbox":
+                return {"messages": messages}
+            case "task-list":
+                return {"tasks": []}
+            case "worker-list":
+                return {"workers": workers, "page": {"hasMore": False}}
+            case "worker-show":
+                return details[args[3]]
+        raise AssertionError(args)
+
+    with patch.object(tick, "runtime", review_runtime), patch.object(tick, "supervisor", return_value=([], "run")), \
+            patch.object(tick, "tickets", return_value=[other, ticket]), patch.object(tick, "held_label", return_value="coder"), \
+            patch.object(tick, "green_report", return_value=sha) as verify, patch.object(tick, "log") as captured, \
+            patch.object(tick, "review_account", side_effect=tick.UncertainReview("simulated unavailable seat")):
+        for expected_reads in ({"retry", "manual"}, set()):
+            calls.clear()
+            verify.reset_mock()
+            tick.review_tick(SimpleNamespace(issue=None, coder=None), db)
+            verify.assert_called_once_with(ticket, chained["subject"] + "\n" + chained["body"])
+            assert [args[1] for args in calls].count("inbox") == 1
+            shows = [args[3] for args in calls if args[1] == "worker-show"]
+            assert len(shows) <= 30, f"700 unrelated successes produced {len(shows)} worker-show calls"
+            assert set(shows) == expected_reads, shows
+            workers[3]["projection"] = {}  # The released retry's saved chain survives a missing worktree projection.
+        assert any(args.args[1]["issue"] == 42 and "inspect uncertain Orca action" in args.args[1]["reason"]
+                   for args in captured.call_args_list)
+        assert tick.review_state(db, "run", 42)["pending"] == "pending"
+
 def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncertain=False, remote_race=False,
+                  released_projection=False, release_race=False,
                   release_unknown=False, ticks=1, card_fails=False, send_lost=False, rewritten=False, pre_upgrade=None,
                   rollback=False, remote_worker=False):
     root = Path(tmp)
@@ -1713,11 +1849,13 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
                  projectItems={"totalCount": 1, "nodes": [card]},
                  closedByPullRequestsReferences={"totalCount": int(merged), "nodes": [pr] if merged else []})
     # Projected fields from the #551 worker-list and worker-show receipts.
-    workers = [dict(dispatchId=dispatch, runId="run", agentTerminalHandle=terminal if owns else None,
+    workers = [dict(dispatchId=dispatch, runId="run", taskId=dispatch + "-task", agentTerminalHandle=terminal if owns else None,
                     dispatchStatus="completed", projection={"workspace": {"id": worktree}, "host": {"kind": "local"}})
                for dispatch, terminal, owns in (("ctx_merge", "term_coder", True),
                                                 ("ctx_review", "term_reviewer", True),
                                                 ("ctx_initial", "term_coder", False))]
+    if released_projection:
+        workers[1]["terminalState"] = "released"
     if remote_worker:
         workers.insert(1, {
             "agentTerminalHandle": "term_wsl",
@@ -1788,9 +1926,13 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
                 return {"workers": workers[2:], "page": {"hasMore": False, "nextCursor": None}}
             return {"workers": workers[:2], "page": {"hasMore": True, "nextCursor": "recorded-cursor"}}
         if args[:2] == ("orchestration", "worker-show"):
-            return {"dispatch": {"id": "ctx_initial", "runId": "run", "assigneeHandle": "term_coder"},
-                    "worker": {"dispatchId": "ctx_initial", "worktreeId": worktree, "effects": [
-                        {"kind": "terminal", "role": "agent", "action": "reused", "id": "term_coder"}]}}
+            worker = next(w for w in workers if w["dispatchId"] == args[3])
+            terminal = worker["agentTerminalHandle"] or "term_coder"
+            status = "dispatched" if release_race and args[3] == "ctx_review" else worker["dispatchStatus"]
+            return {"dispatch": {"id": args[3], "runId": "run", "taskId": worker["taskId"],
+                                 "assigneeHandle": terminal, "status": status},
+                    "worker": {"dispatchId": args[3], "worktreeId": worktree, "effects": [
+                        {"kind": "terminal", "role": "agent", "action": "reused", "id": terminal}]}}
         if args[:2] == ("orchestration", "worker-release"):
             if release_uncertain and args[3] == "ctx_review":
                 return {"state": "release_pending", "reason": pending}
@@ -1870,12 +2012,15 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
             tick.close_tick(args, db)
         notice = db.execute("SELECT sent,carded,request FROM close_notice LEFT JOIN close_request USING (run,issue,reason)"
                             " WHERE run='run' AND issue=41").fetchone()
-    assert [event[3] for event in events if event[:2] == REL] == ["ctx_merge", "ctx_review", "ctx_initial"] * (
-        ticks + rollback)
-    expected_holds = {"term_other", "term_reviewer"} if release_uncertain else {"term_other"}
+    expected_releases = ["ctx_merge", "ctx_initial"] if released_projection or release_race else [
+        "ctx_merge", "ctx_review", "ctx_initial"]
+    assert [event[3] for event in events if event[:2] == REL] == expected_releases * (ticks + rollback)
+    if released_projection:
+        assert not any(e[:4] == ("orchestration", "worker-show", "--dispatch", "ctx_review") for e in events)
+    expected_holds = {"term_other", "term_reviewer"} if release_uncertain or release_race else {"term_other"}
     assert set(json.loads(holds.read_text())) == expected_holds
     edits = [event[-3:] for event in events if event[:3] == ("gh", "project", "item-edit")]
-    if merged and not dirty and not refused and not release_uncertain:
+    if merged and not dirty and not refused and not release_uncertain and not release_race:
         assert not present and not local_ref
         assert edits == [("--field-id", "agent", "--clear"), ("--field-id", "stage", "--clear")]
         assert any(event[0] == "git" and event[3] == "push" for event in events) == remote_race
@@ -1912,6 +2057,7 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
 
 
 for scenario in ({}, {"remote_worker": True}, {"merged": False}, {"dirty": True}, {"refused": True},
+                 {"released_projection": True}, {"release_race": True},
                  {"release_uncertain": True}, {"remote_race": True}, {"release_unknown": True},
                  {"release_uncertain": True, "ticks": 2}, {"release_uncertain": True, "ticks": 3, "card_fails": True},
                  {"release_uncertain": True, "ticks": 3, "send_lost": True},
@@ -1976,6 +2122,7 @@ class Fleet:
         self.holds.write_text(json.dumps({"term_coder": {"account": "jzaw", "label": "jzaw", "host": "local"}}))
         self.agent, self.model, self.screen = agent, model, screen
         self.dispatch, self.terminal, self.status, self.state = "ctx_coder", "term_coder", "dispatched", "ready"
+        self.terminal_state = None
         self.liveness, self.failure, self.wait = "live", None, None
         self.seats = ["jzaw", "x2"]  # the limited account is first in accounts.toml order
         self.superseded = False
@@ -2029,7 +2176,7 @@ class Fleet:
                               *([{"id": "task_root", "run_id": "run", "task_title": "#553 reviewer"}] if self.orig_parent else [])]}
         if verb == ("orchestration", "worker-list"):
             row = dict(dispatchId=self.dispatch, taskId="task_coder", runId="run", workerState=self.state,
-                       dispatchStatus=self.status, agentTerminalHandle=self.terminal,
+                       dispatchStatus=self.status, agentTerminalHandle=self.terminal, terminalState=self.terminal_state,
                        resource={"ownerDispatchId": "ctx_follow" if self.transferred else self.dispatch},
                        projection={"host": {"kind": "local"}, "workspace": {"id": self.worktree},
                                    "liveness": {"verdict": self.liveness}})
@@ -2111,7 +2258,8 @@ class Fleet:
                                "effects": [{"kind": "terminal", "role": "agent", "action": "created", "id": self.terminal}],
                                "startOptions": {"launch": {"effective": {"agent": self.agent, "model": self.model,
                                                                          "effort": self.effort}}}},
-                    "projection": {"liveness": {"verdict": self.liveness}},
+                    "projection": {"liveness": {"verdict": self.liveness},
+                                   "resource": {"releaseState": self.terminal_state}},
                     "terminal": {"handle": self.terminal, "agentWait": self.wait}, "observation": {"agentWait": self.wait}}
         if verb == ("terminal", "read"):
             if args[3] == "term_manual":
@@ -2638,7 +2786,8 @@ with TemporaryDirectory() as tmp:
     f.db.execute("INSERT OR REPLACE INTO watch VALUES ('run','term_follow',?)", (json.dumps({"handoff": 1}),))
     done = {"type": "worker_done", "id": "m1", "sequence": 9,
             "payload": json.dumps({"dispatchId": "ctx_follow", "outcome": "failed"})}
-    assert tick.failed_reviews(f.db, "run", tick.review_state(f.db, "run", 553), [done]) == []
+    assert tick.failed_reviews(f.db, "run", tick.review_state(f.db, "run", 553),
+                               tick.ReviewMailbox(f.db, "run", [done])) == []
 
 # The settled-worker send applies but its reply is lost: the next tick adopts the follow-up Orca started instead of
 # sending again, even after Orca retried that Task. With no review state yet, the follow-up is recorded for review's
@@ -2735,7 +2884,7 @@ for current in ("follow", "follow_retry"):
             patch.object(tick, "command", return_value="https://github.com/julianthant/hr-relay.git\n"), \
             patch.object(tick, "review_step") as step, patch.object(tick, "runtime", discovery):
         tick.review_tick(args, db)
-        assert step.call_args.args[-2]["expected"] == current and step.call_args.args[-1] == [followed_report]
+        assert step.call_args.args[-2]["expected"] == current and step.call_args.args[-1].successes[current] == [followed_report]
 
 # Bug 3: an older coder Task's success report does not outrank the follow-up's root, which has no report; a
 # Task with no Dispatch is skipped, and the next issue still runs.
@@ -2967,6 +3116,49 @@ for title, follow_of, orig, parent, want in (("#553 coder", None, None, None, ("
         start = next(e for e in f.events if e[:2] == ("orchestration", "worker-start"))
         assert (start[start.index("--model") + 1], start[start.index("--effort") + 1]) == want, start
 
+# The original's cached route and its parent's cached role survive release, while a changed status forces a new read.
+for status, expected_route in (("completed", ("gpt-6.2-sol", "xhigh")), ("failed", ("gpt-6.2-astra", "high"))):
+    with TemporaryDirectory() as tmp:
+        f = Fleet(tmp, "codex", None, CODEX_AT_LIMIT)
+        f.title, f.follow_of, f.orig_title, f.orig_parent = "#553: resume", "ctx_orig", "#553: resume", "ctx_root"
+        f.ticket["route"] = ("codex", "gpt-6.2-astra", "medium", None)
+        underlying = f.orca
+        originals = [
+            {"dispatchId": "ctx_orig", "taskId": "task_orig", "runId": "run", "agentTerminalHandle": None,
+             "terminalState": "released", "dispatchStatus": status, "projection": {"host": {"kind": "local"}}},
+            {"dispatchId": "ctx_root", "taskId": "task_root", "runId": "run", "agentTerminalHandle": None,
+             "terminalState": "released", "dispatchStatus": "completed", "projection": {"host": {"kind": "local"}}},
+        ]
+
+        def released_fact(row, state, route=()):
+            dispatch = {"id": row["dispatchId"], "taskId": row["taskId"], "runId": "run", "status": state}
+            if row["dispatchId"] == "ctx_orig":
+                dispatch["followUpOf"] = "ctx_root"
+            return {"dispatch": dispatch, "projection": {"resource": {"releaseState": "released"}},
+                    "worker": {"startOptions": {"launch": {"effective":
+                        dict(zip(("agent", "model", "effort"), route))}}}}
+
+        history = tick.ReleasedDispatchHistory(f.db, "run")
+        for row in originals:
+            completed = dict(row, dispatchStatus="completed")
+            history.remember(completed, released_fact(completed, "completed", ("codex", "gpt-6.2-sol", "xhigh")))
+
+        def history_runtime(*args):
+            if args[:2] == ("orchestration", "worker-list"):
+                out = underlying(*args)
+                return {**out, "workers": [*out["workers"], *originals]}
+            if args[:2] == ("orchestration", "worker-show") and args[3] == "ctx_orig":
+                f.events.append(args)
+                return released_fact(originals[0], status, ("codex", "gpt-6.2-astra", "high"))
+            return underlying(*args)
+
+        with patch.object(f, "orca", history_runtime):
+            f.tick()
+        reads = [e[3] for e in f.events if e[:2] == ("orchestration", "worker-show")]
+        assert "ctx_root" not in reads and reads.count("ctx_orig") == int(status == "failed"), reads
+        start = next(e for e in f.events if e[:2] == ("orchestration", "worker-start"))
+        assert (start[start.index("--model") + 1], start[start.index("--effort") + 1]) == expected_route, start
+
 # Bug 1: after an Orca restart the crashed worker's Task is ready again; it starts without --retry-of and is adopted.
 with TemporaryDirectory() as tmp:
     f = Fleet(tmp, screen=CLAUDE_WORKING)
@@ -2999,8 +3191,62 @@ with TemporaryDirectory() as tmp:
     f = Fleet(tmp, screen=CLAUDE_WORKING)
     f.ticket["stage"] = "Merging"
     f.status, f.state, f.liveness, f.failure = "failed", "failed", "exited", "agent process exited"
-    assert f.tick() == [("orchestration", "task-list"), ("orchestration", "worker-list"),
-                        ("orchestration", "worker-show")] and f.lines == ['watch        "no action"']
+    assert f.tick() == [("orchestration", "task-list"), ("orchestration", "worker-list")]
+    assert f.lines == ['watch        "no action"']
+
+# Hundreds of distinct historical Tasks must not delay watching the current worker.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    history = [{
+        "dispatchId": f"history-{i}", "taskId": f"old-task-{i}", "runId": "run",
+        "workerState": "failed", "dispatchStatus": "failed", "terminalState": "released",
+        "agentTerminalHandle": f"old-pane-{i}", "projection": {"host": {"kind": "local"}},
+    } for i in range(700)]
+    underlying = f.orca
+
+    def long_run(*args):
+        if args[:2] == ("orchestration", "worker-list") and "--cursor" in args:
+            f.events.append(args)
+            start = int(args[-1])
+            end = start + 100
+            return {"workers": history[start:end],
+                    "page": {"hasMore": end < len(history), "nextCursor": str(end)}}
+        if args[:2] == ("orchestration", "worker-list"):
+            return {**underlying(*args), "page": {"hasMore": True, "nextCursor": "0"}}
+        if args[:2] == ("orchestration", "worker-show") and args[3].startswith("history-"):
+            f.events.append(args)
+            return {"dispatch": {"id": args[3], "runId": "run"}}
+        return underlying(*args)
+
+    with patch.object(f, "orca", long_run):
+        calls = f.tick()
+    assert ("terminal", "read") in calls
+    shows = calls.count(("orchestration", "worker-show"))
+    assert shows <= 30, f"700 settled Dispatches produced {shows} worker-show calls"
+
+# A settled released report is read once across passes even while its card still says Coding.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.status, f.state, f.terminal_state = "failed", "failed", "released"
+    f.failure = json.dumps({"provenance": "worker_report", "outcome": "failed"})
+    assert f.tick().count(("orchestration", "worker-show")) == 1
+    assert ("orchestration", "worker-show") not in f.tick(1)
+
+# A worker changed after the parallel observation. Its old limit screen cannot authorize a restart.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+    underlying = f.orca
+
+    def settle_before_restart(*args):
+        if args[:2] == ("orchestration", "worker-show") and args in f.events:
+            f.status, f.state = "completed", "succeeded"
+        return underlying(*args)
+
+    with patch.object(f, "orca", settle_before_restart), check.assertRaises(tick.OrcaError):
+        f.tick()
+    assert "Dispatch identity changed before restart" in f.lines[0]
+    assert not any(e[:2] in (("orchestration", "worker-stop"), ("orchestration", "worker-start")) for e in f.events)
+
 # A Merging coder that failed is still current when the review state names it: relaunched.
 with TemporaryDirectory() as tmp:
     f = Fleet(tmp, screen=CLAUDE_WORKING)
@@ -3075,7 +3321,7 @@ def discovered(ticket):
     with patch.object(tick, "supervisor", return_value=([], "run")), patch.object(tick, "runtime", orca), \
             patch.object(tick, "tickets", return_value=[ticket]), \
             patch.object(tick, "command", return_value="https://github.com/julianthant/dot-agents.git"), \
-            patch.object(tick, "review_step", lambda *a: found.append(a[3]["number"])):
+            patch.object(tick, "review_step", lambda *a, **_: found.append(a[3]["number"])):
         tick.review_tick(SimpleNamespace(issue=None, coder=None), sqlite3.connect(":memory:"))
     return found
 
@@ -3148,6 +3394,7 @@ with TemporaryDirectory() as tmp:
             assert (options.anchor, options.run) == ("term_anchor", "run_live")
             assert json.loads(db.execute("SELECT receipt FROM starts WHERE issue=555").fetchone()[0]) == {
                 "run": "run_live", "dispatch": "ctx_existing"}
+            assert list(tick.pass_workers(options.run, options.workers)) == [{"dispatchId": "ctx_existing"}]
             calls.append((name, options.repo_path))
             if name == "review":
                 raise tick.OrcaError("private CLI error")
@@ -3155,18 +3402,22 @@ with TemporaryDirectory() as tmp:
 
     with patch.object(tick, "SNAPSHOT", root / "issues.json"), \
             patch.object(tick, "supervisor", return_value=(["--from", args.anchor, "--run", args.run], args.run)) as bind, \
+            patch.object(tick, "fleet_workers", return_value=iter([{"dispatchId": "ctx_existing"}])) as roster, \
             patch.object(tick, "watch_tick", phase("watch")), patch.object(tick, "review_tick", phase("review")), \
             patch.object(tick, "close_tick", phase("close")), patch.object(tick, "fill_tick", phase("fill")), \
             patch.object(tick, "full_run_tick", phase_full := Mock()), \
             redirect_stdout(io.StringIO()) as output:
         assert tick.scheduled_tick(args) == 1
         bind.assert_called_once()
+        roster.assert_called_once_with(args.run)
         phase_full.assert_called_once_with()
         status = json.loads((root / "tick.json").read_text())
         assert status["lastRun"] and status["errors"] == [{"phase": "review", "error": "OrcaError"}], status
         assert "private CLI error" in output.getvalue()
         assert calls == [("watch", None), ("review", None), ("close", args.repo_paths[0]),
                          ("close", args.repo_paths[1]), ("fill", args.repo_paths[0]), ("fill", args.repo_paths[1])]
+        assert [line.split(None, 2)[2] for line in output.getvalue().splitlines() if line.startswith("phase start")] == [
+            '"adopt"', '"state"', '"watch"', '"review"', '"close"', '"close"', '"fill"', '"fill"', '"full-run"']
         calls.clear()
         bind.side_effect = tick.OrcaError("wrong Run")
         other_run = [{"truncated": False, "terminals": [{"handle": args.anchor}]},

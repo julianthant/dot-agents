@@ -1825,6 +1825,7 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
             assert "tick.py close --repo-path" in notices[0] and "--issue 41" in notices[0], notices
             if actor:
                 assert "--anchor term_anchor --run run" in notices[0], notices
+                assert "plain shell outside Orca" in notices[0], notices
         # One notice in the Run's mailbox, pre-upgrade or new, besides an older state's notice.
         assert len(mailbox) == (2 if rollback or pre_upgrade in ("other", "foreign", "foreign_wrapped", "prefixed")
                                 else 1), mailbox
@@ -1933,6 +1934,8 @@ class Fleet:
         self.stop_lost = False  # worker-stop applies, but its reply is lost
         self.active, self.fresh = "coord", None  # the coordinator bot's Codex account; pick.coordinator's choice
         self.events, self.cards, self.now = [], [], 1_795_389_500
+        self.head = "a" * 40
+        self.next_start = ("ctx_restart", "term_restart")
         self.ticket = dict(number=553, item="card", agent=f"coder {model} medium @jzaw", stage="Coding")
         self.title = "#553 coder"
         self.notes = []
@@ -1983,6 +1986,9 @@ class Fleet:
                               agentTerminalHandle=None, resource=None)
                 return {"workers": [newest, retried], "page": {"hasMore": False, "nextCursor": None}}
             return {"workers": [*fresh, *follow, *before, row, *olds, retried, *replaced], "page": {"hasMore": False, "nextCursor": None}}
+        if verb == ("worktree", "show"):
+            assert args[2:] == ("--worktree", "id:repo::/wt"), args
+            return {"worktree": {"id": "repo::/wt", "path": str(self.tmp), "branch": "task/test/work"}}
         if verb == ("orchestration", "dispatch-show") and args[3] == "task_follow":
             current = "ctx_follow_retry" if self.follow_retried else "ctx_follow"
             return {"dispatch": {"id": current, "status": "dispatched", "taskId": None, "assigneeHandle": None}}
@@ -2048,12 +2054,12 @@ class Fleet:
             self.started_retry = "--retry-of" in args
             assert "--spec" not in args and "--task-title" not in args and self.status == "failed", args
             assert args[args.index("--worktree") + 1] == "id:repo::/wt"
-            self.dispatch, self.terminal = "ctx_restart", "term_restart"
+            self.dispatch, self.terminal = self.next_start
             self.status, self.state, self.liveness, self.failure = "dispatched", "ready", "live", None
             self.screen = CLAUDE_WORKING
             if self.lose_start:
                 raise tick.OrcaError("timed out")
-            return full_start("ctx_restart", "term_restart")
+            return full_start(self.dispatch, self.terminal)
         if verb == ("orchestration", "send"):
             if args[args.index("--to") + 1] == "dispatch:ctx_restart":
                 if self.note_error:
@@ -2084,6 +2090,10 @@ class Fleet:
                            "effects": [{"kind": "terminal", "role": "agent", "action": "created", "id": self.follow_terminal}]}
                 } if self.follow_terminal else {}
 
+    def git(self, *args):
+        assert args == ("git", "-C", str(self.tmp), "rev-parse", "--verify", "refs/heads/task/test/work"), args
+        return self.head + "\n"
+
     def tick(self, minutes=0):
         self.now += minutes * 60
         self.events.clear()
@@ -2093,6 +2103,7 @@ class Fleet:
         record = lambda ticket, stage, agent: (self.cards.append((stage, agent)), ticket.update(agent=agent))
         out = io.StringIO()
         with patch.object(tick, "supervisor", return_value=([], "run")), patch.object(tick, "runtime", self.orca), \
+                patch.object(tick, "command", self.git), \
                 patch.object(tick, "tickets", side_effect=self.tickets_error, return_value=[self.ticket]), patch.object(tick, "review_card", record), \
                 patch.object(pick, "main", return_value=0) as self.pick_main, patch.object(pick, "due", return_value=[]), \
                 patch.object(pick, "record_usage_handoff") as self.usage_handoff, \
@@ -2187,6 +2198,25 @@ for role, stage in (("coder", "Fixing"), ("reviewer", "Reviewing")):
         assert "/wt/.handoff-553.md" in f.notes[0] and f.cards[-1][0] == stage
         assert ("account", "select", "--agent", "codex", "--account", "jzaw") in f.events
         f.usage_handoff.assert_not_called()
+
+# A second checkpoint at the same branch head needs the operator, once.
+for progressed in (False, True):
+    with TemporaryDirectory() as tmp:
+        f = Fleet(tmp, screen=CLAUDE_WORKING)
+        failure = json.dumps({"provenance": "worker_report", "outcome": "failed",
+                              "reportPath": "/wt/.handoff-553.md"})
+        start = ("orchestration", "worker-start")
+        f.status, f.state, f.liveness, f.failure = "failed", "failed", "exited", failure
+        assert f.tick().count(start) == 1
+        if progressed:
+            f.head = "b" * 40
+            f.next_start = ("ctx_restart2", "term_restart2")
+            f.status, f.state, f.liveness, f.failure = "failed", "failed", "exited", failure
+            assert f.tick(3).count(start) == 1 and f.ticket["stage"] == "Coding"
+        f.status, f.state, f.liveness, f.failure = "failed", "failed", "exited", failure
+        assert start not in f.tick(3)
+        assert f.ticket["stage"] == "Needs you" and f.sent() == [("run:run", "#553: checkpoint restart limit")]
+        assert start not in f.tick(3) and not f.sent()
 
 # A worker can hit a usage limit and hand off between watch passes.
 with TemporaryDirectory() as tmp:
@@ -3088,7 +3118,7 @@ def remote_start(root, stack, db, has_receipt, repo="hr-relay"):
 
 for has_receipt, repo in ((True, "hr-relay"), (False, "hr-relay"), (True, "dot-agents")):
     with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory:") as db:
-        remote_start(Path(tmp), stack, db, has_receipt, repo)
+        remote_start(Path(tmp).resolve(), stack, db, has_receipt, repo)
 
 # Review rows written before host tracking identify their coder through the Run's server records.
 with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory:") as db:
@@ -3184,7 +3214,7 @@ with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory
 # launchd can recover a closed anchor and uses the saved replacement on the next invocation.
 def check_anchor(scenario):
     with TemporaryDirectory() as tmp, ExitStack() as stack:
-        root = Path(tmp)
+        root = Path(tmp).resolve()
         args = SimpleNamespace(anchor="term_old", run="run_live", repo_paths=[root])
         owner = "term_other" if scenario == "other-owner" else "term_old"
         terminals = {"term_other"} if scenario == "other-owner" else set()

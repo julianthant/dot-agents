@@ -137,7 +137,8 @@ the current attempt of every live worker in the Run and logs one `watch` line:
   to the Dispatch. Its failed `worker_done` starts the replacement.
 - A failed `worker_done` with a handoff path starts a fresh session on the same
   agent, model and effort. For a context handoff the original account remains
-  eligible under the standard picker rules.
+  eligible under the standard picker rules. Each Task lineage gets one checkpoint
+  restart per branch head. A second checkpoint at the same head goes to **Needs you**.
 - The limited account comes from the worker's hold, remembered while it runs.
   With none recorded, the watch stops nothing and escalates to the Run.
 - The card shows **Handed off** until the replacement starts; with no seat it
@@ -166,6 +167,8 @@ Run as `status`. A blocked close logs its reason and a retry command once per
 blocked state.
 
 ## launchd cutover
+
+The launchd Run is local to this machine.
 
 Pause manual fleet ticks and starts. Keep the coordinating Run and its live
 workers in place. Use a plain shell outside the worker sessions to create a

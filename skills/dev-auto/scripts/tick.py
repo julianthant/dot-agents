@@ -2366,7 +2366,8 @@ def close_tick(args, db):
                 retry = ["python3", __file__, "close", "--repo-path", str(repo), "--issue", str(number)]
                 if actor:
                     retry.extend(["--anchor", actor[1], "--run", run])
-                log("Needs you", {"issue": number, "reason": str(e), "retry": shlex.join(retry)})
+                log("Needs you", {"issue": number, "reason": str(e), "retry": shlex.join(retry),
+                                  "retry_from": "plain shell outside Orca" if actor else "coordinating Orca pane"})
             else:
                 # A request saved for another reason belongs to another state's notice.
                 request = db.execute("SELECT request FROM close_request WHERE run=? AND issue=? AND reason=?",
@@ -2574,6 +2575,30 @@ def watch_pass(args, db, actions, errors):
             pending.setdefault("number", number)
             resume_start(terminal, state)
             return
+        report = failure_of(show)
+        checkpoint = None
+        if (not crash and isinstance(report, dict) and report.get("provenance") == "worker_report"
+                and report.get("outcome") == "failed" and report.get("reportPath")):
+            worktree = show["worker"]["worktreeId"]
+            tree = runtime("worktree", "show", "--worktree", "id:" + worktree)["worktree"]
+            if tree["id"] != worktree:
+                raise OrcaError("worker worktree changed")
+            branch = "refs/heads/" + tree["branch"].removeprefix("refs/heads/")
+            head = command("git", "-C", tree["path"], "rev-parse", "--verify", branch).strip()
+            checkpoint = {"task": task_id, "head": head}
+            if checkpoint == state.get("checkpoint"):
+                if state.get("checkpoint_blocked") != dispatch:
+                    escalate(number, "checkpoint restart limit",
+                             f"Dispatch {dispatch} reported another checkpoint at {head[:12]}. "
+                             f"Inspect its handoff: {report['reportPath']}.")
+                    state.setdefault("previous_stage", phase(ticket, state, title))
+                    stage(ticket, "Needs you")
+                    for key in ("handoff", "handoff_reason", "pending"):
+                        state.pop(key, None)
+                    state["checkpoint_blocked"] = dispatch
+                    save(terminal, state)
+                    actions.append({"issue": number, "dispatch": dispatch, "reported": "checkpoint restart limit"})
+                return
         usage = not crash and why != CHECKPOINT_HANDOFF
         if usage and not state.get("account"):
             if state.get("escalated") != "account":
@@ -2615,7 +2640,6 @@ def watch_pass(args, db, actions, errors):
         runtime("account", "select", "--agent", route[0], "--account", account["id"])
         if runtime("account", "list")[route[0]]["activeAccountId"] != account["id"]:
             raise OrcaError("selected account changed before restart")
-        report = failure_of(show)
         note = (f"You replace Dispatch {dispatch}, which stopped: {why}."
                 + (f" Its handoff: {report['reportPath']}." if isinstance(report, dict) and report.get("reportPath") else "")
                 + (f" Its last report:\n{report['body'][:1500]}\n" if isinstance(report, dict) and report.get("body") else " ")
@@ -2631,6 +2655,8 @@ def watch_pass(args, db, actions, errors):
         state["pending"].update(starting=True, dispatch=dispatch, task=task_id, number=number, title=title,
                                 worktree=show["worker"]["worktreeId"], route=route, account=account["id"],
                                 label=account["label"], note=note, coordinator=prior, retry=retry)
+        if checkpoint:
+            state["pending"]["checkpoint"] = checkpoint
         save(terminal, state)
         # The same Task keeps its title, dependencies and retry lineage for the review tick.
         try:
@@ -2687,6 +2713,8 @@ def watch_pass(args, db, actions, errors):
             review = None
         row = {"relaunched": bool(state.get("relaunched") or p["crash"]), "account": p["account"],
                "note": {"to": new, "subject": f"#{number}: resume" if number else "resume", "body": p["note"]}}
+        if checkpoint := p.get("checkpoint") or state.get("checkpoint"):
+            row["checkpoint"] = checkpoint
         if p.get("coordinator"):
             row["coordinator"] = p["coordinator"]
         if ticket:
@@ -2759,6 +2787,8 @@ def watch_pass(args, db, actions, errors):
                 if (coder or reviewer) and not verified:
                     raise OrcaError(f"unverified follow-up {new} of {note['to']}")
                 terminal = start_identity(show["worker"])[1] if verified else handle
+                if verified and row.get("checkpoint"):
+                    row["checkpoint"]["task"] = show["dispatch"]["taskId"]
                 if coder:
                     assign_coder(review, new, terminal)
                 elif reviewer:

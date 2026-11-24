@@ -256,3 +256,38 @@ for case in ("success", "digest mismatch", "nonzero exit"):
             with TestCase().assertRaisesRegex(error, message):
                 pick.account_usage.remote_output("Juzzark-WSL", "/checkout", argv)
         assert [call.args[2] for call in rpc.call_args_list] == ["create", "read", "close"]
+
+# Grok needs its weekly reading below 85%. Cursor only needs a free configured slot.
+with TemporaryDirectory() as temp, patch.object(pick, "HOLDS", Path(temp) / "holds.json"):
+    grok = dict(agent="grok", id="grok-seat", label="Grok", host="local", enabled=True, home="", slots=1)
+    cursor = dict(grok, agent="cursor", id="cursor-seat", label="Cursor", slots=2)
+    cfg = {"account": [grok, cursor, dict(grok, host="Juzzark-WSL"), dict(cursor, host="Juzzark-WSL")]}
+    readings = {("grok", None): (1, [(84.9, 100, "weekly")])}
+    with (patch.object(pick.sys, "platform", "darwin"),
+          patch.object(pick.account_usage, "orca_usage", return_value=readings)):
+        assert pick.pick(cfg, "grok", "grok-4.7", "high", "local", 2, holds=[])[0] == grok
+        assert pick.pick(cfg, "grok", "grok-4.7", "high", "local", 2, holds=[{"account": grok["id"]}])[0] is None
+        readings["grok", None] = (1, [(85, 100, "weekly")])
+        assert pick.pick(cfg, "grok", "grok-4.7", "xhigh", "local", 2, holds=[])[0] is None
+        with patch.object(pick, "live_handles", return_value={"live"}):
+            pick.hold(cfg, SimpleNamespace(terminal="live", account=grok["id"], agent="grok",
+                                          model="grok-4.7", effort="high", host="local"))
+            assert pick.due(cfg, "local", 2) == [("Grok", "live", "weekly 85%")]
+            assert pick.due(cfg, "local", 100) == []
+        readings["grok", None] = (1, [(20, 100, "five_hour")])
+        assert pick.pick(cfg, "grok", "grok-4.7", "xhigh", "local", 2, holds=[])[0] is None
+        held = [{"account": cursor["id"]}]
+        assert pick.pick(cfg, "cursor", "grok-4.7-xhigh", "xhigh", "local", 2, holds=held)[0] == cursor
+        assert pick.pick(cfg, "cursor", "grok-4.7-high", "high", "local", 2, holds=held * 2)[0] is None
+        for agent, model in (("grok", "grok-4.7"), ("cursor", "grok-4.7-high")):
+            assert pick.pick(cfg, agent, model, "high", "Juzzark-WSL", 2, holds=[])[0] is None
+            with patch.object(pick.sys, "platform", "linux"):
+                assert pick.pick(cfg, agent, model, "high", "local", 2, holds=[])[0] is None
+
+        with (patch.object(pick.account_usage, "load_config", return_value=cfg),
+              patch.object(pick, "live_holds", return_value=[]), patch.object(pick.subprocess, "run") as orca,
+              redirect_stdout(io.StringIO()) as out):
+            assert pick.main(["pick", "--agent", "cursor", "--model", "grok-4.7-high", "--effort", "high"]) == 0
+            assert json.loads(out.getvalue())["select"] == []
+            assert pick.main(["select", "--agent", "cursor", "--account", "cursor-seat"]) == 0
+            orca.assert_not_called()

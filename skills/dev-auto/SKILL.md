@@ -14,6 +14,12 @@ account reads only Orca's per-account reading, never its CLI files.
 Pass the same `--host` to all three commands for a remote environment. The
 default host is `local` and the default effort is `medium`.
 
+Grok and Cursor use their signed-in CLI accounts on the local Mac. Set
+`slots` on each account row. Their picker receipts have an empty `select`
+command because Orca does not switch those sign-ins. Grok needs an Orca
+weekly usage reading below 85%, and its live holds become due at 85%.
+Cursor eligibility depends on its available slots.
+
 1. **Pick an account** before starting a worker. The JSON output includes the
    account ID, label, plan, and selection command for the caller to run. When no
    account qualifies, the picker exits 1 and writes skip reasons to stderr.
@@ -60,6 +66,15 @@ every writer before enabling fill. The ledger lock coordinates writes and
 pruning. The separate pick, account-select, start and hold commands still
 require the fleet coordinator to serialize launches on the same host.
 
+Use `grok / grok-4.7 / high` or `cursor / grok-4.7-high / high` for
+coding tickets with a Sonnet reviewer. For research, use `xhigh` in the
+effort and the Cursor model suffix. A ticket with `Branch: none` and
+`Reviewer: none` starts once from a detached local checkout pinned to
+`origin/development`. The brief limits the worker to read-only work and
+sends its `worker_done` report to the owning Run for the orchestrator to
+act on. The review tick skips it. The detached checkout stays available
+for inspecting findings and can be removed after the report is handled.
+
 Fill records the Orca Task before calling worker-start. On an uncertain
 response, rerun fill from the same coordinating Run. It looks up the existing
 Dispatch and verifies its Run, Task and worktree before recording the hold and
@@ -89,6 +104,11 @@ If a startup prompt appears, fill forwards the observed prompt to the owning
 Run, sets the Project's Agent state to **Needs you**, and retains the hold
 and reservation. After the operator answers in the worker pane, the next real
 tick checks that same Dispatch before recording Coding.
+
+Grok startup also needs an observed turn or assistant activity in its exact
+Orca transcript. If Orca only accepted the input, fill marks **Needs you**
+on the same reservation and asks the Run to inspect the worker. The next
+tick checks that Dispatch again.
 
 ## Issue snapshot
 

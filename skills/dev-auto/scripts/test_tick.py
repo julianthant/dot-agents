@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import subprocess
 import sys
@@ -258,6 +259,14 @@ src/backend/logs/ (writers), tests/backend/logs*.ts
 check.assertEqual(tick.coder_route(body), ("claude", "claude-sonnet-5-5", "high", "opus"))
 # The card label cannot show +advisor for Codex: rejected since 25ea75d.
 assert tick.coder_route("Coder: codex / gpt-6.2-sol / high + opus advisor") is None
+assert tick.coder_route("Coder: grok / grok-4.7 / xhigh") == ("grok", "grok-4.7", "xhigh", None)
+assert tick.coder_route("Coder: cursor / grok-4.7-high / high") == ("cursor", "grok-4.7-high", "high", None)
+assert tick.coder_route("Coder: cursor / grok-4.7-high / xhigh") is None
+coding_body = "Coder: cursor / grok-4.7-high / high\nReviewer: claude / claude-sonnet-5-5 / medium"
+cursor_ticket = dict(base, number=25, body=coding_body, route=tick.coder_route(coding_body))
+assert next(tick.fill_plan([cursor_ticket], seat))[1] == account
+assert next(tick.fill_plan([dict(cursor_ticket, body=coding_body.replace("claude-sonnet", "claude-opus"))],
+                           seat))[2] == "Grok coding needs a Sonnet reviewer"
 check.assertEqual(tick.owned_paths(body), ["src/backend/logs/", "tests/backend/logs*.ts"])
 check.assertEqual(tick.owned_paths("Owned paths: selected service code and fixtures."), ["*"])
 
@@ -280,10 +289,15 @@ def full_start(dispatch, terminal):
                         {"kind": "terminal", "role": "agent", "action": "created", "id": terminal, "surface": "visible"},
                         {"kind": "dispatch_input", "role": "agent", "id": terminal, "state": "accepted"}]}
 
+receipt = dict(full_start("grok-dispatch", "grok-pane"), state="outcome_unknown", turnStart="unobserved",
+               stage="turn_start_unobserved")
+with patch.object(tick.subprocess, "run", return_value=subprocess.CompletedProcess(
+        [], 1, json.dumps({"ok": True, "result": receipt}), "")):
+    assert tick.runtime("orchestration", "worker-start", "--agent", "grok", "--full") == receipt
+
 
 # Exercise launch through the real advisor file, journal, hold and Project-edit boundary.
 from types import SimpleNamespace
-import json
 with TemporaryDirectory() as tmp, sqlite3.connect(":memory:") as db:
     root = Path(tmp)
     card = []
@@ -802,6 +816,11 @@ with patch.object(tick, "command", side_effect=lambda *a: issue_page(rows if "st
     parsed = tick.tickets(fresh=True)
 check.assertEqual([row["branch"] for row in parsed], ["task/dashboard-frontend-speed/clock-tick-in-leaves",
                   "task/driver-reads/crm-sso-route-recovery", "task/tests/explicit"])
+
+research_body = ("Branch: none (read-only).\nReviewer: none (the orchestrator checks the report)\n"
+                 "Coder: grok / grok-4.7 / xhigh\nOwned paths: none.\n")
+research_ticket, = tick.tickets(rows=[issue_row(762, "dependencies / package review: research", research_body)])
+assert (research_ticket["branch"], research_ticket["base"], research_ticket["paths"]) == (None, "origin/development", [])
 
 # The poller reads closed issues incrementally, while consumers only see its saved result.
 with TemporaryDirectory() as tmp:
@@ -3339,3 +3358,103 @@ with TemporaryDirectory() as tmp:
     sent.clear()
     assert "already queued or running" in lines(20_000, [{"status": "in_progress", "event": "schedule"}])
     assert sent == [listing]
+
+# Run fill against a real detached checkout and an Orca receipt with a pasted, unrun Grok prompt.
+with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory:") as db:
+    root = Path(tmp).resolve()
+    checkout = root / "checkout"
+    git = ("git", "-C", str(checkout))
+    checkout.mkdir()
+    subprocess.check_output((*git, "init", "-b", "development"), stderr=subprocess.STDOUT)
+    subprocess.check_output((*git, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                             "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "base"))
+    head = subprocess.check_output((*git, "rev-parse", "HEAD"), text=True).strip()
+    subprocess.check_call((*git, "update-ref", "refs/remotes/origin/development", head))
+    ticket = dict(research_ticket, status="Todo", item="test-card")
+    grok = dict(id="grok-seat", label="Grok", agent="grok", host="local", enabled=True, home="", slots=1)
+    mail, operations, edits = [], [], []
+    transcript = [{"role": "user", "blocks": [{"type": "text"}]}]
+
+    def command(*argv):
+        if "get-url" in argv:
+            return "https://github.com/julianthant/hr-relay.git"
+        if "ls-remote" in argv:
+            return f"{head}\trefs/heads/development\n"
+        if "fetch" in argv:
+            return ""
+        if argv[:3] == ("gh", "project", "item-edit"):
+            edits.append(argv[-1])
+            return ""
+        assert argv[0] == "git", argv
+        return subprocess.check_output(argv, text=True, stderr=subprocess.STDOUT)
+
+    def orca(*argv):
+        operations.append(argv[:2])
+        match argv[:2]:
+            case "worktree", "list":
+                return {"worktrees": [], "truncated": False}
+            case "terminal", "list":
+                return {"terminals": [], "truncated": False}
+            case "worktree", "show":
+                path = argv[-1].removeprefix("path:")
+                return {"worktree": {"id": "research-tree", "path": path, "branch": "", "isMainWorktree": False}}
+            case "orchestration", "task-create":
+                assert argv[argv.index("--task-title") + 1] == "#762 research"
+                assert "Work read-only from this detached origin/development checkout" in argv[argv.index("--spec") + 1]
+                assert "worker_done" in argv[argv.index("--spec") + 1]
+                return {"task": {"id": "research-task"}}
+            case "orchestration", "worker-start":
+                path = argv[argv.index("--worktree") + 1].removeprefix("path:")
+                assert command("git", "-C", path, "branch", "--show-current") == ""
+                assert command("git", "-C", path, "rev-parse", "HEAD").strip() == head
+                assert argv[argv.index("--agent"):argv.index("--effort")+2] == (
+                    "--agent", "grok", "--model", "grok-4.7", "--effort", "xhigh")
+                assert "--on" not in argv and "--keep-open" not in argv
+                return dict(full_start("research-dispatch", "research-pane"), turnStart="unsupported")
+            case "orchestration", "dispatch-show":
+                assert argv[argv.index("--task") + 1] == "research-task"
+                return {"dispatch": {"id": "research-dispatch"}}
+            case "orchestration", "worker-show":
+                return {"dispatch": {"id": "research-dispatch", "taskId": "research-task", "runId": "run",
+                                     "assigneeHandle": "research-pane", "status": "dispatched"},
+                        "worker": {"worktreeId": "research-tree", "state": "ready"}}
+            case "orchestration", "worker-read":
+                return {"dispatchId": "research-dispatch", "provider": "grok", "source": "transcript",
+                        "sourceExact": True, "transcript": {"messages": transcript}}
+            case "orchestration", "send":
+                assert argv[argv.index("--to") + 1] == "run:run"
+                assert "no observed Grok turn" in argv[-1]
+                return {"messageId": "need-input"}
+            case "orchestration", "inbox":
+                return {"messages": mail}
+            case "orchestration", "task-list":
+                return {"tasks": [{"title": "#762 research", "id": "research-task"}]}
+        raise AssertionError(argv)
+
+    stack.enter_context(patch.object(tick, "SNAPSHOT", root / "issues.json"))
+    stack.enter_context(patch.object(tick, "tickets", return_value=[ticket]))
+    stack.enter_context(patch.object(tick, "supervisor", return_value=([], "run")))
+    stack.enter_context(patch.object(tick, "project_fields", return_value=(
+        "project", [("status", "progress"), ("stage", "coding"), ("agent", None)], ("stage", "needs-you"))))
+    stack.enter_context(patch.object(tick, "command", side_effect=command))
+    stack.enter_context(patch.object(tick, "runtime", side_effect=orca))
+    stack.enter_context(patch.object(pick, "mac_host", side_effect=lambda host: host == "local"))
+    stack.enter_context(patch.object(pick.account_usage, "load_config", return_value={"account": [grok]}))
+    stack.enter_context(patch.object(pick.account_usage, "orca_usage", return_value={
+        ("grok", None): (1, [(84, None, "weekly")])}))
+    stack.enter_context(redirect_stdout(io.StringIO()))
+    args = SimpleNamespace(repo_path=checkout, dry_run=False, holds=root / "holds.json", issue=None, coder=None)
+    assert tick.fill_tick(args, db) == {762: None}
+    assert edits == ["needs-you"]
+    tick.fill_tick(args, db)
+    assert edits == ["needs-you"] and operations.count(("orchestration", "send")) == 1
+    transcript.append({"role": "assistant", "blocks": [{"type": "text"}]})
+    tick.fill_tick(args, db)
+    assert edits == ["needs-you", "progress", "coding", "research grok-4.7 xhigh @Grok"]
+    mail.append(report("research-dispatch", "Research complete. Findings delivered to the Run."))
+    tick.review_tick(args, db)
+    tick.fill_tick(args, db)
+    assert operations.count(("orchestration", "worker-start")) == 1
+    assert operations.count(("orchestration", "task-create")) == 1
+    assert tick.review_state(db, "run", 762) is None
+    assert json.loads(args.holds.read_text())["research-pane"]["account"] == "grok-seat"

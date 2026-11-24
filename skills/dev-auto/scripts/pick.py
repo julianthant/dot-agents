@@ -29,6 +29,11 @@ import account_usage
 HERE = Path(__file__).resolve().parent
 LIMITS = HERE.parent / "limits.toml"
 HOLDS = account_usage.ACCOUNTS.with_name("holds.json")
+SLOT_AGENTS = ("grok", "cursor")
+
+
+def mac_host(host):
+    return host == "local" and sys.platform == "darwin"
 
 
 def live_handles(host):
@@ -76,7 +81,7 @@ def windows(cfg, row, now):
     if not found:
         return None, None
     out = {w: (0.0 if r and r <= now else p) for w, (p, r) in found.items()}
-    return out.get("five_hour", 0.0), out.get("weekly", 0.0)
+    return out.get("five_hour", 0.0), out.get("weekly", None if row["agent"] == "grok" else 0.0)
 
 
 def window_readings(row, now):
@@ -181,6 +186,8 @@ def low_quota(plan, five, week):
 
 
 def pick(cfg, agent, model, effort, host, now, holds=None):
+    if agent in SLOT_AGENTS and not mac_host(host):
+        return None, [f"{agent}: requires the local Mac"]
     if holds is None:
         holds = live_holds(host)
     route = f"{model}:{effort}"
@@ -195,9 +202,23 @@ def pick(cfg, agent, model, effort, host, now, holds=None):
             continue
         name = row["label"]
         handoff = handoffs.get(row["id"])
-        if handoff and now < handoff["until"]:
+        if agent != "cursor" and handoff and now < handoff["until"]:
             why.append(f"{name}: waiting for {handoff['window']} reset after usage handoff")
             continue
+        if agent in SLOT_AGENTS:
+            if agent == "grok":
+                _, week = windows(cfg, row, now)
+                if week is None:
+                    why.append(f"{name}: weekly usage never read by Orca")
+                    continue
+                if reason := past_handoff(row, None, week):
+                    why.append(f"{name}: {reason}")
+                    continue
+            used = sum(h["account"] == row["id"] for h in holds)
+            if used >= row["slots"]:
+                why.append(f"{name}: {used} of {row['slots']} sessions")
+                continue
+            return row, why
         plan = LIM.get(agent, {}).get(row.get("plan"))
         if plan is None:
             why.append(f"{name}: no {agent}.{row.get('plan')} plan in limits.toml")
@@ -231,6 +252,12 @@ def pick(cfg, agent, model, effort, host, now, holds=None):
 
 def past_handoff(row, five, week):
     """Why this account must stop taking work now, or None."""
+    if row["agent"] == "cursor":
+        return None
+    if row["agent"] == "grok":
+        if week is not None and week >= LIM["grok"]["weekly_stop"]:
+            return f"weekly {week:.0f}%"
+        return None
     plan = LIM.get(row["agent"], {}).get(row.get("plan")) or {}
     if max(five or 0, week or 0) >= 100:
         return f"limit reached (5-hour {five or 0:.0f}%, weekly {week or 0:.0f}%)"
@@ -264,9 +291,11 @@ def ready_tickets(data):
 
 
 def fill(cfg, host, now, data):
-    """Ready tickets and whether any Claude Sonnet or Codex Sol seat is free to take one."""
+    """Ready tickets and whether any worker seat is free."""
     ready = ready_tickets(data)
-    seat = any(pick(cfg, a, m, "medium", host, now)[0] for a, m in (("claude", "claude-sonnet-5-5"), ("codex", "gpt-6.2-sol")))
+    routes = (("claude", "claude-sonnet-5-5", "medium"), ("codex", "gpt-6.2-sol", "medium"),
+              ("grok", "grok-4.7", "high"), ("cursor", "grok-4.7-high", "high"))
+    seat = any(pick(cfg, *route, host, now)[0] for route in routes)
     return ready, seat
 
 
@@ -280,6 +309,8 @@ def due(cfg, host, now):
         row = rows.get(rec["account"])
         if rec["host"] != host or handle not in alive or row is None:
             continue
+        if row["agent"] == "cursor" or (row["agent"] == "grok" and not mac_host(host)):
+            continue
         why = past_handoff(row, *windows(cfg, row, now))
         if why:
             found.append((row["label"], handle, why))
@@ -290,6 +321,8 @@ def hold(cfg, args):
     row = next((r for r in cfg["account"] if r.get("host", "local") == args.host and args.account in (r["id"], r["label"])), None)
     if row is None:
         raise SystemExit(f"no account {args.account} in accounts.toml")
+    if args.agent in SLOT_AGENTS and (row["agent"] != args.agent or not mac_host(args.host)):
+        raise SystemExit(f"{args.agent} needs a matching account on the local Mac")
     with edit_holds(HOLDS) as holds:
         holds[args.terminal] = {"account": row["id"], "label": row["label"], "agent": args.agent,
                                 "model": args.model, "effort": args.effort, "host": args.host,
@@ -302,7 +335,7 @@ LIM = tomllib.loads(LIMITS.read_text())
 def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("command", choices=["pick", "select", "hold", "due", "coordinator", "fill"])
-    p.add_argument("--agent", choices=["claude", "codex"])
+    p.add_argument("--agent", choices=("claude", "codex", *SLOT_AGENTS))
     p.add_argument("--model")
     p.add_argument("--effort", default="medium")
     p.add_argument("--host", default="local")
@@ -329,6 +362,11 @@ def main(argv=None):
     if args.command == "select":
         if not (args.agent and args.account):
             raise SystemExit("select needs --agent and --account")
+        if args.agent in SLOT_AGENTS:
+            if not mac_host(args.host) or not any(row["agent"] == args.agent and row["host"] == args.host
+                and row["enabled"] and args.account in (row["id"], row["label"]) for row in cfg["account"]):
+                raise SystemExit(f"{args.agent} needs a matching enabled account on the local Mac")
+            return 0  # Both CLIs use their own signed-in account.
         account_command("select", "--agent", args.agent, "--account", args.account)
         return 0
     if args.command == "coordinator":
@@ -350,10 +388,13 @@ def main(argv=None):
         print(line, file=sys.stderr)
     if row is None:
         return 1
-    select = (["orca", "account", "select"] if args.host == "local" else
-              [sys.executable, str(Path(__file__).resolve()), "select", "--host", args.host])
-    print(json.dumps({"id": row["id"], "label": row["label"], "plan": row["plan"], "host": args.host,
-                      "select": [*select, "--agent", args.agent, "--account", row["id"]]}))
+    select = []
+    if args.agent not in SLOT_AGENTS:
+        command = (["orca", "account", "select"] if args.host == "local" else
+                   [sys.executable, str(Path(__file__).resolve()), "select", "--host", args.host])
+        select = [*command, "--agent", args.agent, "--account", row["id"]]
+    print(json.dumps({"id": row["id"], "label": row["label"], "plan": row.get("plan", ""), "host": args.host,
+                      "select": select}))
     return 0
 
 

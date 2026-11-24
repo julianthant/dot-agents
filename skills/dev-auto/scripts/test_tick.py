@@ -1558,6 +1558,27 @@ with sqlite3.connect(":memory:") as db, patch.object(tick, "inspect_worker",
     assert tick.latest_coder_report(state.copy(), 41, mailbox, {manual_report["id"]}) == [recorded]
     inspect.assert_called_once_with("manual")
 
+# A coder without a report can ignore mail from before its Task and still find an unplaced follow-up.
+manual_report = dict(manual_report, created_at="2026-11-23T08:00:00Z")
+old_report = dict(old_report, created_at="2026-11-23T07:59:59Z")
+unplaced = [dict(old_report, id=f"unplaced-{i}", sequence=i + 4, created_at="2026-11-23T08:00:01Z",
+                 payload={"taskId": f"task-{i}", "dispatchId": f"unplaced-{i}", "outcome": "succeeded"})
+            for i in range(13)]
+
+def unrelated_worker(dispatch):
+    return followup_worker(dispatch, "other-pane", previous="coder" if dispatch == "manual" else None)
+
+with sqlite3.connect(":memory:") as db, patch.object(tick, "inspect_worker", side_effect=unrelated_worker) as inspect:
+    mailbox = tick.ReviewMailbox(db, "run", [old_report, manual_report, *unplaced],
+                                 tasks=[{"id": "task", "title": "#41 coder", "created_at": "2026-11-23 08:00:00"}],
+                                 inventory=SimpleNamespace(rows=rows))
+    for _ in range(2):
+        assert tick.latest_coder_report(state.copy(), 41, mailbox, set()) == [manual_report]
+    assert tick.latest_coder_report(state.copy(), 41, mailbox, {manual_report["id"]}) == []
+    assert [call.args[0] for call in inspect.call_args_list] == [
+        *(f"unplaced-{i}" for i in reversed(range(13))), "manual",
+    ]
+
 # An explicit coder that reports to another Run fails loudly instead of exiting quietly.
 args = SimpleNamespace(issue=41, coder="ctx_elsewhere", run=None, anchor=None)
 with patch.object(tick, "tickets", return_value=[ticket]), patch.object(tick, "supervisor", return_value=([], "run")), \

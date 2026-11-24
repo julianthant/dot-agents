@@ -1704,15 +1704,21 @@ def mail_payload(message):
 
 
 class ReviewMailbox:
+    ISSUE_PREFIX = re.compile(r"^#(\d+)(?=[:\s]|$)")
+
     def __init__(self, db, run, messages, tasks=(), inventory=None):
         self.history = ReleasedDispatchHistory(db, run)
         self.inventory = inventory
         self.successes, self.failures = {}, {}
         self.by_task, self.by_terminal, self.by_issue, self.issue_tasks = {}, {}, {}, {}
+        self.task_created = {}
+        self.lineage_reads = {}
         self.last_success = -1
         for task in tasks:
+            if created := task.get("created_at"):
+                self.task_created[task["id"]] = created.replace(" ", "T")[:19]
             title = task.get("task_title") or task.get("title") or ""
-            issue = re.search(r"#(\d+)\b", title) or re.search(r"hr-relay ?#(\d+)\b", task.get("spec") or "")
+            issue = self.ISSUE_PREFIX.match(title) or re.search(r"hr-relay ?#(\d+)\b", task.get("spec") or "")
             if issue:
                 self.issue_tasks.setdefault(int(issue[1]), set()).add(task["id"])
         for message in sorted(messages, key=lambda m: m["sequence"]):
@@ -1732,8 +1738,15 @@ class ReviewMailbox:
                 self.by_task.setdefault(task, set()).add(dispatch)
             if terminal := message.get("from_handle"):
                 self.by_terminal.setdefault(terminal, set()).add(dispatch)
-            if issue := re.search(r"#(\d+)\b", message.get("subject") or ""):
+            if issue := self.ISSUE_PREFIX.match(message.get("subject") or ""):
                 self.by_issue.setdefault(int(issue[1]), set()).add(dispatch)
+
+    def read_lineage(self, dispatch, worker):
+        row = worker or {}
+        key = (dispatch, row.get("dispatchStatus"), row.get("terminalState"))
+        if key not in self.lineage_reads:
+            self.lineage_reads[key] = self.history.read(dispatch, worker)
+        return self.lineage_reads[key]
 
     def related(self, state, number, latest):
         run = self.history.run
@@ -1761,10 +1774,13 @@ class ReviewMailbox:
                     or (worker.get("resource") or {}).get("worktreeId"))
 
         coder_worktree = worktree(coder_worker)
+        unplaced = self.successes.keys() - workers.keys()
         children = {}
         for dispatch, worker in workers.items():
             resource = worker.get("resource") or {}
             workspace = worktree(worker)
+            if not workspace and dispatch in self.successes:
+                unplaced.add(dispatch)
             if (worker.get("taskId") in task_ids or worker.get("agentTerminalHandle") in terminals
                     or (workspace and (workspace == coder_worktree
                                        or state.get("path") in (workspace, workspace.partition("::")[2])))):
@@ -1774,6 +1790,11 @@ class ReviewMailbox:
             parent = attempt.get("retryOfDispatchId") or attempt.get("followUpOf") or resource.get("originDispatchId")
             if parent and parent != dispatch:
                 children.setdefault(parent, set()).add(dispatch)
+        # Before the coder reports, its Task creation still rules out older unplaced mail.
+        if not latest and (created := self.task_created.get(coder_worker.get("taskId"))):
+            unplaced = {dispatch for dispatch in unplaced
+                        if not (sent := self.successes[dispatch][-1].get("created_at"))
+                        or sent.replace(" ", "T")[:19] >= created}
         # The inventory and saved lineage only nominate candidates. Orca's ancestry still decides ownership.
         known, pending = {coder}, [coder]
         while pending:
@@ -1781,7 +1802,7 @@ class ReviewMailbox:
                 if child not in known:
                     known.add(child)
                     pending.append(child)
-        return workers, (related | known) - {coder}
+        return workers, (related | known | unplaced) - {coder}
 
 
 CHECKPOINT_HANDOFF = "handed off with a checkpoint"
@@ -1816,7 +1837,7 @@ def latest_coder_report(state, number, mailbox, handled, *, after=-1):
                     break
 
         def read(dispatch):
-            return mailbox.history.read(dispatch, workers.get(dispatch))
+            return mailbox.read_lineage(dispatch, workers.get(dispatch))
 
         for dispatch, message in sorted(candidates, key=lambda row: row[1]["sequence"], reverse=True):
             if in_coder_chain(dispatch, state["coder"], mailbox.history.run, read=read):

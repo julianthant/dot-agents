@@ -4,11 +4,12 @@ import sqlite3
 from contextlib import closing, redirect_stderr, redirect_stdout
 from io import StringIO
 import subprocess
+import sys
 import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from threading import Event, Thread
+from threading import Thread
 from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.error import HTTPError
@@ -308,6 +309,7 @@ class Roadmap(unittest.TestCase):
         self.block_ticket({"number": 653, "state": "OPEN"})
         self.heads = "red refs/heads/task/lane/1\n"
         self.runs({"head_branch": "task/lane/1", "head_sha": "red", "event": "push",
+                   "path": ".github/workflows/development.yml",
                    "status": "completed", "conclusion": "failure"})
         self.full()
         with self.local_worker({"dispatchStatus": "completed", "workerState": "succeeded"}):

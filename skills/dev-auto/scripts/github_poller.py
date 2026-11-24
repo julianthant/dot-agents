@@ -110,8 +110,12 @@ def conditional(cache, endpoint, select, poll):
     return value
 
 
+def run_summary(run):
+    return {key: run.get(key) for key in RUN_FIELDS}
+
+
 def runs(value):
-    return [{key: run.get(key) for key in RUN_FIELDS} for run in value["workflow_runs"]]
+    return [run_summary(run) for run in value["workflow_runs"]]
 
 
 def workflow_matches(run, workflow):
@@ -132,14 +136,19 @@ class Poller:
     def set(self, name, data):
         self.samples[name] = Sample(data, self.clock())
 
+    def remember(self, repo, rows):
+        with self.lock:
+            seen = {run["id"] for run in rows}
+            previous = (run for run in self.history[repo] if run["id"] not in seen)
+            self.history[repo] = tuple([*rows, *previous][:500])
+
     def poll_runs(self):
         errors = []
         for repo in REPOS:
             endpoint = f"repos/{OWNER}/{repo}/actions/runs?per_page=100"
             try:
                 data = conditional(self.cache, endpoint, runs, self.rest.poll)
-                seen = {run["id"]: run for run in data}
-                self.history[repo] = tuple([*data, *(run for run in self.history[repo] if run["id"] not in seen)][:500])
+                self.remember(repo, data)
                 self.pages[repo] = Sample(data, self.clock())
             except (Unavailable, OSError, ValueError, KeyError, subprocess.SubprocessError) as e:
                 errors.append(str(e))
@@ -198,6 +207,7 @@ class Poller:
                 sample = self.demand_sample(endpoint)
             elif source == "runs" and query.get("id", "").isdecimal():
                 sample = self.demand_sample(f"{root}/runs/{query['id']}")
+                sample = Sample(run_summary(sample.data) if sample.data else None, sample.at)
             elif source == "runs":
                 sample = self.read_runs(repo, root, query)
             else:
@@ -214,24 +224,27 @@ class Poller:
         page = self.pages[repo]
         if page.answer(self.clock())["stale"]:
             return page
+        key, value = ("head_sha", sha.lower()) if sha else ("head_branch", branch)
+
         def matches(run):
-            return (run["head_sha"] == sha or run["head_branch"] == branch) and workflow_matches(
-                run, workflow) and (not event or run["event"] == event)
+            return run[key] == value and workflow_matches(run, workflow) and (not event or run["event"] == event)
 
         found = [run for run in page.data if matches(run)]
         if found:
             return Sample(found, page.at)
-        if sha:
-            historical = next((run for run in self.history[repo] if run["id"] and matches(run)), None)
-            if historical:
-                older = self.demand_sample(f"{root}/runs/{historical['id']}")
-                return Sample(runs({"workflow_runs": [older.data]}) if older.data else None, older.at)
+        historical = next((run for run in self.history[repo] if run["id"] and matches(run)), None) if sha else None
+        if historical:
+            older = self.demand_sample(f"{root}/runs/{historical['id']}")
+            return Sample([run_summary(older.data)] if older.data else None, older.at)
         path = f"{root}/workflows/{workflow}/runs" if workflow else f"{root}/runs"
-        args = {"per_page": 100, "head_sha" if sha else "branch": sha or branch}
+        args = {"per_page": 100, "head_sha" if sha else "branch": value}
         if event:
             args["event"] = event
         older = self.demand_sample(f"{path}?{urlencode(args)}")
-        return Sample(runs(older.data) if older.data is not None else None, older.at)
+        discovered = [run for run in runs(older.data) if matches(run)] if older.data is not None else None
+        if sha and discovered:
+            self.remember(repo, discovered)
+        return Sample(discovered, older.at)
 
     def schedule(self, stop, interval, operation, *, rest=False):
         def loop():

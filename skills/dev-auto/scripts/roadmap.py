@@ -127,20 +127,32 @@ def refresh(state):
     state["heads"] = branch_heads(tick.tickets(rows=snap["open"]))
     state["readiness"] = readiness(snap)
     state["githubFetchedAt"] = stamp()
-    return snap
 
 
-def render(full=False):
-    state = read_json(STATE, {})
-    state.setdefault("pipeline", {})
-    if full:
-        snap = refresh(state)
-    else:
+def render(full=False, directory=None):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    if not full:
+        return render_local(directory)
+    # A slow GitHub request must not block periodic local updates.
+    with STATE.with_suffix(".refresh.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = read_json(STATE, {})
+        refresh(state)
+        return render_local(directory, refreshed=state)
+
+
+def render_local(directory, *, refreshed=None):
+    with STATE.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = read_json(STATE, {}) if refreshed is None else refreshed
+        state.setdefault("pipeline", {})
         snap = read_json(tick.SNAPSHOT, {"open": [], "closed": []})
-    data = build(snap, state, now_rows(snap, state))
-    if full:
-        write_json(STATE, state)
-    return data
+        data = build(snap, state, now_rows(snap, state))
+        if refreshed is not None:
+            write_json(STATE, state)
+        if directory is not None:
+            write_json(directory / "data.json", data)
+        return data
 
 
 def readiness(snap):
@@ -401,14 +413,9 @@ def pipeline(rest, prs, full_run):
 
 
 def publish(full, directory=None):
-    STATE.parent.mkdir(parents=True, exist_ok=True)
-    with STATE.with_suffix(".lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        data = render(full)
-        if directory is None:
-            json.dump(data, sys.stdout, separators=(",", ":"))
-        else:
-            write_json(directory / "data.json", data)
+    data = render(full, directory)
+    if directory is None:
+        json.dump(data, sys.stdout, separators=(",", ":"))
 
 
 def make_server(directory, bind, port):

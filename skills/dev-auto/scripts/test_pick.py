@@ -283,3 +283,11 @@ with TemporaryDirectory() as temp, patch.object(pick, "HOLDS", Path(temp) / "hol
             assert pick.pick(cfg, agent, model, "high", "Juzzark-WSL", 2, holds=[])[0] is None
             with patch.object(pick.sys, "platform", "linux"):
                 assert pick.pick(cfg, agent, model, "high", "local", 2, holds=[])[0] is None
+
+        with (patch.object(pick.account_usage, "load_config", return_value=cfg),
+              patch.object(pick, "live_holds", return_value=[]), patch.object(pick.subprocess, "run") as orca,
+              redirect_stdout(io.StringIO()) as out):
+            assert pick.main(["pick", "--agent", "cursor", "--model", "grok-4.7-high", "--effort", "high"]) == 0
+            assert json.loads(out.getvalue())["select"] == []
+            assert pick.main(["select", "--agent", "cursor", "--account", "cursor-seat"]) == 0
+            orca.assert_not_called()

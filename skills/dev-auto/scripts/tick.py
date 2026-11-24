@@ -2560,29 +2560,36 @@ def watch_pass(args, db, actions, errors):
         return None
 
     def replacement_for(w, show, number, fresh_handoff):
-        dispatch = w["dispatchId"]
+        dispatch, task_id = w["dispatchId"], w["taskId"]
         worktree = show["worker"]["worktreeId"]
         role = role_of(show["dispatch"])
-        for pos, other in enumerate(roster):
-            found = other["dispatchId"]
-            if found == dispatch or (found in local_dispatches and other["taskId"] == w["taskId"]):
+        created = tasks.get(task_id, {}).get("created_at")
+        for other in roster:
+            found, other_task_id = other["dispatchId"], other["taskId"]
+            local = found in task_of
+            if found == dispatch or found in replaced or (local and other_task_id == task_id):
                 continue
             projection = other.get("projection") or {}
             resource = other.get("resource") or {}
             workspace_id = (projection.get("workspace") or {}).get("id") or resource.get("worktreeId")
-            same_tree = worktree and found in local_dispatches and workspace_id == worktree
-            newer = pos < worker_order[dispatch]
-            if fresh_handoff and newer and same_tree:
+            same_tree = worktree and local and workspace_id == worktree
+            if local:
+                newer = worker_order[found] < worker_order[dispatch]
+            else:
+                # Orca appends paired Dispatches without timestamps after each local page.
+                other_created = tasks.get(other_task_id, {}).get("created_at")
+                newer = bool(created and other_created and other_created > created)
+            if fresh_handoff and newer and same_tree and task_role(other_task_id) in (None, role):
                 return found
             live_on_tree = (same_tree and other["dispatchStatus"] == "dispatched"
                             and (projection.get("liveness") or {}).get("verdict") != "exited"
                             and resource.get("ownerDispatchId") in (None, found))
-            same_ticket = newer and number is not None and issue_of(other["taskId"])[1] == number
+            same_ticket = newer and number is not None and issue_of(other_task_id)[1] == number
             if role and (live_on_tree or same_ticket):
-                other_role = task_role(other["taskId"])
+                other_role = task_role(other_task_id)
                 if not other_role:
                     d = runtime("orchestration", "worker-show", "--dispatch", found, "--full")["dispatch"]
-                    if d["id"] != found or d["runId"] != run or d["taskId"] != other["taskId"]:
+                    if d["id"] != found or d["runId"] != run or d["taskId"] != other_task_id:
                         raise OrcaError("Dispatch identity changed")
                     other_role = role_of(d)
                 if other_role == role:
@@ -2618,6 +2625,8 @@ def watch_pass(args, db, actions, errors):
             pending.setdefault("dispatch", dispatch)
             pending.setdefault("number", number)
             resume_start(terminal, state)
+            return
+        if number is not None and (review_state(db, run, number) or {}).get("stage") == "Needs you":
             return
         if replacement := replacement_for(w, show, number, fresh_handoff):
             owed = {"coordinator": state["coordinator"]} if state.get("coordinator") else None
@@ -2917,9 +2926,8 @@ def watch_pass(args, db, actions, errors):
         roster.append(w)
         if host == "local":
             workers.append(w)
-    worker_order = {w["dispatchId"]: pos for pos, w in enumerate(roster)}
+    worker_order = {w["dispatchId"]: pos for pos, w in enumerate(workers)}
     task_of = {w["dispatchId"]: w["taskId"] for w in workers}
-    local_dispatches = task_of.keys()
     for w in workers:
         terminal, dispatch, task_id = w["agentTerminalHandle"], w["dispatchId"], w["taskId"]
         owner = (w.get("resource") or {}).get("ownerDispatchId")
@@ -2949,8 +2957,6 @@ def watch_pass(args, db, actions, errors):
             title = task.get("task_title") or ""
             ticket = cards.get(number)
             review = (review_state(db, run, number) or {}) if number is not None else {}
-            if review.get("stage") == "Needs you":
-                continue
             named = {review.get("coder"), review.get("expected"), (review.get("reviewer") or {}).get("dispatch")}
             if not live and unwatched and not (ticket and (ticket["stage"] in ACTIVE or dispatch in named)):
                 continue  # history: only a ticket still in work can have a current crash

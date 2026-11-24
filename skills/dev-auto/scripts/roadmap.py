@@ -125,7 +125,7 @@ def refresh(state):
         meta = tick.project_meta(refresh=True)
     state["areas"] = area_names(meta)
     state["heads"] = branch_heads(tick.tickets(rows=snap["open"]))
-    state["readiness"] = readiness(snap)
+    state["readiness"] = {str(number): reason for number, reason in readiness(snap).items()}
     state["githubFetchedAt"] = stamp()
 
 

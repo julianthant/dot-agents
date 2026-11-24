@@ -149,6 +149,7 @@ class Roadmap(unittest.TestCase):
               patch.object(pick.account_usage, "load_config", return_value={}),
               patch.object(pick, "pick", side_effect=seat)):
             rows = self.full()["issues"]
+            self.assertEqual(roadmap.render()["issues"], rows)
             with redirect_stdout(StringIO()) as output:
                 tick.fill(SimpleNamespace(repo_path=Path("/fixture"), issue=None, dry_run=True, holds=None))
         starts = [json.loads(line.split("would start ", 1)[-1])["issue"]
@@ -419,6 +420,7 @@ class Roadmap(unittest.TestCase):
                 with urlopen(Request(base + path, method=method, headers=headers), timeout=5) as response:
                     return response.status, response.read()
             except HTTPError as error:
+                error.close()
                 return error.code, b""
 
         with roadmap.make_server(directory, "127.0.0.1", 0) as server:

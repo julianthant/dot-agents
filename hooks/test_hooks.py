@@ -133,7 +133,8 @@ class RepeatTest(unittest.TestCase):
 
 class CiWaitHookTest(unittest.TestCase):
     def test_blocks_watches_but_allows_one_shot_reads(self):
-        for command in ("gh run watch 123", "gh pr checks 42 --watch", "git push && /usr/bin/gh run watch 4"):
+        for command in ("gh run watch 123", "gh pr checks 42 --watch", "git push && /usr/bin/gh run watch 4",
+                        "gh -R example/repo pr checks 42 --watch=true"):
             with self.subTest(command=command):
                 payload = {"tool_name": "Bash", "tool_input": {"command": command}}
                 out = json.loads(run("ci-wait.py", payload))["hookSpecificOutput"]

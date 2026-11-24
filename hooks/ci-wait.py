@@ -18,7 +18,9 @@ def watches(command):
             if all(char in ";&|()" for char in arg):
                 break
             args.append(arg)
-        if args[:2] == ["run", "watch"] or args[:2] == ["pr", "checks"] and "--watch" in args[2:]:
+        pairs = set(zip(args, args[1:]))
+        watch_flag = any(arg in ("--watch", "--watch=true", "-w") for arg in args)
+        if ("run", "watch") in pairs or (("pr", "checks") in pairs and watch_flag):
             return True
     return False
 

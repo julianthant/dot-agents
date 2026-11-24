@@ -3,6 +3,8 @@ import os
 import sqlite3
 from contextlib import closing, redirect_stderr, redirect_stdout
 from io import StringIO
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
 from shutil import copy2
 import subprocess
 import sys
@@ -67,6 +69,11 @@ class Roadmap(unittest.TestCase):
                     status = json.load(response)
                 self.assertIn("sources", status)
                 self.assertIn("callsLastHour", status)
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(Request(f"http://127.0.0.1:{server.server_port}/status",
+                                    headers={"Host": "unknown.example"}), timeout=5)
+                self.assertEqual(error.exception.code, 400)
+                error.exception.close()
             finally:
                 server.shutdown()
                 serving.join(5)
@@ -415,6 +422,28 @@ class Roadmap(unittest.TestCase):
         self.assertEqual(self.poller.pages["hr-relay"], previous)
         self.assertEqual((directory / "data.json").read_bytes(), saved)
 
+    def test_board_publishes_even_when_pipeline_fails_from_startup(self):
+        self.prepare()
+        self.poller.poll_runs()
+        del self.replies[f"repos/{roadmap.REPO}/releases?per_page=1"]
+        with self.assertRaises(ValueError):
+            roadmap.pipeline(self.poller)
+        status = {"lastRun": SINCE, "errors": []}
+        tick.SNAPSHOT.with_name("tick.json").write_text(json.dumps(status))
+        directory = tick.SNAPSHOT.parent
+        with self.local_worker({}):
+            roadmap.publish_board(self.poller, directory)
+            data = json.loads((directory / "data.json").read_text())
+            self.assertIsNotNone(data["githubFetchedAt"])
+            self.assertEqual(data["issues"][0]["now"]["status"], "working")
+            self.assertEqual(data["tick"], status)
+
+            self.poller.pages["hr-relay"] = github_poller.Sample([], self.poller.clock() - 61)
+            data = roadmap.publish_board(self.poller, directory)
+            self.assertEqual(data["issues"][0]["now"]["status"], "working")
+            self.assertEqual(data["tick"], status)
+            self.assertTrue(self.poller.status()["sources"]["runs:hr-relay"]["stale"])
+
     def test_polling_reuses_etags_and_local_renders_keep_the_github_timestamp(self):
         full = {"head_branch": "development", "event": "workflow_dispatch", "status": "in_progress",
                 "conclusion": None, "created_at": SINCE, "head_sha": "abc", "html_url": "https://example.com/run",
@@ -487,6 +516,23 @@ class Roadmap(unittest.TestCase):
             self.assertEqual(self.poller.read("jobs", job_query)["data"]["jobs"][0]["name"], "Checks")
         self.assertEqual(sum(argv[-1] == path for argv in self.sent), 1)
         self.assertEqual(sum(argv[-1] == job_path for argv in self.sent), 1)
+
+    def test_twenty_due_job_lookups_are_refreshed_in_one_pass(self):
+        now = time.time()
+        self.poller.clock = lambda: now
+        queries = [{"repo": "hr-relay", "id": str(i), "attempt": "2"} for i in range(1, 21)]
+        for query in queries:
+            path = f"repos/julianthant/hr-relay/actions/runs/{query['id']}/attempts/2/jobs?per_page=100"
+            self.replies[path] = R200.format(tag=query["id"], body='{"jobs":[]}')
+            self.assertIsNone(self.poller.read("jobs", query)["data"])
+        for _ in range(4):
+            self.poller.poll_details()
+            for query in queries:
+                answer = self.poller.read("jobs", query)
+                self.assertEqual(answer["data"], {"jobs": []})
+                self.assertFalse(answer["stale"])
+            now += 30
+        self.assertEqual(len(self.sent), 80)
 
     def test_budget_slowdown_floor_and_304(self):
         clock = [100]
@@ -580,6 +626,49 @@ class Roadmap(unittest.TestCase):
         graph = {"relay": {"dev": {"nodes": [pr]}, "staging": {"nodes": []}}, "agents": {"task": {"nodes": []}}}
         with patch.object(roadmap, "pull_requests", REAL_PULL_REQUESTS), patch.object(roadmap, "github_query", return_value=graph):
             self.assertEqual(roadmap.pull_requests()["devPrs"][0]["checks"], "green")
+            pr["baseRef"]["refUpdateRule"]["requiredStatusCheckContexts"] = []
+            self.assertEqual(roadmap.pull_requests()["devPrs"][0]["checks"], "green")
+            pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"][0]["conclusion"] = "FAILURE"
+            self.assertEqual(roadmap.pull_requests()["devPrs"][0]["checks"], "failing")
+
+    def test_ci_wait_reports_an_unlisted_run_then_uses_the_requested_attempt(self):
+        spec = spec_from_loader("ci_wait", SourceFileLoader("ci_wait", str(Path(tick.__file__).with_name("ci-wait"))))
+        client = module_from_spec(spec)
+        spec.loader.exec_module(client)
+        sha = "a" * 40
+        for repo, workflow, event, conclusion in (("hr-relay", "development.yml", "push", "success"),
+                ("dot-agents", "tests.yml", "pull_request", "cancelled")):
+            with self.subTest(repo=repo):
+                now = 0
+                calls = []
+                output = StringIO()
+                wrong_event = "pull_request" if event == "push" else "push"
+                old = {"head_sha": sha, "path": workflow, "event": event, "status": "completed",
+                       "conclusion": "success", "id": 1, "run_attempt": 1, "html_url": "old"}
+                target = dict(old, id=2, run_attempt=2, conclusion=conclusion, html_url="current")
+
+                def read(source, **query):
+                    calls.append((source, query))
+                    if source == "jobs":
+                        return {"jobs": [{"name": "Checks", "conclusion": "cancelled"}]}
+                    if now <= 180:
+                        return [dict(target, event=wrong_event)]
+                    self.assertIn("no " + event + " run listed after 3 minutes", output.getvalue())
+                    return [dict(target, event=wrong_event, id=3), old, target]
+
+                def sleep(seconds):
+                    nonlocal now
+                    now += seconds
+
+                with (patch.object(client, "read", side_effect=read), patch.object(client, "sleep", sleep),
+                      patch.object(client, "monotonic", lambda: now), redirect_stdout(output), redirect_stderr(output)):
+                    self.assertEqual(client.wait(repo, sha), int(conclusion != "success"))
+                self.assertIn(f"{sha} {conclusion} current", output.getvalue())
+                self.assertEqual(output.getvalue().count("after 3 minutes"), 1)
+                self.assertEqual(calls[0], ("runs", {"repo": repo, "sha": sha, "event": event,
+                                                    "workflow": workflow, "waiting": "1"}))
+                self.assertEqual([query for source, query in calls if source == "jobs"],
+                                 [] if conclusion == "success" else [{"repo": repo, "id": 2, "attempt": 2}])
 
 
 if __name__ == "__main__":

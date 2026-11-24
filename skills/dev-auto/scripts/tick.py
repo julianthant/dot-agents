@@ -2652,7 +2652,7 @@ def watch_pass(args, db, actions, errors):
         title, spec = (task.get(key) or "" for key in ("task_title", "spec"))
         if role := re.search(r"(?m)^Role: .*roles/(coder|reviewer)\.md\b", spec):
             return role[1]
-        if role := re.search(r"\b(coder|reviewer?)\b", title, re.I):
+        if role := re.search(r"\b(coder|review(?:er)?)\b", title, re.I):
             return "coder" if role[1].lower() == "coder" else "reviewer"
         if spec.startswith("/goal Implement "):
             return "coder"
@@ -2669,7 +2669,7 @@ def watch_pass(args, db, actions, errors):
             d = runtime("orchestration", "worker-show", "--dispatch", up, "--full")["dispatch"]
         return None
 
-    def replacement_for(w, show, number, fresh_handoff):
+    def replacement_for(w, show, number, fresh_handoff, recorded_coder):
         dispatch, task_id = w["dispatchId"], w["taskId"]
         worktree = show["worker"]["worktreeId"]
         role = role_of(show["dispatch"])
@@ -2678,6 +2678,10 @@ def watch_pass(args, db, actions, errors):
             found, other_task_id = other["dispatchId"], other["taskId"]
             local = found in task_of
             if found == dispatch or found in replaced or (local and other_task_id == task_id):
+                continue
+            if not local and other_task_id not in tasks:
+                if role == "coder" and found == recorded_coder:
+                    return found
                 continue
             projection = other.get("projection") or {}
             resource = other.get("resource") or {}
@@ -2689,20 +2693,19 @@ def watch_pass(args, db, actions, errors):
                 # Orca appends paired Dispatches without timestamps after each local page.
                 other_created = tasks.get(other_task_id, {}).get("created_at")
                 newer = bool(created and other_created and other_created > created)
-            if fresh_handoff and newer and same_tree and task_role(other_task_id) in (None, role):
-                return found
+            fresh_history = fresh_handoff and newer and same_tree
             live_on_tree = (same_tree and other["dispatchStatus"] == "dispatched"
                             and (projection.get("liveness") or {}).get("verdict") != "exited"
                             and resource.get("ownerDispatchId") in (None, found))
             same_ticket = newer and number is not None and issue_of(other_task_id)[1] == number
-            if role and (live_on_tree or same_ticket):
+            if fresh_history or (role and (live_on_tree or same_ticket)):
                 other_role = task_role(other_task_id)
                 if not other_role:
                     d = runtime("orchestration", "worker-show", "--dispatch", found, "--full")["dispatch"]
                     if d["id"] != found or d["runId"] != run or d["taskId"] != other_task_id:
                         raise OrcaError("Dispatch identity changed")
                     other_role = role_of(d)
-                if other_role == role:
+                if other_role == role or (fresh_history and other_role is None):
                     return found
         return None
 
@@ -2736,9 +2739,10 @@ def watch_pass(args, db, actions, errors):
             pending.setdefault("number", number)
             resume_start(terminal, state)
             return
-        if number is not None and (review_state(db, run, number) or {}).get("stage") == "Needs you":
+        review = (review_state(db, run, number) or {}) if number is not None else {}
+        if review.get("stage") == "Needs you":
             return
-        if replacement := replacement_for(w, show, number, fresh_handoff):
+        if replacement := replacement_for(w, show, number, fresh_handoff, review.get("coder")):
             owed = {"coordinator": state["coordinator"]} if state.get("coordinator") else None
             save(terminal, owed, replaced_dispatch=dispatch)
             replaced.add(dispatch)
@@ -3047,6 +3051,7 @@ def watch_pass(args, db, actions, errors):
             workers.append(w)
     worker_order = {w["dispatchId"]: pos for pos, w in enumerate(workers)}
     task_of = {w["dispatchId"]: w["taskId"] for w in workers}
+    research = research_root()
     for w in workers:
         terminal, dispatch, task_id = w["agentTerminalHandle"], w["dispatchId"], w["taskId"]
         task, number = issue_of(task_id)
@@ -3076,6 +3081,9 @@ def watch_pass(args, db, actions, errors):
             show = runtime("orchestration", "worker-show", "--dispatch", dispatch, "--full")
             if show["dispatch"]["id"] != dispatch or show["dispatch"]["runId"] != run:
                 raise OrcaError("Dispatch identity changed")
+            worktree = (show.get("worker") or {}).get("worktreeId") or ""
+            if Path(worktree.partition("::")[2]).parent == research:
+                continue
             title = task.get("task_title") or ""
             ticket = cards.get(number)
             review = (review_state(db, run, number) or {}) if number is not None else {}

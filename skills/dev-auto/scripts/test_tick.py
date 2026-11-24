@@ -1958,6 +1958,8 @@ class Fleet:
         self.next_start = ("ctx_restart", "term_restart")
         self.ticket = dict(number=553, item="card", agent=f"coder {model} medium @jzaw", stage="Coding")
         self.title = "#553 coder"
+        self.spec = "/goal Implement julianthant/hr-relay#553 and report a green SHA."
+        self.worktree = "repo::/wt"
         self.notes = []
         self.followups = []  # Tasks Orca created for mail to a settled Dispatch
         self.note_lost = False  # the send to the replacement applies, but its reply is lost
@@ -1972,20 +1974,20 @@ class Fleet:
         verb = args[:2]
         if verb == ("orchestration", "task-list"):
             return {"tasks": [{"id": "task_coder", "run_id": "run", "task_title": self.title, "status": self.task_status,
-                               "created_at": "2026-11-24 19:00:00",
-                               "spec": "/goal Implement julianthant/hr-relay#553 and report a green SHA."},
+                               "created_at": "2026-11-24 19:00:00", "spec": self.spec},
                               *([dict(id="task_replacement", run_id="run", task_title=self.replacement["title"],
                                       spec=self.replacement["spec"],
                                       created_at="2026-11-24 19:01:00" if self.replacement["newer"] else "2026-11-24 18:59:00")]
-                                if self.replacement else []),
+                                if self.replacement and self.replacement["task_listed"] else []),
                               *self.followups,
-                              *([{"id": "task_orig", "run_id": "run", "task_title": self.orig_title}] if self.follow_of else []),
+                              *([{"id": "task_orig", "run_id": "run", "task_title": self.orig_title}]
+                                if self.follow_of or (self.replacement or {}).get("follow_of") else []),
                               *([{"id": "task_root", "run_id": "run", "task_title": "#553 reviewer"}] if self.orig_parent else [])]}
         if verb == ("orchestration", "worker-list"):
             row = dict(dispatchId=self.dispatch, taskId="task_coder", runId="run", workerState=self.state,
                        dispatchStatus=self.status, agentTerminalHandle=self.terminal,
                        resource={"ownerDispatchId": "ctx_follow" if self.transferred else self.dispatch},
-                       projection={"host": {"kind": "local"}, "workspace": {"id": "repo::/wt"},
+                       projection={"host": {"kind": "local"}, "workspace": {"id": self.worktree},
                                    "liveness": {"verdict": self.liveness}})
             manual, remote = [], []
             if self.replacement:
@@ -2051,7 +2053,7 @@ class Fleet:
                 "effective": {"agent": "codex", "model": "gpt-6.2-sol", "effort": "xhigh"}}}}}
         if verb == ("orchestration", "worker-show") and args[3] == "ctx_manual":
             return {"dispatch": {"id": "ctx_manual", "runId": "run", "taskId": "task_replacement",
-                                 "status": self.replacement["status"]},
+                                 "status": self.replacement["status"], "followUpOf": self.replacement["follow_of"]},
                     "worker": {"state": "ready", "worktreeId": self.replacement["worktree"],
                                "startOptions": {"launch": {"effective": {}}}},
                     "projection": {"liveness": {"verdict": self.replacement["liveness"]}}}
@@ -2061,7 +2063,7 @@ class Fleet:
             return {"dispatch": {"id": self.dispatch, "runId": "run", "taskId": "task_coder", "status": self.status,
                                  "assigneeHandle": self.terminal, "lastFailure": self.failure,
                                  "retryOfDispatchId": retry, "followUpOf": self.follow_of},
-                    "worker": {"state": self.state, "worktreeId": "repo::/wt", "dispatchId": self.dispatch,
+                    "worker": {"state": self.state, "worktreeId": self.worktree, "dispatchId": self.dispatch,
                                "effects": [{"kind": "terminal", "role": "agent", "action": "created", "id": self.terminal}],
                                "startOptions": {"launch": {"effective": {"agent": self.agent, "model": self.model,
                                                                          "effort": self.effort}}}},
@@ -2132,10 +2134,10 @@ class Fleet:
         raise AssertionError(args)
 
     def add_replacement(self, title="#553 coder", *, worktree="repo::/wt", live=True, newer=True, spec="", remote=False,
-                        screen=CLAUDE_WORKING):
+                        screen=CLAUDE_WORKING, follow_of=None, task_listed=True):
         self.replacement = dict(title=title, worktree=worktree, newer=newer, spec=spec, remote=remote,
                                 status="dispatched" if live else "completed", liveness="live" if live else "exited",
-                                screen=screen)
+                                screen=screen, follow_of=follow_of, task_listed=task_listed)
 
     def checkpoint_failure(self):
         self.status, self.state, self.liveness = "failed", "failed", "exited"
@@ -2299,6 +2301,41 @@ for watched in (False, True):
         f.add_replacement("#553 reviewer")
         assert f.tick(1).count(("orchestration", "worker-start")) == 1, f.lines
 
+# An unwatched coder's checkpoint still restarts beside a live re-review.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.checkpoint_failure()
+    f.add_replacement("#553 re-review at abc")
+    assert f.tick().count(("orchestration", "worker-start")) == 1, f.lines
+
+# The same holds when a reviewer follows up under a neutral title.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.checkpoint_failure()
+    f.add_replacement("#553: resume", follow_of="ctx_orig")
+    assert f.tick().count(("orchestration", "worker-start")) == 1, f.lines
+
+# A live re-review supersedes a re-review at a limit.
+for title in ("#553 re-review", "#553 review"):
+    with TemporaryDirectory() as tmp:
+        f = Fleet(tmp, screen=CODEX_AT_LIMIT)
+        f.title, f.spec = title, ""
+        f.add_replacement("#553 re-review 2")
+        calls = f.tick()
+        assert '"dispatch": "ctx_coder", "replaced by": "ctx_manual"' in f.lines[0], f.lines
+        assert ("orchestration", "worker-start") not in calls and ("orchestration", "worker-stop") not in calls
+
+# Detached research stays out of watch even when neither Task has a role or a research card.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.title, f.spec = "#553: research notes", ""
+    f.worktree = f"repo::{tick.research_root() / 'issue-553-abcd'}"
+    f.checkpoint_failure()
+    f.add_replacement("#553: continue research", worktree=f.worktree)
+    calls = f.tick()
+    assert "replaced by" not in f.lines[0], f.lines
+    assert ("orchestration", "worker-start") not in calls and ("terminal", "read") not in calls
+
 # An older live owner of the worktree blocks a usage-limit restart in the same role.
 with TemporaryDirectory() as tmp:
     f = Fleet(tmp, screen=CODEX_AT_LIMIT)
@@ -2317,6 +2354,19 @@ for newer in (True, False):
         calls = f.tick()
         assert calls.count(("orchestration", "worker-start")) == (0 if newer else 1), f.lines
         assert ("orchestration", "worker-stop") not in calls and ("replaced by" in f.lines[0]) == newer, f.lines
+
+# Paired rows without Tasks supersede local coders only when the review row names that Dispatch.
+for recorded_coder in ("ctx_manual", "ctx_unrelated"):
+    with TemporaryDirectory() as tmp:
+        f = Fleet(tmp, screen=CLAUDE_WORKING)
+        f.checkpoint_failure()
+        f.add_replacement(worktree="repo::/elsewhere", remote=True, task_listed=False)
+        tick.review_state(f.db, "run", 553)
+        tick.save_review(f.db, "run", 553, {"coder": recorded_coder})
+        calls = f.tick()
+        replaced = recorded_coder == "ctx_manual"
+        assert calls.count(("orchestration", "worker-start")) == (0 if replaced else 1), f.lines
+        assert ('"dispatch": "ctx_coder", "replaced by": "ctx_manual"' in f.lines[0]) == replaced, f.lines
 
 # A second checkpoint at the same branch head needs the operator, once.
 for progressed in (False, True):

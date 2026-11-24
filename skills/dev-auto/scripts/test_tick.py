@@ -1080,6 +1080,15 @@ recorded = report("coder", f"I pushed {sha} with host-local account selection.")
 mailbox = tick.ReviewMailbox(sqlite3.connect(":memory:"), "run", [report("other", sha, "question"), recorded])
 assert mailbox.successes == {"coder": [recorded]}
 
+with sqlite3.connect(":memory:") as db:
+    mailbox = tick.ReviewMailbox(db, "run", [
+        dict(report("pr", sha), subject="PR #47 for #796"),
+        dict(report("fix", sha), sequence=2, subject="#796: Fixing"),
+        dict(report("resume", sha), sequence=3, subject="#796 resume"),
+    ], tasks=[{"id": "pr", "title": "PR #47 for #796"}, {"id": "coder", "title": "#796 coder"}])
+    assert mailbox.by_issue == {796: {"fix", "resume"}}
+    assert mailbox.issue_tasks == {796: {"coder"}}
+
 assert tick.review_route("Coder: codex / gpt-6.2-sol / medium. Reviewer: none (UI, simple; green task CI clears it). Tier: UI, simple.") is None
 check.assertEqual(tick.review_route("Reviewer: Claude Sonnet 5.5 medium with Opus advisor"),
                   ("claude", "claude-sonnet-5-5", "medium", "opus"))
@@ -1502,7 +1511,7 @@ for pending in (False, True):
     ticket, state = review_fixture()
     state.update(coder_terminal="old-pane")
     original = dict(recorded, created_at="2026-11-23T08:00:00Z")
-    manual = dict(report("manual", "red at the old head", msg_id="manual-report"), sequence=3, subject="#41 follow-up",
+    manual = dict(report("manual", "red at the old head", msg_id="manual-report"), sequence=3,
                   from_handle="manual-pane",
                   payload={"taskId": "manual-task", "dispatchId": "manual", "outcome": "succeeded"})
 
@@ -1527,6 +1536,27 @@ for pending in (False, True):
             tick.save_review(db, "run", 41, dict(state, pending=original["id"], sha=sha))
         tick.review_step(db, "run", [], ticket, state, [original, manual])
         assert tick.review_state(db, "run", 41)["coder"] == "fix"
+
+# An inventory row without a workspace can still report from a new Task and pane.
+ticket, state = review_fixture()
+state["coder_terminal"] = "old-pane"
+manual_report = dict(report("manual", sha, msg_id="manual-report"), sequence=3, from_handle="manual-pane",
+                     payload={"taskId": "manual-task", "dispatchId": "manual", "outcome": "succeeded"})
+old_report = dict(manual_report, id="old-report", sequence=0,
+                  payload={"taskId": "old-task", "dispatchId": "old", "outcome": "succeeded"})
+rows = [{"dispatchId": "coder", "taskId": "task", "agentTerminalHandle": "old-pane",
+         "projection": {"workspace": {"id": "repo::/fixture"}}},
+        {"dispatchId": "manual", "taskId": "manual-task", "agentTerminalHandle": "manual-pane", "projection": {}}]
+with sqlite3.connect(":memory:") as db, patch.object(tick, "inspect_worker",
+        return_value=followup_worker("manual", "manual-pane", task="manual-task")) as inspect:
+    mailbox = tick.ReviewMailbox(db, "run", [recorded, manual_report, old_report],
+                                 inventory=SimpleNamespace(rows=rows))
+    for _ in range(2):
+        review = state.copy()
+        assert tick.latest_coder_report(review, 41, mailbox, set()) == [manual_report]
+        assert (review["coder"], review["expected"], review["coder_terminal"]) == ("manual", "manual", "manual-pane")
+    assert tick.latest_coder_report(state.copy(), 41, mailbox, {manual_report["id"]}) == [recorded]
+    inspect.assert_called_once_with("manual")
 
 # An explicit coder that reports to another Run fails loudly instead of exiting quietly.
 args = SimpleNamespace(issue=41, coder="ctx_elsewhere", run=None, anchor=None)

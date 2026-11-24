@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""Wait for task CI against the roadmap's shared GitHub snapshot."""
+from argparse import ArgumentParser
+import re
+import subprocess
+import sys
+from time import monotonic, sleep
+
+from github_poller import OWNER, REPOS, SHA, Unavailable, read
+from tick import task_workflow
+
+
+def repository():
+    remote = subprocess.run(["git", "remote", "get-url", "origin"], capture_output=True, text=True, timeout=5)
+    match = re.fullmatch(rf"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/){OWNER}/"
+                         rf"({'|'.join(REPOS)})(?:\.git)?", remote.stdout.strip())
+    if remote.returncode or not match:
+        raise Unavailable("run inside an HR Relay or dot-agents checkout, or supply --repo")
+    return match[1]
+
+
+def wait(repo, target):
+    deadline = monotonic() + 90 * 60
+    workflow, event = task_workflow(repo)
+    sha = target.lower() if SHA.fullmatch(target) else None
+    while monotonic() < deadline:
+        if sha is None:
+            sha = read("heads")[repo].get(target)
+            if sha:
+                print(f"{target} resolves to {sha}", flush=True)
+        if sha:
+            runs = read("runs", repo=repo, sha=sha, event=event, workflow=workflow)
+            if runs and runs[0]["status"] == "completed":
+                run = runs[0]
+                print(f"{sha} {run['conclusion']} {run['html_url']}", flush=True)
+                if run["conclusion"] == "success":
+                    return 0
+                while monotonic() < deadline:
+                    jobs = read("jobs", repo=repo, id=run["id"], attempt=run["run_attempt"] or 1)
+                    if jobs is not None:
+                        for job in jobs["jobs"]:
+                            if job["conclusion"] not in ("success", "neutral", "skipped"):
+                                print(f"  {job['name']} ({job['conclusion']})")
+                        return 1
+                    sleep(2)
+        sleep(2)
+    raise Unavailable(f"timed out waiting for {sha or target}")
+
+
+def main():
+    parser = ArgumentParser(description=__doc__)
+    parser.add_argument("ref", metavar="SHA_OR_BRANCH")
+    parser.add_argument("--repo", choices=REPOS)
+    args = parser.parse_args()
+    try:
+        return wait(args.repo or repository(), args.ref)
+    except (Unavailable, OSError, subprocess.SubprocessError) as e:
+        print(f"ci-wait: {e}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

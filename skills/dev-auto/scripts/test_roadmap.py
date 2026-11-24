@@ -14,6 +14,7 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+import github_poller
 import tick
 import roadmap
 import pick
@@ -24,6 +25,9 @@ R200 = 'HTTP/2.0 200 OK\r\nCache-Control: private, max-age=60, s-maxage=60\r\nEt
 SINCE = "2026-11-23T13:00:00Z"
 COMMAND = tick.command  # the real one, run over a faked gh process
 READINESS = roadmap.readiness
+REAL_PULL_REQUESTS = roadmap.pull_requests
+RUNS = {repo: f"repos/{github_poller.OWNER}/{repo}/actions/runs?per_page=100" for repo in github_poller.REPOS}
+SEARCH = "search/issues?per_page=1&q=repo%3Ajulianthant%2Fhr-relay+is%3Apr+is%3Amerged+base%3Adevelopment+merged%3A%3E2026-11-23"
 
 
 def issue(n, stage):
@@ -45,7 +49,6 @@ FIELDS = {"Status": {"id": "f_status", "name": "Status", "options": [{"id": "o_d
 GITHUB = {"pipeline": {"devPrs": []}, "milestones": ["Staging cut"]}
 REST = {
     "releases?per_page=1": [{"tag_name": "v1", "published_at": SINCE}],
-    "git/matching-refs/heads/cut/": [{"ref": "refs/heads/cut/old"}],
     "compare/staging...development?per_page=1": {"ahead_by": 8},
     "compare/main...development?per_page=1": {"ahead_by": 9},
     "milestones?state=open&per_page=50": [{"title": "Staging cut"}],
@@ -82,7 +85,7 @@ class Roadmap(unittest.TestCase):
         self.prs = {"devPrs": [], "stagingPr": [], "agentPrs": []}
         # Any GitHub read outside the conditional polls fails the test unless it expects one.
         self.reads = []
-        for target, name in ((tick, "command"), (roadmap, "gh")):
+        for target, name in ((tick, "command"), (roadmap, "github_query")):
             p = patch.object(target, name, side_effect=lambda *a: self.reads.append(a) or self.answer(a))
             p.start()
             self.addCleanup(p.stop)
@@ -95,6 +98,8 @@ class Roadmap(unittest.TestCase):
         p = patch.object(roadmap, "pull_requests", side_effect=lambda: self.prs)
         p.start()
         self.addCleanup(p.stop)
+        self.poller = github_poller.Poller()
+        self.poller.set("project", {"id": "proj", "fields": FIELDS})
 
     def answer(self, a):
         raise AssertionError(f"unexpected GitHub read {a}")
@@ -111,26 +116,25 @@ class Roadmap(unittest.TestCase):
             roadmap.STATE.write_text(json.dumps(GITHUB))
 
     def runs(self, *runs):
-        self.replies[roadmap.RUNS] = R200.format(tag="runs", body=json.dumps({"workflow_runs": runs}))
+        self.replies[RUNS["hr-relay"]] = R200.format(tag="runs", body=json.dumps({"workflow_runs": runs}))
 
-    def full(self, *, render=True):
+    def prepare(self):
         for path, body in REST.items():
-            self.replies[f"repos/{roadmap.REPO}/{path}"] = R200.format(tag="cached", body=json.dumps(body))
-        self.replies.setdefault(roadmap.RUNS, R200.format(tag="runs", body='{"workflow_runs":[]}'))
-
-        def github(*args):
-            if args[:2] == ("api", "-X"):
-                self.reads.append(args)
-                return {"total_count": 7}
-            return self.answer(args)
-
+            self.replies.setdefault(f"repos/{roadmap.REPO}/{path}", R200.format(tag="cached", body=json.dumps(body)))
+        for path in RUNS.values():
+            self.replies.setdefault(path, R200.format(tag="runs", body='{"workflow_runs":[]}'))
+        self.replies.setdefault(SEARCH, R200.format(tag="search", body='{"total_count":7}'))
+        self.poller.set("heads", roadmap.branch_heads())
+        self.poller.set("prs", roadmap.pull_requests())
         opened = json.loads(tick.SNAPSHOT.read_text())["open"]
-        patches = (patch.object(roadmap, "gh", side_effect=github),
-                   patch.object(tick, "issue_nodes", side_effect=lambda state, *_: opened if state == "OPEN" else []))
-        if not render:
-            return patches
-        with patches[0], patches[1]:
-            return roadmap.render(full=True)
+        with patch.object(tick, "issue_nodes", side_effect=lambda state, *_: opened if state == "OPEN" else []):
+            roadmap.poll_issues(self.poller)
+
+    def full(self):
+        self.prepare()
+        self.poller.poll_runs()
+        self.poller.set("pipeline", roadmap.pipeline(self.poller))
+        return roadmap.publish_board(self.poller, None)
 
     def edit(self, field, *value, item="item1"):
         with patch.object(tick.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "{}", "")):
@@ -148,6 +152,7 @@ class Roadmap(unittest.TestCase):
         snap = json.loads(tick.SNAPSHOT.read_text())
         snap["open"] = [bug, blocked, full, later, missing]
         tick.SNAPSHOT.write_text(json.dumps(snap))
+        self.heads = "abc refs/heads/feature/lane\n"
 
         def refs(argv):
             return {"remote": "https://github.com/julianthant/hr-relay.git",
@@ -157,6 +162,8 @@ class Roadmap(unittest.TestCase):
             return (None, ["capacity"]) if holds else ({"id": "seat", "label": "seat"}, [])
 
         with (patch.object(roadmap, "readiness", READINESS), patch.object(self, "answer", side_effect=refs),
+              patch.object(tick, "github_state", side_effect=lambda source: {
+                  "issues": snap, "heads": {"hr-relay": {"feature/lane": "abc"}}}[source]),
               patch.object(Path, "home", return_value=tick.SNAPSHOT.parent),
               patch.object(tick, "inventory", return_value=set()),
               patch.object(pick.account_usage, "load_config", return_value={}),
@@ -361,9 +368,9 @@ class Roadmap(unittest.TestCase):
         live = roadmap.render()["issues"][1]["now"]
         self.assertEqual((live["stage"], live["status"], live["who"]), (3, "PR checks failing", []))
 
-    def test_task_ci_uses_only_the_pushed_head_from_the_last_manual_refresh(self):
+    def test_task_ci_uses_only_the_pushed_head_from_the_latest_poll(self):
         self.heads = "new refs/heads/task/lane/1\n"
-        run = {"head_branch": "task/lane/1", "head_sha": "old", "event": "push",
+        run = {"head_branch": "task/lane/1", "head_sha": "old", "event": "push", "path": ".github/workflows/development.yml",
                "status": "completed", "conclusion": "success"}
         self.runs(run)
         self.full()
@@ -393,91 +400,139 @@ class Roadmap(unittest.TestCase):
         self.edit("f_unknown", "--text", "x")
         self.assertEqual(json.loads(tick.SNAPSHOT.read_text())["fetched"], 0)
 
-    def test_full_refresh_reuses_etags_and_local_renders_keep_the_github_timestamp(self):
+    def test_failed_poll_keeps_the_last_published_data(self):
+        self.full()
+        directory = tick.SNAPSHOT.parent
+        roadmap.render(directory)
+        saved = (directory / "data.json").read_bytes()
+        self.replies[RUNS["hr-relay"]] = "HTTP/2.0 403 Forbidden\r\n\r\n"
+        previous = self.poller.pages["hr-relay"]
+        with self.assertRaisesRegex(github_poller.Unavailable, "GitHub REST request returned 403"):
+            self.poller.poll_runs()
+        self.assertEqual(self.poller.pages["hr-relay"], previous)
+        self.assertEqual((directory / "data.json").read_bytes(), saved)
+
+    def test_polling_reuses_etags_and_local_renders_keep_the_github_timestamp(self):
         full = {"head_branch": "development", "event": "workflow_dispatch", "status": "in_progress",
-                "conclusion": None, "created_at": SINCE, "head_sha": "abc", "html_url": "https://example.com/run"}
+                "conclusion": None, "created_at": SINCE, "head_sha": "abc", "html_url": "https://example.com/run",
+                "path": ".github/workflows/full.yml"}
         self.runs(dict(full, event="push", head_sha="other"), full)
         self.prs["devPrs"] = [{"n": 7, "head": "task/example", "issues": [], "checks": "running"}]
-        gh, issues = self.full(render=False)
-        with gh, issues:
-            first = roadmap.render(full=True)
-            self.sent.clear()
-            self.replies.clear()
-            self.prs = {**self.prs, "devPrs": [dict(self.prs["devPrs"][0], checks="failing")]}
-            second = roadmap.render(full=True)
-        self.assertEqual(len(self.sent), 6)
+        self.prepare()
+        self.poller.poll_runs()
+        self.poller.set("pipeline", roadmap.pipeline(self.poller))
+        first = roadmap.publish_board(self.poller, None)
+        self.sent.clear()
+        self.replies.clear()
+        self.poller.poll_runs()
+        self.poller.set("pipeline", roadmap.pipeline(self.poller))
+        self.poller.set("prs", {**self.prs, "devPrs": [dict(self.prs["devPrs"][0], checks="failing")]})
+        second = roadmap.publish_board(self.poller, None)
+        self.assertEqual(len(self.sent), 7)
         self.assertTrue(all("-H" in argv for argv in self.sent))
         self.assertEqual(first["pipeline"]["fullRun"]["headSha"], "abc")
         self.assertEqual(second["pipeline"]["release"], {"tagName": "v1", "publishedAt": SINCE})
         self.assertEqual(second["pipeline"]["mergedSinceRelease"], 7)
         self.assertEqual(second["pipeline"]["devPrs"][0]["checks"], "failing")
         self.assertEqual(second["milestones"], ["Staging cut"])
-        self.assertNotEqual(first["githubFetchedAt"], second["githubFetchedAt"])
         self.assertEqual(roadmap.render()["githubFetchedAt"], second["githubFetchedAt"])
 
-    def test_refresh_endpoint_publishes_once_for_overlapping_and_rapid_clicks(self):
-        directory = tick.SNAPSHOT.parent
-        entered, release = Event(), Event()
-        gh, issues = self.full(render=False)
-
-        def wait_for_github(argv, **kwargs):
-            if argv[-1] == roadmap.RUNS:
-                entered.set()
-                if not release.wait(5):
-                    raise TimeoutError("test did not release the refresh")
-            return self.gh_api(argv, **kwargs)
-
-        def request(method, *, header=True, path="/refresh"):
-            headers = {"X-Roadmap-Refresh": "1"} if header else {}
-            try:
-                with urlopen(Request(base + path, method=method, headers=headers), timeout=5) as response:
-                    return response.status, response.read()
-            except HTTPError as error:
-                error.close()
-                return error.code, b""
-
-        with roadmap.make_server(directory, "127.0.0.1", 0) as server:
+    def test_ten_readers_share_one_request_and_the_server_refuses_writes(self):
+        sha = "a" * 40
+        self.runs({"id": 1, "head_sha": sha, "head_branch": "task/lane/1", "status": "in_progress"})
+        self.prepare()
+        self.poller.poll_runs()
+        with roadmap.make_server(tick.SNAPSHOT.parent, "127.0.0.1", 0, self.poller) as server:
             base = f"http://127.0.0.1:{server.server_port}"
             serving = Thread(target=server.serve_forever, daemon=True)
             serving.start()
-            first = []
-            clicking = Thread(target=lambda: first.append(request("POST")[0]), daemon=True)
             try:
-                self.assertEqual(request("POST", header=False)[0], 403)
-                with gh, issues, patch.object(roadmap.subprocess, "run", side_effect=wait_for_github):
-                    clicking.start()
-                    self.assertTrue(entered.wait(5))
-                    self.assertEqual(request("POST")[0], 409)
-                    local = Thread(target=roadmap.publish, args=(False, directory), daemon=True)
-                    local.start()
-                    local.join(2)
-                    self.assertFalse(local.is_alive(), "local render waited on GitHub")
-                    _, body = request("GET", path="/data.json")
-                    self.assertIsNone(json.loads(body)["githubFetchedAt"])
-                    release.set()
-                    clicking.join(5)
-                    self.assertEqual(first, [204])
-                    self.assertEqual(request("POST")[0], 204)
-                    _, body = request("GET", path="/data.json")
-                    data = json.loads(body)
-                    self.assertIsNotNone(data["githubFetchedAt"])
-                    self.assertEqual(sum(argv[-1] == roadmap.RUNS for argv in self.sent), 1)
+                for _ in range(10):
+                    with urlopen(f"{base}/runs?repo=hr-relay&sha={sha}", timeout=5) as response:
+                        result = json.load(response)
+                    self.assertFalse(result["stale"])
+                    self.assertEqual(result["data"][0]["head_sha"], sha)
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(Request(base + "/refresh", method="POST"), timeout=5)
+                self.assertEqual(error.exception.code, 501)
+                error.exception.close()
             finally:
-                release.set()
                 server.shutdown()
                 serving.join(5)
+        self.assertEqual(sum(argv[-1] == RUNS["hr-relay"] for argv in self.sent), 1)
 
-    def test_failed_manual_refresh_preserves_the_published_data(self):
-        directory = tick.SNAPSHOT.parent
-        gh, issues = self.full(render=False)
-        with gh, issues:
-            roadmap.publish(True, directory)
-        saved = (directory / "data.json").read_bytes()
-        self.replies[roadmap.RUNS] = "HTTP/2.0 403 Forbidden\r\n\r\n"
-        with self.assertRaisesRegex(ValueError, "GitHub REST request returned 403"):
-            roadmap.publish(True, directory)
-        self.assertEqual((directory / "data.json").read_bytes(), saved)
-        self.assertEqual(roadmap.render()["githubFetchedAt"], json.loads(saved)["githubFetchedAt"])
+    def test_older_run_is_refreshed_by_id_and_failed_jobs_are_shared(self):
+        sha = "b" * 40
+        run = {"id": 7, "head_sha": sha, "head_branch": "task/lane/7", "status": "in_progress"}
+        self.runs(run)
+        self.prepare()
+        self.poller.poll_runs()
+        self.runs()
+        self.poller.poll_runs()
+        query = {"repo": "hr-relay", "sha": sha}
+        self.assertIsNone(self.poller.read("runs", query)["data"])
+        path = "repos/julianthant/hr-relay/actions/runs/7"
+        self.replies[path] = R200.format(tag="old", body=json.dumps(dict(run, status="completed", conclusion="failure")))
+        self.poller.poll_details()
+        self.assertEqual(self.poller.read("runs", query)["data"][0]["conclusion"], "failure")
+        job_query = {"repo": "hr-relay", "id": "7", "attempt": "1"}
+        self.assertIsNone(self.poller.read("jobs", job_query)["data"])
+        job_path = f"{path}/attempts/1/jobs?per_page=100"
+        self.replies[job_path] = R200.format(tag="jobs", body='{"jobs":[{"name":"Checks","conclusion":"failure"}]}')
+        self.poller.poll_details()
+        for _ in range(10):
+            self.assertEqual(self.poller.read("jobs", job_query)["data"]["jobs"][0]["name"], "Checks")
+        self.assertEqual(sum(argv[-1] == path for argv in self.sent), 1)
+        self.assertEqual(sum(argv[-1] == job_path for argv in self.sent), 1)
+
+    def test_budget_slowdown_floor_and_304(self):
+        clock = [100]
+        rest = github_poller.Rest(clock=lambda: clock[0])
+        before = len(self.sent)
+        for remaining, slow in ((1500, 1), (999, 2), (499, 4), (249, 8), (100, 8)):
+            self.replies["endpoint"] = (f"HTTP/2.0 304 Not Modified\r\nX-Ratelimit-Remaining: {remaining}\r\n"
+                                        "X-Ratelimit-Reset: 200\r\n\r\n")
+            self.assertEqual(rest.poll("endpoint", '"tag"'), (304, '"tag"', ""))
+            self.assertEqual(rest.slowdown(), slow)
+        with self.assertRaises(github_poller.Unavailable):
+            rest.poll("endpoint")
+        self.assertEqual((len(self.sent) - before, rest.budget()["limitedUntil"]), (5, 200))
+        self.assertEqual(rest.budget()["notModifiedLastHour"], 5)
+        clock[0] = 3701
+        self.assertEqual((rest.budget()["callsLastHour"], rest.slowdown()), (0, 1))
+
+    def test_ci_wait_fails_closed_on_stale_and_unreachable(self):
+        script = Path(tick.__file__).with_name("ci-wait")
+        command = [sys.executable, script, "--repo", "hr-relay", "a" * 40]
+
+        def wait(url):
+            with subprocess.Popen(command, text=True, stderr=subprocess.PIPE,
+                                  env={**os.environ, "ROADMAP_URL": url}) as process:
+                _, stderr = process.communicate(timeout=10)
+                self.assertNotEqual(process.returncode, 0)
+                return stderr
+
+        with roadmap.make_server(tick.SNAPSHOT.parent, "127.0.0.1", 0, self.poller) as server:
+            base = f"http://127.0.0.1:{server.server_port}"
+            self.poller.pages["hr-relay"] = github_poller.Sample([], time.time() - 61)
+            serving = Thread(target=server.serve_forever, daemon=True)
+            serving.start()
+            try:
+                self.assertIn("runs data is stale", wait(base))
+            finally:
+                server.shutdown()
+                serving.join(5)
+        self.assertIn("roadmap server unavailable", wait(base))
+
+    def test_a_nonrequired_failing_check_does_not_mark_the_pr_failing(self):
+        pr = {"number": 1, "title": "PR", "headRefName": "task/lane/a", "headRefOid": "sha", "autoMergeRequest": None,
+              "isDraft": False, "updatedAt": SINCE, "closingIssuesReferences": {"nodes": []},
+              "baseRef": {"refUpdateRule": {"requiredStatusCheckContexts": ["tests"]}},
+              "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": [
+                  {"name": "tests", "conclusion": "SUCCESS"}, {"name": "GitGuardian", "conclusion": "FAILURE"}]}}}}]}}
+        graph = {"relay": {"dev": {"nodes": [pr]}, "staging": {"nodes": []}}, "agents": {"task": {"nodes": []}}}
+        with patch.object(roadmap, "pull_requests", REAL_PULL_REQUESTS), patch.object(roadmap, "github_query", return_value=graph):
+            self.assertEqual(roadmap.pull_requests()["devPrs"][0]["checks"], "green")
 
 
 if __name__ == "__main__":

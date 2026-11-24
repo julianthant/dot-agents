@@ -1,9 +1,10 @@
-"""Build roadmap JSON from saved data, or refresh GitHub on demand."""
+"""Serve the roadmap and the shared GitHub snapshot."""
 from argparse import ArgumentParser, Namespace
 import datetime
 from contextlib import closing
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from ipaddress import ip_address, ip_network
 import fcntl
 import json
 from pathlib import Path
@@ -11,18 +12,30 @@ import re
 import sqlite3
 import subprocess
 import sys
-from threading import Lock
-import time
+from threading import Event, Thread
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
+import github_poller
 import tick
 
 REPO = "julianthant/hr-relay"
 RUN = "run_c95eee175345"
 PR_FIELDS = """
   nodes {
-    number title headRefName autoMergeRequest { enabledAt } isDraft updatedAt
+    number title headRefName headRefOid autoMergeRequest { enabledAt } isDraft updatedAt
     closingIssuesReferences(first: 20) { nodes { number repository { nameWithOwner } } }
-    commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+    baseRef {
+      refUpdateRule { requiredStatusCheckContexts }
+      rules(first: 50) { nodes { parameters { ... on RequiredStatusChecksParameters {
+        requiredStatusChecks { context }
+      } } } }
+    }
+    commits(last: 1) { nodes { commit { statusCheckRollup {
+      contexts(first: 100) { nodes {
+        ... on CheckRun { name conclusion }
+        ... on StatusContext { name: context state }
+      } }
+    } } } }
   }
 """
 PR_QUERY = """
@@ -36,10 +49,22 @@ query {
   }
 }
 """ % (PR_FIELDS, PR_FIELDS, PR_FIELDS)
+PROJECT_QUERY = """
+query { user(login: "julianthant") { projectV2(number: 5) {
+  id fields(first: 100) { nodes {
+    ... on ProjectV2FieldCommon { id name }
+    ... on ProjectV2SingleSelectField { options { id name } }
+  } }
+} } }
+"""
 
 
-def gh(*a):
-    return json.loads(subprocess.run(["gh", *a], check=True, capture_output=True, text=True, timeout=60).stdout)
+def github_query(query):
+    body = json.loads(subprocess.run(["gh", "api", "graphql", "-f", f"query={query}"],
+                                     check=True, capture_output=True, text=True, timeout=15).stdout)
+    if body.get("errors"):
+        raise ValueError("GitHub GraphQL query failed")
+    return body["data"]
 
 
 def row(n):
@@ -57,20 +82,24 @@ def row(n):
 
 
 def pull_requests():
-    result = gh("api", "graphql", "-f", f"query={PR_QUERY}")
-    if not result or result.get("errors"):
-        raise ValueError("GitHub PR query failed")
-
     def pr(p):
         commit = p["commits"]["nodes"]
         rollup = (commit[0]["commit"]["statusCheckRollup"] or {}) if commit else {}
-        checks = {"SUCCESS": "green", "ERROR": "failing", "FAILURE": "failing"}.get(rollup.get("state"), "running")
+        base = p["baseRef"] or {}
+        required = set((base.get("refUpdateRule") or {}).get("requiredStatusCheckContexts") or ())
+        required.update(check["context"] for rule in base.get("rules", {}).get("nodes", [])
+                        for check in (rule["parameters"] or {}).get("requiredStatusChecks", []))
+        outcomes = {check["name"]: check.get("conclusion", check.get("state"))
+                    for check in rollup.get("contexts", {}).get("nodes", []) if check and check["name"] in required}
+        passing = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+        checks = ("failing" if any(outcome not in {*passing, None, "PENDING", "EXPECTED"} for outcome in outcomes.values())
+                  else "green" if all(outcomes.get(name) in passing for name in required) else "running")
         return dict(n=p["number"], t=p["title"], head=p["headRefName"], auto=p["autoMergeRequest"] is not None,
-                    draft=p["isDraft"], checks=checks, updated=p["updatedAt"],
+                    draft=p["isDraft"], checks=checks, updated=p["updatedAt"], sha=p["headRefOid"],
                     issues=[i["number"] for i in p["closingIssuesReferences"]["nodes"]
                             if i and i["repository"]["nameWithOwner"] == REPO])
 
-    data = result["data"]
+    data = github_query(PR_QUERY)
     return {"devPrs": [pr(p) for p in data["relay"]["dev"]["nodes"]],
             "stagingPr": [pr(p) for p in data["relay"]["staging"]["nodes"]],
             "agentPrs": [pr(p) for p in data["agents"]["task"]["nodes"] if p["headRefName"].startswith("task/")]}
@@ -80,18 +109,6 @@ REFUSED = (tick.OrcaError, OSError, ValueError, KeyError, subprocess.TimeoutExpi
 
 
 STATE = tick.SNAPSHOT.with_name("roadmap.json")
-RUNS = f"repos/{REPO}/actions/workflows/{tick.FULL_RUN_WORKFLOW}/runs?per_page=100"
-REFRESH_ERRORS = (*REFUSED, subprocess.CalledProcessError, TypeError)
-
-
-def poll(url, etag):
-    """(status, etag, body) of a GET sent with If-None-Match."""
-    r = subprocess.run(["gh", "api", "-i", *(["-H", f"If-None-Match: {etag}"] if etag else []), url],
-                       capture_output=True, text=True, timeout=60)
-    head, _, body = r.stdout.replace("\r\n", "\n").partition("\n\n")
-    status = re.match(r"HTTP/\S+ (\d+)", head)
-    tag = re.search(r"(?im)^etag:\s*(.+)$", head)
-    return int(status[1]) if status else 0, tag[1].strip() if tag else etag, body
 
 
 def read_json(path, default):
@@ -107,55 +124,23 @@ def write_json(path, data):
     tmp.replace(path)
 
 
-def refresh(state):
-    rest = state.setdefault("rest", {})
-    runs = cached_rest(rest, RUNS, lambda data: data["workflow_runs"])
-    latest = {}
-    for run in runs:
-        if run["event"] == "push" and run["head_branch"].startswith("task/"):
-            latest.setdefault(run["head_branch"], {k: run[k] for k in ("head_sha", "status", "conclusion")})
-    state["task_runs"] = {**state.get("task_runs", {}), **latest}
-    full_run = next((r for r in runs if r["head_branch"] == tick.FULL_RUN_BRANCH
-                     and r["event"] in ("schedule", "workflow_dispatch")), None)
-    state.update(pipeline(rest, pull_requests(), full_run))
-
-    snap = tick.snapshot(fresh=True)
-    meta = tick.project_meta()
-    if {row(n)["area"] for n in snap["open"] + snap["closed"]} - {None, *area_names(meta)}:
-        meta = tick.project_meta(refresh=True)
-    state["areas"] = area_names(meta)
-    state["heads"] = branch_heads(tick.tickets(rows=snap["open"]))
-    state["readiness"] = {str(number): reason for number, reason in readiness(snap).items()}
-    state["githubFetchedAt"] = stamp()
-
-
-def render(full=False, directory=None):
+def render(directory=None, *, state=None):
     STATE.parent.mkdir(parents=True, exist_ok=True)
-    if not full:
-        return render_local(directory)
-    # A slow GitHub request must not block periodic local updates.
-    with STATE.with_suffix(".refresh.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        state = read_json(STATE, {})
-        refresh(state)
-        return render_local(directory, refreshed=state)
-
-
-def render_local(directory, *, refreshed=None):
     with STATE.with_suffix(".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        state = read_json(STATE, {}) if refreshed is None else refreshed
-        state.setdefault("pipeline", {})
+        refreshed = state is not None
+        state = state if refreshed else read_json(STATE, {})
+        state = {"pipeline": {}, **state}
         snap = read_json(tick.SNAPSHOT, {"open": [], "closed": []})
         data = build(snap, state, now_rows(snap, state))
-        if refreshed is not None:
+        if refreshed:
             write_json(STATE, state)
         if directory is not None:
             write_json(directory / "data.json", data)
         return data
 
 
-def readiness(snap):
+def readiness(snap, heads):
     tickets = tick.tickets(rows=snap["open"])
     decisions = {}
     home = Path.home()
@@ -164,7 +149,7 @@ def readiness(snap):
             continue
         args = Namespace(repo_path=checkout, dry_run=True, holds=None, issue=None)
         try:
-            decisions.update(tick.fill(args, issues=tickets, emit=lambda *_: None))
+            decisions.update(tick.fill(args, issues=tickets, heads=heads, emit=lambda *_: None))
         except (*REFUSED, sqlite3.Error) as e:
             print(f"roadmap {name} readiness: {e}", file=sys.stderr)
     return decisions
@@ -267,11 +252,11 @@ def worker_status(worker):
     return "working" if activity == "working" else "worker state unavailable"
 
 
-def branch_heads(tickets):
+def branch_heads():
     heads = {}
-    for name in {t["repo"] for t in tickets if t["branch"]}:
+    for name in github_poller.REPOS:
         try:
-            refs = subprocess.run(["git", "ls-remote", "--heads", f"https://github.com/julianthant/{name}.git", "refs/heads/task/*"],
+            refs = subprocess.run(["git", "ls-remote", "--heads", f"https://github.com/julianthant/{name}.git"],
                                   check=True, capture_output=True, text=True, timeout=4).stdout
             heads[name] = {ref.removeprefix("refs/heads/"): sha
                            for sha, ref in (line.split() for line in refs.splitlines())}
@@ -311,7 +296,7 @@ def now_rows(snap, state):
         status = "needs you" if phase == "Needs you" or "needs you" in statuses else next(iter(statuses), "no worker")
         warning = status in ("stopped", "worker state unavailable")
 
-        run = state.get("task_runs", {}).get(branch) if repo == "hr-relay" else None
+        run = state.get("task_runs", {}).get(repo, {}).get(branch)
         run = run if head and run and run["head_sha"] == head else None
         ci_complete = run is not None and run["status"] == "completed"
         ci_failed = ci_complete and run["conclusion"] != "success"
@@ -360,7 +345,7 @@ def stamp():
 
 
 def build(snap, state, live):
-    issues = sorted(snap["open"], key=lambda n: n["updatedAt"], reverse=True) + snap["closed"]
+    issues = sorted(snap["open"], key=lambda n: n["updatedAt"], reverse=True) + snap["closed"][:tick.CLOSED_KEPT]
     rows = [row(n) for n in issues]
     decisions = state.get("readiness", {})
     for r in rows:
@@ -376,22 +361,10 @@ def build(snap, state, live):
             "milestones": state.get("milestones", []), "issues": rows, "pipeline": state["pipeline"], "tick": last_tick}
 
 
-def cached_rest(cache, endpoint, select):
-    """Use the saved value when GitHub confirms its ETag is current."""
-    etag, value = cache.get(endpoint, (None, None))
-    status, tag, body = poll(endpoint, etag)
-    if status == 200:
-        value = select(json.loads(body))
-        cache[endpoint] = tag, value
-    elif status != 304 or not etag:
-        raise ValueError(f"GitHub REST request returned {status}: {endpoint}")
-    return value
-
-
-def pipeline(rest, prs, full_run):
-    """The release pipeline and open milestones from a manual refresh."""
+def pipeline(poller):
+    """Release data changes slowly and shares the REST budget with runs."""
     def api(path, select):
-        return cached_rest(rest, f"repos/{REPO}/{path}", select)
+        return github_poller.conditional(poller.cache, f"repos/{REPO}/{path}", select, poller.rest.poll)
 
     release = api("releases?per_page=1", lambda rows: {"tagName": rows[0]["tag_name"],
                                                      "publishedAt": rows[0]["published_at"]} if rows else None)
@@ -399,65 +372,139 @@ def pipeline(rest, prs, full_run):
         main_date = api("commits/main", lambda result: result.get("commit", {}).get("committer", {}).get("date"))
         release = {"tagName": None, "publishedAt": main_date}
     since = (release["publishedAt"] or "2026-01-01")[:10]
-    merged = gh("api", "-X", "GET", "search/issues", "-f", "per_page=1", "-f",
-                f"q=repo:{REPO} is:pr is:merged base:development merged:>{since}")
-    cuts = api("git/matching-refs/heads/cut/", lambda rows: [r["ref"].removeprefix("refs/heads/") for r in rows])
-    stages = dict(**prs, mergedSinceRelease=merged["total_count"],
+    search = "search/issues?" + urlencode({"per_page": 1, "q": f"repo:{REPO} is:pr is:merged base:development merged:>{since}"})
+    merged = github_poller.conditional(poller.cache, search, lambda value: value["total_count"], poller.rest.poll)
+    stages = dict(mergedSinceRelease=merged,
                   devAheadOfStaging=api("compare/staging...development?per_page=1", lambda result: result["ahead_by"]),
                   devAheadOfMain=api("compare/main...development?per_page=1", lambda result: result["ahead_by"]),
-                  release=release, cuts=cuts,
-                  fullRun=dict(status=full_run["status"], conclusion=full_run["conclusion"],
-                               createdAt=full_run["created_at"], headSha=full_run["head_sha"],
-                               url=full_run["html_url"]) if full_run else None)
+                  release=release)
     return {"pipeline": stages, "milestones": api("milestones?state=open&per_page=50", lambda rows: [m["title"] for m in rows])}
 
 
-def publish(full, directory=None):
-    data = render(full, directory)
-    if directory is None:
-        json.dump(data, sys.stdout, separators=(",", ":"))
+def project():
+    data = github_query(PROJECT_QUERY)["user"]["projectV2"]
+    return {"id": data["id"], "fields": {field["name"]: field for field in data["fields"]["nodes"]}}
 
 
-def make_server(directory, bind, port):
-    refresh_lock = Lock()
-    completed = float("-inf")
-    status = 204
+def poll_project(poller):
+    meta = project()
+    tick.PROJECT_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    write_json(tick.PROJECT_CACHE, meta)
+    poller.set("project", meta)
+
+
+def poll_issues(poller):
+    snap = tick.refresh_snapshot()
+    poller.samples["issues"] = github_poller.Sample(snap, snap["fetched"])
+
+
+def publish_board(poller, directory):
+    snap = read_json(tick.SNAPSHOT, {"open": [], "closed": []})
+    samples = poller.samples.copy()
+    pages = poller.pages.copy()
+    budget = poller.status()
+    now = poller.clock()
+    times = [sample.at for sample in (*samples.values(), *pages.values())] + [snap.get("fetched")]
+    if any(at is None for at in times):
+        return
+    heads = samples["heads"].data
+    latest = {}
+    for repo, page in pages.items():
+        workflow, event = tick.task_workflow(repo)
+        latest[repo] = {}
+        for run in page.data:
+            if run["event"] == event and github_poller.workflow_matches(run, workflow):
+                latest[repo].setdefault(run["head_branch"], run)
+    full_run = next((r for r in pages["hr-relay"].data if r["head_branch"] == tick.FULL_RUN_BRANCH
+                     and r["event"] in ("schedule", "workflow_dispatch")
+                     and github_poller.workflow_matches(r, tick.FULL_RUN_WORKFLOW)), None)
+    fields = samples["pipeline"].data
+    data = {**fields, "heads": heads, "areas": area_names(samples["project"].data), "task_runs": latest,
+            "pipeline": {**fields["pipeline"], **samples["prs"].data,
+                         "cuts": sorted((name for name in heads["hr-relay"] if name.startswith("cut/")), reverse=True),
+                         "fullRun": dict(status=full_run["status"], conclusion=full_run["conclusion"],
+                                         createdAt=full_run["created_at"], headSha=full_run["head_sha"],
+                                         url=full_run["html_url"]) if full_run else None},
+            "githubFetchedAt": datetime.datetime.fromtimestamp(min(times), datetime.timezone.utc).isoformat()}
+    if not any(source["stale"] for source in budget["sources"].values()) and now - min(times) <= github_poller.STALE_SECONDS:
+        data["readiness"] = {str(number): reason for number, reason in readiness(snap, heads).items()}
+    return render(directory, state=data)
+
+
+def make_server(directory, bind, port, poller=None):
+    poller = poller or github_poller.Poller()
+    address = ip_address(bind)
+    if address.version != 4 or not (address.is_loopback or address in ip_network("100.64.0.0/10")):
+        raise ValueError("bind to loopback or the Mac's Tailscale IPv4 address")
 
     class Handler(SimpleHTTPRequestHandler):
-        def do_POST(self):
-            nonlocal completed, status
-            if self.path != "/refresh":
-                self.send_error(404)
+        def log_request(self, code="-", size="-"):
+            if str(code).startswith(("4", "5")):
+                super().log_request(code, size)
+
+        def send_json(self, body, code=200):
+            payload = json.dumps(body, separators=(",", ":")).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_GET(self):
+            path = urlsplit(self.path)
+            source = path.path.strip("/")
+            if source == "status":
+                return self.send_json(poller.status())
+            if source == "data.json":
+                data = read_json(directory / "data.json", None)
+                if data is None:
+                    data = {"issues": [], "githubFetchedAt": None}
+                return self.send_json({**data, "githubStatus": poller.status()})
+            if source == "issues":
+                snap = read_json(tick.SNAPSHOT, None)
+                if snap is not None:
+                    return self.send_json(github_poller.Sample(snap, snap["fetched"]).answer(poller.clock()))
+            if source in ("runs", "jobs", "prs", "heads", "issues", "project"):
+                try:
+                    self.send_json(poller.read(source, dict(parse_qsl(path.query))))
+                except ValueError as e:
+                    self.send_json({"error": str(e)}, 400)
+                except github_poller.Unavailable as e:
+                    self.send_json({"error": str(e)}, 503)
                 return
-            # Cross-origin browser requests cannot send this header without a CORS preflight.
-            if self.headers.get("X-Roadmap-Refresh") != "1":
-                self.send_error(403)
-                return
-            if not refresh_lock.acquire(blocking=False):
-                self.send_error(409)
-                return
-            try:
-                if time.monotonic() - completed >= 2:
-                    try:
-                        publish(True, directory)
-                    except REFRESH_ERRORS as e:
-                        self.log_error("roadmap refresh: %s", e)
-                        status = 503
-                    else:
-                        status = 204
-                    completed = time.monotonic()
-                self.send_response(status)
-                self.send_header("Content-Length", "0")
-                self.end_headers()
-            finally:
-                refresh_lock.release()
+            super().do_GET()
 
     return ThreadingHTTPServer((bind, port), partial(Handler, directory=directory))
 
 
+def serve(directory, bind, port):
+    poller = github_poller.Poller()
+    stop = Event()
+    with make_server(directory, "127.0.0.1", port, poller) as loopback:
+        tailnet = make_server(directory, bind, port, poller) if bind != "127.0.0.1" else None
+        if tailnet:
+            Thread(target=tailnet.serve_forever, daemon=True).start()
+        poller.schedule(stop, 5, poller.poll_runs, rest=True)
+        poller.schedule(stop, 5, poller.poll_details, rest=True)
+        poller.schedule(stop, 10, lambda: poller.set("prs", pull_requests()))
+        poller.schedule(stop, 10, lambda: poll_project(poller))
+        poller.schedule(stop, 30, lambda: poll_issues(poller))
+        poller.schedule(stop, 10, lambda: poller.set("heads", branch_heads()))
+        poller.schedule(stop, 30, lambda: poller.set("pipeline", pipeline(poller)), rest=True)
+        poller.schedule(stop, 5, lambda: publish_board(poller, directory))
+        try:
+            loopback.serve_forever()
+        finally:
+            stop.set()
+            if tailnet:
+                tailnet.shutdown()
+                tailnet.server_close()
+
+
 def main():
     parser = ArgumentParser(description=__doc__)
-    parser.add_argument("mode", nargs="?", choices=("local", "full", "serve"), default="local")
+    parser.add_argument("mode", nargs="?", choices=("local", "serve"), default="local")
     parser.add_argument("--directory", type=Path, help="serve this directory or write data.json here")
     parser.add_argument("--bind", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8790)
@@ -465,10 +512,11 @@ def main():
     if args.mode == "serve":
         if args.directory is None:
             parser.error("serve requires --directory")
-        with make_server(args.directory, args.bind, args.port) as server:
-            server.serve_forever()
+        serve(args.directory, args.bind, args.port)
     else:
-        publish(args.mode == "full", args.directory)
+        data = render(args.directory)
+        if args.directory is None:
+            json.dump(data, sys.stdout, separators=(",", ":"))
 
 
 if __name__ == "__main__":

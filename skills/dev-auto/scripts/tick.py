@@ -1434,6 +1434,11 @@ def released_worker(worker):
     return worker.get("terminalState") == "released" and worker["dispatchStatus"] in ("completed", "failed")
 
 
+def worker_worktree(worker):
+    return (((worker.get("projection") or {}).get("workspace") or {}).get("id")
+            or (worker.get("resource") or {}).get("worktreeId"))
+
+
 class ReleasedDispatchHistory:
     def __init__(self, db, run):
         self.db = db
@@ -1467,6 +1472,7 @@ class ReleasedDispatchHistory:
         effective = ((receipt.get("startOptions") or {}).get("launch") or {}).get("effective") or {}
         facts = {
             "dispatch": {k: dispatch.get(k) for k in ("id", "runId", "taskId", "followUpOf", "retryOfDispatchId")},
+            "worktree": worker_worktree(worker),
             "worker": {"startOptions": {"launch": {"effective":
                 {k: effective.get(k) for k in ("agent", "model", "effort")}}}},
             "finished": not checkpoint and (dispatch["status"] != "failed" or reported or receipt.get("state") == "stopped"),
@@ -1769,24 +1775,20 @@ class ReviewMailbox:
         for task in task_ids:
             related.update(self.by_task.get(task, ()))
 
-        def worktree(worker):
-            return (((worker.get("projection") or {}).get("workspace") or {}).get("id")
-                    or (worker.get("resource") or {}).get("worktreeId"))
-
-        coder_worktree = worktree(coder_worker)
+        coder_worktree = worker_worktree(coder_worker) or (self.history.cached(coder_worker) or {}).get("worktree")
         unplaced = self.successes.keys() - workers.keys()
         children = {}
         for dispatch, worker in workers.items():
             resource = worker.get("resource") or {}
-            workspace = worktree(worker)
+            facts = self.history.cached(worker) or {}
+            workspace = worker_worktree(worker) or facts.get("worktree")
             if not workspace and dispatch in self.successes:
                 unplaced.add(dispatch)
             if (worker.get("taskId") in task_ids or worker.get("agentTerminalHandle") in terminals
                     or (workspace and (workspace == coder_worktree
                                        or state.get("path") in (workspace, workspace.partition("::")[2])))):
                 related.add(dispatch)
-            facts = self.history.cached(worker)
-            attempt = facts["dispatch"] if facts else {}
+            attempt = facts.get("dispatch", {})
             parent = attempt.get("retryOfDispatchId") or attempt.get("followUpOf") or resource.get("originDispatchId")
             if parent and parent != dispatch:
                 children.setdefault(parent, set()).add(dispatch)

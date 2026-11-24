@@ -951,5 +951,5 @@ test('should edit a product', async ({ page, request }) => {
 - [core/configuration.md](configuration.md) — `testMatch`, `testDir`, `fullyParallel`, `workers`
 - [core/fixtures-and-hooks.md](fixtures-and-hooks.md) — shared setup via fixtures instead of `beforeAll`
 - [core/test-architecture.md](test-architecture.md) — when to write E2E vs API vs component tests
-- [ci/parallel-and-sharding.md](../ci/parallel-and-sharding.md) — CI sharding for large suites
-- [ci/projects-and-dependencies.md](../ci/projects-and-dependencies.md) — multi-project config
+- [ci/parallel-and-sharding.md](~/.agents/skills/playwright-ci/parallel-and-sharding.md) — CI sharding for large suites
+- [ci/projects-and-dependencies.md](~/.agents/skills/playwright-ci/projects-and-dependencies.md) — multi-project config

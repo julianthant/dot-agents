@@ -31,5 +31,5 @@ A `data-testid` is a **public API for your UI's automation layer**: once a test 
 
 ## Related
 
-- [core/locators.md](../core/locators.md) / [core/locator-strategy.md](../core/locator-strategy.md) — the consumer side: choosing locators when *writing tests*.
+- [core/locators.md](~/.agents/skills/playwright-core/locators.md) / [core/locator-strategy.md](~/.agents/skills/playwright-core/locator-strategy.md) — the consumer side: choosing locators when *writing tests*.
 - Playwright official docs: [Locators](https://playwright.dev/docs/locators), [Best Practices](https://playwright.dev/docs/best-practices).

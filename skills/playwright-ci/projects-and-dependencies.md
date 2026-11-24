@@ -662,9 +662,9 @@ declare module '@playwright/test' {
 
 ## Related
 
-- [core/configuration.md](../core/configuration.md) -- base config, `projects`, `use` settings
+- [core/configuration.md](~/.agents/skills/playwright-core/configuration.md) -- base config, `projects`, `use` settings
 - [ci/global-setup-teardown.md](global-setup-teardown.md) -- `globalSetup` vs setup projects
-- [core/fixtures-and-hooks.md](../core/fixtures-and-hooks.md) -- option fixtures configured per project
-- [core/authentication.md](../core/authentication.md) -- auth state via setup projects
+- [core/fixtures-and-hooks.md](~/.agents/skills/playwright-core/fixtures-and-hooks.md) -- option fixtures configured per project
+- [core/authentication.md](~/.agents/skills/playwright-core/authentication.md) -- auth state via setup projects
 - [ci/parallel-and-sharding.md](parallel-and-sharding.md) -- sharding across projects
 - [ci/ci-github-actions.md](ci-github-actions.md) -- running specific projects in CI

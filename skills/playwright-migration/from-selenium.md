@@ -1,7 +1,7 @@
 # Migrating from Selenium to Playwright
 
 > **When to use**: When converting a Selenium/WebDriver test suite to Playwright. Covers Java/Python/C# Selenium idioms mapped to TypeScript and JavaScript Playwright equivalents.
-> **Prerequisites**: [core/locators.md](../core/locators.md), [core/assertions-and-waiting.md](../core/assertions-and-waiting.md)
+> **Prerequisites**: [core/locators.md](~/.agents/skills/playwright-core/locators.md), [core/assertions-and-waiting.md](~/.agents/skills/playwright-core/assertions-and-waiting.md)
 
 ## Key Mindset Shifts
 
@@ -832,7 +832,7 @@ Selenium tests typically run sequentially (one browser, one thread). Playwright 
 - Each test gets its own browser context (fresh cookies, storage, session)
 - Database fixtures must not collide between parallel tests
 
-If your Selenium suite depends on execution order, you must fix that before migrating. See [core/test-organization.md](../core/test-organization.md) for isolation strategies.
+If your Selenium suite depends on execution order, you must fix that before migrating. See [core/test-organization.md](~/.agents/skills/playwright-core/test-organization.md) for isolation strategies.
 
 ## What's Better in Playwright
 
@@ -946,10 +946,10 @@ Step forward and backward through each action, see the DOM state, network reques
 
 ## Related
 
-- [core/locators.md](../core/locators.md) -- locator strategy priority and patterns
-- [core/assertions-and-waiting.md](../core/assertions-and-waiting.md) -- auto-waiting and web-first assertions in depth
-- [core/configuration.md](../core/configuration.md) -- setting up `playwright.config`
-- [pom/page-object-model.md](../pom/page-object-model.md) -- page object patterns for Playwright
-- [core/fixtures-and-hooks.md](../core/fixtures-and-hooks.md) -- fixtures system for test setup and isolation
-- [core/test-organization.md](../core/test-organization.md) -- organizing tests for parallel execution
+- [core/locators.md](~/.agents/skills/playwright-core/locators.md) -- locator strategy priority and patterns
+- [core/assertions-and-waiting.md](~/.agents/skills/playwright-core/assertions-and-waiting.md) -- auto-waiting and web-first assertions in depth
+- [core/configuration.md](~/.agents/skills/playwright-core/configuration.md) -- setting up `playwright.config`
+- [pom/page-object-model.md](~/.agents/skills/playwright-pom/page-object-model.md) -- page object patterns for Playwright
+- [core/fixtures-and-hooks.md](~/.agents/skills/playwright-core/fixtures-and-hooks.md) -- fixtures system for test setup and isolation
+- [core/test-organization.md](~/.agents/skills/playwright-core/test-organization.md) -- organizing tests for parallel execution
 - [migration/from-cypress.md](from-cypress.md) -- migrating from Cypress instead

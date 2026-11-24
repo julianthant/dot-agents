@@ -19,7 +19,8 @@ ask it, not the operator.
 - Keep existing assertions, coverage floors and timeouts. A slow test gets faster; it doesn't get
   a longer timeout.
 - Commit by logical step and stage exact paths.
-- Run locally only the test files the issue names or your change touches, one at a time. CI runs
+- When the repository says tests run only in GitHub Actions, run none locally. Otherwise run
+  locally only the test files the issue names or your change touches, one at a time. CI runs
   the rest.
 
 ## Push and CI

@@ -1081,6 +1081,6 @@ test('no hydration errors after SSR', async ({ page }) => {
 - [core/forms-and-validation.md](forms-and-validation.md) -- form testing patterns for reactive and template-driven forms
 - [core/accessibility.md](accessibility.md) -- accessibility testing for Angular Material components
 - [core/authentication.md](authentication.md) -- authentication with Angular route guards
-- [migration/from-selenium.md](../migration/from-selenium.md) -- migration patterns applicable to Protractor (Protractor is built on Selenium)
+- [migration/from-selenium.md](~/.agents/skills/playwright-migration/from-selenium.md) -- migration patterns applicable to Protractor (Protractor is built on Selenium)
 - [core/test-architecture.md](test-architecture.md) -- when to use E2E vs unit tests with Angular TestBed
-- [ci/ci-github-actions.md](../ci/ci-github-actions.md) -- CI setup with Angular build caching
+- [ci/ci-github-actions.md](~/.agents/skills/playwright-ci/ci-github-actions.md) -- CI setup with Angular build caching

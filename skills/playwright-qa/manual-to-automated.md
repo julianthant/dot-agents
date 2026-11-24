@@ -1,7 +1,7 @@
 # Manual Test Cases to Playwright Specs
 
 > **When to use**: The team has manual test cases (TestRail, Xray, Zephyr, a spreadsheet or CSV export) and wants them automated with Playwright, or asks which ones are worth automating and how to keep tests linked to case IDs.
-> **Prerequisites**: [core/fixtures-and-hooks.md](../core/fixtures-and-hooks.md), [core/authentication.md](../core/authentication.md)
+> **Prerequisites**: [core/fixtures-and-hooks.md](~/.agents/skills/playwright-core/fixtures-and-hooks.md), [core/authentication.md](~/.agents/skills/playwright-core/authentication.md)
 
 ## Quick Reference
 
@@ -54,8 +54,8 @@ test('TC-42 login with valid credentials', {
 });
 ```
 
-- The precondition "user exists" is a fixture that creates the user through the API, not steps in the test. See [test-data-management.md](../core/test-data-management.md).
-- Locators come from what the manual step names ("Email", "Sign in") as the user sees it: `getByLabel`, `getByRole`. See [locators.md](../core/locators.md).
+- The precondition "user exists" is a fixture that creates the user through the API, not steps in the test. See [test-data-management.md](~/.agents/skills/playwright-core/test-data-management.md).
+- Locators come from what the manual step names ("Email", "Sign in") as the user sees it: `getByLabel`, `getByRole`. See [locators.md](~/.agents/skills/playwright-core/locators.md).
 - Manual expected results often sit only at the end. Add assertions where the state changes, so a failure points at the step that broke.
 
 ### Pattern 3: Turn Shared Preconditions Into Fixtures
@@ -92,7 +92,7 @@ export const test = base.extend<{ user: User; project: Project }>({
 export { expect } from '@playwright/test';
 ```
 
-Log in once per role with a setup project and `storageState` ([authentication.md](../core/authentication.md)), then each test starts signed in with its own project.
+Log in once per role with a setup project and `storageState` ([authentication.md](~/.agents/skills/playwright-core/authentication.md)), then each test starts signed in with its own project.
 
 ### Pattern 4: Keep Traceability to Case IDs
 
@@ -132,7 +132,7 @@ Each test in `results.json` carries its annotations and status; a small script o
 4. **Split** long manual cases (15+ steps covering several features) into focused tests; a manual tester tolerates a long script, a suite does not.
 5. **Flag ambiguity**: a step like "verify the page is correct" has no oracle. List these back to the user instead of inventing an assertion.
 
-Alternatively, write the triaged cases as a plan in `specs/` and run Playwright's generator ([test-agents.md](../core/test-agents.md)), then review the output against Pattern 2.
+Alternatively, write the triaged cases as a plan in `specs/` and run Playwright's generator ([test-agents.md](~/.agents/skills/playwright-core/test-agents.md)), then review the output against Pattern 2.
 
 ## Anti-Patterns
 
@@ -148,6 +148,6 @@ Alternatively, write the triaged cases as a plan in `specs/` and run Playwright'
 ## Related
 
 - [qa/test-design.md](test-design.md): when cases need to be designed first
-- [core/fixtures-and-hooks.md](../core/fixtures-and-hooks.md): fixtures for preconditions
-- [core/test-organization.md](../core/test-organization.md): tags, annotations, grep
-- [migration/from-selenium.md](../migration/from-selenium.md): when the existing suite is Selenium, not manual
+- [core/fixtures-and-hooks.md](~/.agents/skills/playwright-core/fixtures-and-hooks.md): fixtures for preconditions
+- [core/test-organization.md](~/.agents/skills/playwright-core/test-organization.md): tags, annotations, grep
+- [migration/from-selenium.md](~/.agents/skills/playwright-migration/from-selenium.md): when the existing suite is Selenium, not manual

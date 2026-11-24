@@ -1,7 +1,7 @@
 # Dynamic Test Selection
 
 > **When to use**: You need to decide *which* tests run, or *how* they retry, from outside the test files — driven by CI signals, a quarantine list, or historical flakiness data from an external service. Playwright 1.62+.
-> **Prerequisites**: [core/flaky-tests.md](flaky-tests.md), [ci/reporting-and-artifacts.md](../ci/reporting-and-artifacts.md)
+> **Prerequisites**: [core/flaky-tests.md](flaky-tests.md), [ci/reporting-and-artifacts.md](~/.agents/skills/playwright-ci/reporting-and-artifacts.md)
 
 Before 1.62, filtering tests from outside the suite meant `--grep` with a generated regex, or editing spec files to add `test.skip()`. Both are blunt. `--grep` matches on titles, so a rename silently drops a test from the filter, and titles containing regex metacharacters have to be escaped. Editing spec files means a bot writing commits.
 
@@ -183,7 +183,7 @@ That guard matters. An auto-quarantine with no exemption list will eventually si
 | Test is broken and you want it to stop blocking merges | `testRun.fail()` — runs it, alerts when it recovers |
 | Test cannot run in this environment at all | `testRun.exclude()` |
 | Diagnosing whether flakiness is concurrency-related | `retryStrategy: 'isolated'` |
-| Tests contend over a shared resource | `lock` — see [ci/parallel-and-sharding.md](../ci/parallel-and-sharding.md) |
+| Tests contend over a shared resource | `lock` — see [ci/parallel-and-sharding.md](~/.agents/skills/playwright-ci/parallel-and-sharding.md) |
 
 ## Anti-Patterns
 
@@ -212,6 +212,6 @@ Playwright's `test.title` is the innermost title only. A test inside `test.descr
 ## Related
 
 - [core/flaky-tests.md](flaky-tests.md) — diagnosing and fixing the underlying flakiness
-- [ci/parallel-and-sharding.md](../ci/parallel-and-sharding.md) — workers, shards, and `lock`
-- [ci/reporting-and-artifacts.md](../ci/reporting-and-artifacts.md) — reporter configuration and `--add-reporter`
+- [ci/parallel-and-sharding.md](~/.agents/skills/playwright-ci/parallel-and-sharding.md) — workers, shards, and `lock`
+- [ci/reporting-and-artifacts.md](~/.agents/skills/playwright-ci/reporting-and-artifacts.md) — reporter configuration and `--add-reporter`
 - [core/test-organization.md](test-organization.md) — tags and suite structure

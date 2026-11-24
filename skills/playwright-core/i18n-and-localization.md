@@ -619,4 +619,4 @@ for (const { locale, name } of LOCALES) {
 - [core/configuration.md](configuration.md) -- project-level locale and timezone configuration
 - [core/visual-regression.md](visual-regression.md) -- screenshot comparison fundamentals
 - [core/clock-and-time-mocking.md](clock-and-time-mocking.md) -- mocking time for date-dependent testing
-- [ci/docker-and-containers.md](../ci/docker-and-containers.md) -- consistent font rendering in CI with Docker
+- [ci/docker-and-containers.md](~/.agents/skills/playwright-ci/docker-and-containers.md) -- consistent font rendering in CI with Docker

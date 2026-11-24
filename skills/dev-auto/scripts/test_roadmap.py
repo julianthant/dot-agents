@@ -3,6 +3,7 @@ import os
 import sqlite3
 from contextlib import closing, redirect_stderr, redirect_stdout
 from io import StringIO
+from shutil import copy2
 import subprocess
 import sys
 import time
@@ -543,7 +544,12 @@ class Roadmap(unittest.TestCase):
               "2040 shared REST GETs, 1795 HTTP 304s, 245 HTTP 200s.")
 
     def test_ci_wait_fails_closed_on_stale_and_unreachable(self):
-        script = Path(tick.__file__).with_name("ci-wait")
+        scripts = Path(tick.__file__).parent
+        install = tick.SNAPSHOT.parent / "wsl"
+        install.mkdir()
+        for filename in ("ci-wait", "github_poller.py"):
+            copy2(scripts / filename, install / filename)
+        script = install / "ci-wait"
         command = [sys.executable, script, "--repo", "hr-relay", "a" * 40]
 
         def wait(url):

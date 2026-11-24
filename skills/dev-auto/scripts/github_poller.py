@@ -25,6 +25,11 @@ class Unavailable(RuntimeError):
     pass
 
 
+def task_workflow(repo):
+    # dot-agents only runs its task checks on a PR.
+    return ("tests.yml", "pull_request") if repo == "dot-agents" else ("development.yml", "push")
+
+
 @dataclass(frozen=True)
 class Sample:
     data: object

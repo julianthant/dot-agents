@@ -1652,11 +1652,6 @@ def latest_coder_report(state, run, messages, handled=()):
     return [latest] if latest else []
 
 
-def task_workflow(repo):
-    # dot-agents only runs its task checks on a PR.
-    return ("tests.yml", "pull_request") if repo == "dot-agents" else ("development.yml", "push")
-
-
 def green_report(ticket, body):
     name = ticket["repo"]
     repo = f"{OWNER}/{name}"
@@ -1664,7 +1659,7 @@ def green_report(ticket, body):
     head = github_state("heads")[name].get(branch)
     if head not in re.findall(r"(?i)\b[0-9a-f]{40}\b", body):
         return None
-    workflow, event = task_workflow(name)
+    workflow, event = github_poller.task_workflow(name)
     cached = github_state("runs", repo=name, sha=head, workflow=workflow, event=event)
     if not cached or (cached[0]["head_branch"], cached[0]["status"], cached[0]["conclusion"]) != (
             branch, "completed", "success"):

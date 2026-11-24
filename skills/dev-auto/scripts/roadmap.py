@@ -410,7 +410,7 @@ def publish_board(poller, directory):
     heads = samples["heads"].data
     latest = {}
     for repo, page in pages.items():
-        workflow, event = tick.task_workflow(repo)
+        workflow, event = github_poller.task_workflow(repo)
         latest[repo] = {}
         for run in page.data:
             if run["event"] == event and github_poller.workflow_matches(run, workflow):

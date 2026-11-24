@@ -6,8 +6,7 @@ import subprocess
 import sys
 from time import monotonic, sleep
 
-from github_poller import OWNER, REPOS, SHA, Unavailable, read
-from tick import task_workflow
+from github_poller import OWNER, REPOS, SHA, Unavailable, read, task_workflow
 
 
 def repository():

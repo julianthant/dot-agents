@@ -829,4 +829,4 @@ if (!process.env.CI) {
 - [core/common-pitfalls.md](common-pitfalls.md) — common beginner mistakes
 - [core/assertions-and-waiting.md](assertions-and-waiting.md) — web-first assertions and auto-waiting
 - [core/configuration.md](configuration.md) — trace, screenshot, and retry configuration
-- [ci/reporting-and-artifacts.md](../ci/reporting-and-artifacts.md) — CI artifact collection for traces and screenshots
+- [ci/reporting-and-artifacts.md](~/.agents/skills/playwright-ci/reporting-and-artifacts.md) — CI artifact collection for traces and screenshots

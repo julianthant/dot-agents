@@ -621,4 +621,4 @@ test('session ID changes after login', async ({ page, context }) => {
 - [core/network-mocking.md](network-mocking.md) -- intercepting requests for security testing
 - [core/configuration.md](configuration.md) -- `ignoreHTTPSErrors` and base URL configuration
 - [core/third-party-integrations.md](third-party-integrations.md) -- testing OAuth and third-party auth providers
-- [ci/ci-github-actions.md](../ci/ci-github-actions.md) -- running security tests in CI pipelines
+- [ci/ci-github-actions.md](~/.agents/skills/playwright-ci/ci-github-actions.md) -- running security tests in CI pipelines

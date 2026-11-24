@@ -1205,5 +1205,5 @@ seedUser: async ({ request }, use) => {
 - [core/fixtures-and-hooks.md](fixtures-and-hooks.md) — fixture mechanics, scoping, composition
 - [core/authentication.md](authentication.md) — storage state setup, multi-role auth patterns
 - [core/api-testing.md](api-testing.md) — API request context, response validation
-- [ci/global-setup-teardown.md](../ci/global-setup-teardown.md) — global setup/teardown for batch operations
-- [pom/pom-vs-fixtures-vs-helpers.md](../pom/pom-vs-fixtures-vs-helpers.md) — when to use fixtures vs page objects vs helpers
+- [ci/global-setup-teardown.md](~/.agents/skills/playwright-ci/global-setup-teardown.md) — global setup/teardown for batch operations
+- [pom/pom-vs-fixtures-vs-helpers.md](~/.agents/skills/playwright-pom/pom-vs-fixtures-vs-helpers.md) — when to use fixtures vs page objects vs helpers

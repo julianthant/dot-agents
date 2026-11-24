@@ -686,7 +686,7 @@ jobs:
   visual-tests:
     runs-on: ubuntu-latest
     container:
-      image: mcr.microsoft.com/playwright:v1.64.0-noble
+      image: mcr.microsoft.com/playwright:v%%VERSION%%-noble
     steps:
       - uses: actions/checkout@v7
 
@@ -715,7 +715,7 @@ jobs:
 ```bash
 # Generate/update snapshots using the same container as CI
 docker run --rm --init --ipc=host -v $(pwd):/work -w /work \
-  mcr.microsoft.com/playwright:v1.64.0-noble \
+  mcr.microsoft.com/playwright:v%%VERSION%%-noble \
   npx playwright test --update-snapshots --project=visual
 ```
 
@@ -725,7 +725,7 @@ docker run --rm --init --ipc=host -v $(pwd):/work -w /work \
 {
   "scripts": {
     "test:visual": "npx playwright test --project=visual",
-    "test:visual:update": "docker run --rm --init --ipc=host -v $(pwd):/work -w /work mcr.microsoft.com/playwright:v1.64.0-noble npx playwright test --update-snapshots --project=visual"
+    "test:visual:update": "docker run --rm --init --ipc=host -v $(pwd):/work -w /work mcr.microsoft.com/playwright:v%%VERSION%%-noble npx playwright test --update-snapshots --project=visual"
   }
 }
 ```
@@ -975,7 +975,7 @@ This complements visual snapshots: use it to lock down specific pseudo-element s
 
 ```bash
 docker run --rm --init --ipc=host -v $(pwd):/work -w /work \
-  mcr.microsoft.com/playwright:v1.64.0-noble \
+  mcr.microsoft.com/playwright:v%%VERSION%%-noble \
   npx playwright test --update-snapshots --project=visual
 ```
 
@@ -1005,7 +1005,7 @@ If the diff is larger, check the HTML report. Look at the diff image to determin
 ```json
 {
   "devDependencies": {
-    "@playwright/test": "1.64.0"
+    "@playwright/test": "<version in package.json>"
   }
 }
 ```
@@ -1013,7 +1013,7 @@ If the diff is larger, check the HTML report. Look at the diff image to determin
 ```yaml
 # CI config
 container:
-  image: mcr.microsoft.com/playwright:v1.64.0-noble  # must match
+  image: mcr.microsoft.com/playwright:v%%VERSION%%-noble  # must match package.json
 ```
 
 ### Animations cause random diff failures
@@ -1071,5 +1071,5 @@ Skip pages where functional assertions already cover the key elements. A `toHave
 - [core/assertions-and-waiting.md](assertions-and-waiting.md) -- `toHaveScreenshot()` is a web-first assertion and follows the same retry semantics
 - [core/configuration.md](configuration.md) -- global screenshot config, project setup, `snapshotPathTemplate`
 - [core/mobile-and-responsive.md](mobile-and-responsive.md) -- responsive viewport testing patterns
-- [ci/docker-and-containers.md](../ci/docker-and-containers.md) -- Docker setup for consistent rendering
-- [ci/ci-github-actions.md](../ci/ci-github-actions.md) -- CI pipeline configuration for visual tests
+- [ci/docker-and-containers.md](~/.agents/skills/playwright-ci/docker-and-containers.md) -- Docker setup for consistent rendering
+- [ci/ci-github-actions.md](~/.agents/skills/playwright-ci/ci-github-actions.md) -- CI pipeline configuration for visual tests

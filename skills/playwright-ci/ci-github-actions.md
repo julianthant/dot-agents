@@ -319,7 +319,7 @@ jobs:
     timeout-minutes: 30
     runs-on: ubuntu-latest
     container:
-      image: mcr.microsoft.com/playwright:v1.64.0-noble
+      image: mcr.microsoft.com/playwright:v%%VERSION%%-noble  # version in package.json
       options: --ipc=host
 
     steps:
@@ -618,4 +618,4 @@ export default defineConfig({
 - [ci/docker-and-containers.md](docker-and-containers.md) -- container images for CI
 - [ci/ci-gitlab.md](ci-gitlab.md) -- GitLab CI equivalent
 - [ci/ci-other.md](ci-other.md) -- CircleCI, Azure DevOps, Jenkins
-- [core/configuration.md](../core/configuration.md) -- CI-aware config settings
+- [core/configuration.md](~/.agents/skills/playwright-core/configuration.md) -- CI-aware config settings

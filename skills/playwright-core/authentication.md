@@ -1423,7 +1423,7 @@ page.on('request', (req) => {
 
 - [core/fixtures-and-hooks.md](fixtures-and-hooks.md) -- custom fixtures for auth setup and teardown
 - [core/configuration.md](configuration.md) -- `storageState`, projects, and global setup configuration
-- [ci/global-setup-teardown.md](../ci/global-setup-teardown.md) -- global setup patterns and project dependencies
+- [ci/global-setup-teardown.md](~/.agents/skills/playwright-ci/global-setup-teardown.md) -- global setup patterns and project dependencies
 - [core/network-mocking.md](network-mocking.md) -- route interception patterns used in OAuth mocking
 - [core/api-testing.md](api-testing.md) -- API request context used in API-based login
 - [core/flaky-tests.md](flaky-tests.md) -- diagnosing auth-related flakiness

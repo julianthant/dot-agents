@@ -824,4 +824,4 @@ test.describe('mock contract validation', () => {
 - [core/authentication.md](authentication.md) -- when to mock auth vs test real login flows
 - [core/fixtures-and-hooks.md](fixtures-and-hooks.md) -- building reusable mock fixtures
 - [core/configuration.md](configuration.md) -- `webServer`, `baseURL`, and project configuration
-- [ci/ci-github-actions.md](../ci/ci-github-actions.md) -- CI setup for different test tiers
+- [ci/ci-github-actions.md](~/.agents/skills/playwright-ci/ci-github-actions.md) -- CI setup for different test tiers

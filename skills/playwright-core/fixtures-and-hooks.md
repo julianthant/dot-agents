@@ -1064,9 +1064,9 @@ export const test = base.extend<MyFixtures>({
 
 ## Related
 
-- [pom/page-object-model.md](../pom/page-object-model.md) — Page objects are typically consumed via fixtures
+- [pom/page-object-model.md](~/.agents/skills/playwright-pom/page-object-model.md) — Page objects are typically consumed via fixtures
 - [core/test-organization.md](test-organization.md) — Where to put fixture files in the project tree
 - [core/configuration.md](configuration.md) — Option fixtures are configured in `playwright.config`
 - [core/authentication.md](authentication.md) — Auth state is the most common worker-scoped fixture
-- [ci/global-setup-teardown.md](../ci/global-setup-teardown.md) — For truly global (all-workers) setup, not per-worker
-- [pom/pom-vs-fixtures-vs-helpers.md](../pom/pom-vs-fixtures-vs-helpers.md) — When to use each abstraction
+- [ci/global-setup-teardown.md](~/.agents/skills/playwright-ci/global-setup-teardown.md) — For truly global (all-workers) setup, not per-worker
+- [pom/pom-vs-fixtures-vs-helpers.md](~/.agents/skills/playwright-pom/pom-vs-fixtures-vs-helpers.md) — When to use each abstraction

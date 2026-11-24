@@ -1521,6 +1521,6 @@ await expect(page.getByLabel('Email')).toBeFocused();
 
 - [core/locators.md](locators.md) — role-based locators align with accessibility best practices
 - [core/forms-and-validation.md](forms-and-validation.md) — form interaction patterns including accessible error handling
-- [ci/ci-github-actions.md](../ci/ci-github-actions.md) — CI setup for running accessibility tests
+- [ci/ci-github-actions.md](~/.agents/skills/playwright-ci/ci-github-actions.md) — CI setup for running accessibility tests
 - [core/i18n-and-localization.md](i18n-and-localization.md) — accessibility considerations for multilingual apps
 - [core/component-testing.md](component-testing.md) — test individual component accessibility in isolation

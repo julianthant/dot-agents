@@ -27,7 +27,8 @@ version: 2.1
 executors:
   playwright:
     docker:
-      - image: mcr.microsoft.com/playwright:v1.64.0-noble
+      # Replace %%VERSION%% with the version in the project's package.json
+      - image: mcr.microsoft.com/playwright:v%%VERSION%%-noble
     working_directory: ~/project
 
 jobs:
@@ -106,7 +107,7 @@ orbs:
 executors:
   playwright:
     docker:
-      - image: mcr.microsoft.com/playwright:v1.64.0-noble
+      - image: mcr.microsoft.com/playwright:v%%VERSION%%-noble
 
 jobs:
   e2e:
@@ -312,7 +313,7 @@ stages:
 pipeline {
     agent {
         docker {
-            image 'mcr.microsoft.com/playwright:v1.64.0-noble'
+            image 'mcr.microsoft.com/playwright:v%%VERSION%%-noble'
             args '-u root'  // Playwright needs root in container
         }
     }
@@ -408,7 +409,7 @@ pipeline {
                 stage('Shard 1') {
                     agent {
                         docker {
-                            image 'mcr.microsoft.com/playwright:v1.64.0-noble'
+                            image 'mcr.microsoft.com/playwright:v%%VERSION%%-noble'
                             args '-u root'
                         }
                     }
@@ -426,7 +427,7 @@ pipeline {
                 stage('Shard 2') {
                     agent {
                         docker {
-                            image 'mcr.microsoft.com/playwright:v1.64.0-noble'
+                            image 'mcr.microsoft.com/playwright:v%%VERSION%%-noble'
                             args '-u root'
                         }
                     }
@@ -444,7 +445,7 @@ pipeline {
                 stage('Shard 3') {
                     agent {
                         docker {
-                            image 'mcr.microsoft.com/playwright:v1.64.0-noble'
+                            image 'mcr.microsoft.com/playwright:v%%VERSION%%-noble'
                             args '-u root'
                         }
                     }
@@ -462,7 +463,7 @@ pipeline {
                 stage('Shard 4') {
                     agent {
                         docker {
-                            image 'mcr.microsoft.com/playwright:v1.64.0-noble'
+                            image 'mcr.microsoft.com/playwright:v%%VERSION%%-noble'
                             args '-u root'
                         }
                     }
@@ -519,7 +520,7 @@ pipeline {
 
 ```yaml
 docker:
-  - image: mcr.microsoft.com/playwright:v1.64.0-noble  # match package.json version
+  - image: mcr.microsoft.com/playwright:v%%VERSION%%-noble  # match package.json version
 ```
 
 ### Azure DevOps: Test results not showing in Tests tab
@@ -550,7 +551,7 @@ reporter: [['junit', { outputFile: 'test-results/junit.xml' }]],
 ```groovy
 agent {
     docker {
-        image 'mcr.microsoft.com/playwright:v1.64.0-noble'
+        image 'mcr.microsoft.com/playwright:v%%VERSION%%-noble'
         args '-u root'
     }
 }

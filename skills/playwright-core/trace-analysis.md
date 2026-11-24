@@ -4,7 +4,7 @@
 
 The `npx playwright trace` command family lets you interrogate a trace archive the way a human uses the Trace Viewer: list what ran, find what failed, read the error, inspect the DOM at the moment of failure, and cross-check network and console. Every command returns plain text an agent can parse, so the whole debug loop fits in one turn with no screenshots to interpret.
 
-This is the **post-mortem** interface — you already have a `trace.zip`. For *recording* traces and the interactive `--debug=cli` flow against a live browser, see [../playwright-cli/tracing-and-debugging.md](../playwright-cli/tracing-and-debugging.md). For the broader debugging workflow (UI mode, inspector), see [debugging.md](debugging.md).
+This is the **post-mortem** interface — you already have a `trace.zip`. For *recording* traces and the interactive `--debug=cli` flow against a live browser, see [~/.agents/skills/playwright-cli/tracing-and-debugging.md](~/.agents/skills/playwright-cli/tracing-and-debugging.md). For the broader debugging workflow (UI mode, inspector), see [debugging.md](debugging.md).
 
 ## CLI vs GUI
 
@@ -154,8 +154,8 @@ done; npx playwright trace close
 
 ## Related Guides
 
-- [../playwright-cli/tracing-and-debugging.md](../playwright-cli/tracing-and-debugging.md) — recording traces, `--debug=cli`, live console/network
+- [~/.agents/skills/playwright-cli/tracing-and-debugging.md](~/.agents/skills/playwright-cli/tracing-and-debugging.md) — recording traces, `--debug=cli`, live console/network
 - [debugging.md](debugging.md) — broader debugging workflow (UI mode, inspector, trace viewer)
 - [error-index.md](error-index.md) — map an exact error string to its fix
 - [flaky-tests.md](flaky-tests.md) — timing/race root causes and fixes
-- [../ci/reporting-and-artifacts.md](../ci/reporting-and-artifacts.md) — where CI stores `trace.zip` and how to retrieve it
+- [~/.agents/skills/playwright-ci/reporting-and-artifacts.md](~/.agents/skills/playwright-ci/reporting-and-artifacts.md) — where CI stores `trace.zip` and how to retrieve it

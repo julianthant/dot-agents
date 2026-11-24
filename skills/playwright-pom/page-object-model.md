@@ -915,7 +915,7 @@ Exposing locators as `readonly` properties for assertions is acceptable (`expect
 
 ## Related
 
-- [core/fixtures-and-hooks.md](../core/fixtures-and-hooks.md) -- how `test.extend()` works in depth, fixture scoping, teardown
-- [core/locators.md](../core/locators.md) -- choosing the right locator strategy for POM properties
+- [core/fixtures-and-hooks.md](~/.agents/skills/playwright-core/fixtures-and-hooks.md) -- how `test.extend()` works in depth, fixture scoping, teardown
+- [core/locators.md](~/.agents/skills/playwright-core/locators.md) -- choosing the right locator strategy for POM properties
 - [pom/pom-vs-fixtures-vs-helpers.md](pom-vs-fixtures-vs-helpers.md) -- expanded decision framework for when to use each approach
-- [core/test-organization.md](../core/test-organization.md) -- file and folder conventions for the broader test suite
+- [core/test-organization.md](~/.agents/skills/playwright-core/test-organization.md) -- file and folder conventions for the broader test suite

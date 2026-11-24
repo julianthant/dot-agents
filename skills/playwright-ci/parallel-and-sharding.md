@@ -440,5 +440,5 @@ export default defineConfig({
 - [ci/ci-gitlab.md](ci-gitlab.md) -- GitLab `parallel:` keyword with sharding
 - [ci/ci-other.md](ci-other.md) -- sharding on CircleCI, Azure DevOps, Jenkins
 - [ci/reporting-and-artifacts.md](reporting-and-artifacts.md) -- blob reporter and merge-reports
-- [core/fixtures-and-hooks.md](../core/fixtures-and-hooks.md) -- worker-scoped fixtures
-- [core/test-organization.md](../core/test-organization.md) -- parallel vs serial execution
+- [core/fixtures-and-hooks.md](~/.agents/skills/playwright-core/fixtures-and-hooks.md) -- worker-scoped fixtures
+- [core/test-organization.md](~/.agents/skills/playwright-core/test-organization.md) -- parallel vs serial execution

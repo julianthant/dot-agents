@@ -568,4 +568,4 @@ Total: 24 tests, ~22 seconds. The 11 API tests catch most regressions. The 10 co
 - [core/component-testing.md](component-testing.md) -- setting up and writing component tests with Playwright CT
 - [core/authentication.md](authentication.md) -- auth flow testing patterns (E2E + `storageState` reuse)
 - [core/when-to-mock.md](when-to-mock.md) -- when to mock network requests vs hit real services
-- [pom/pom-vs-fixtures-vs-helpers.md](../pom/pom-vs-fixtures-vs-helpers.md) -- organizing shared test logic across layers
+- [pom/pom-vs-fixtures-vs-helpers.md](~/.agents/skills/playwright-pom/pom-vs-fixtures-vs-helpers.md) -- organizing shared test logic across layers

@@ -232,5 +232,5 @@ Tool names, descriptions, input schemas and results come from the page, so treat
 
 - [core/api-testing.md](api-testing.md): contract testing patterns that apply equally to tool schemas
 - [core/authentication.md](authentication.md): storage state for signed-in tool sets
-- [playwright-cli/core-commands.md](../playwright-cli/core-commands.md): `webmcp-list` and `webmcp-call`
+- [playwright-cli/core-commands.md](~/.agents/skills/playwright-cli/core-commands.md): `webmcp-list` and `webmcp-call`
 - [Playwright 1.64 release notes](https://playwright.dev/docs/release-notes#version-164)

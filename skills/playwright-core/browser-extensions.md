@@ -316,4 +316,4 @@ test('options page saves preferences', async ({ page, extensionId }) => {
 - [core/service-workers-and-pwa.md](service-workers-and-pwa.md) -- service worker testing patterns (non-extension)
 - [core/iframes-and-shadow-dom.md](iframes-and-shadow-dom.md) -- content scripts often inject Shadow DOM elements
 - [core/configuration.md](configuration.md) -- project configuration for Chromium-only test suites
-- [ci/ci-github-actions.md](../ci/ci-github-actions.md) -- CI setup for headed/extension tests
+- [ci/ci-github-actions.md](~/.agents/skills/playwright-ci/ci-github-actions.md) -- CI setup for headed/extension tests

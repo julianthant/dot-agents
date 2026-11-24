@@ -1,7 +1,7 @@
 # Bug Reports From Failing Tests
 
 > **When to use**: A Playwright test failed and the user wants to know whether it's a real bug, wants a bug report the dev team can act on, or asks what to do with the test while the bug is open.
-> **Prerequisites**: [core/trace-analysis.md](../core/trace-analysis.md), [core/error-index.md](../core/error-index.md)
+> **Prerequisites**: [core/trace-analysis.md](~/.agents/skills/playwright-core/trace-analysis.md), [core/error-index.md](~/.agents/skills/playwright-core/error-index.md)
 
 ## Quick Reference
 
@@ -29,11 +29,11 @@ npx playwright show-trace trace.zip
 | Evidence | Likely | Next step |
 |---|---|---|
 | Fails every run; the trace shows the app doing the wrong thing (wrong text, 500 response, missing element the user also cannot see) | **App bug** | File it (Pattern 2) |
-| Fails every run; the app looks right in the trace screenshot but the locator or expected value is stale | **Test bug** | Fix the test; see [error-index.md](../core/error-index.md) |
-| Passes alone, fails sometimes under `--repeat-each` or only in parallel | **Flaky test or race in the app** | [flaky-tests.md](../core/flaky-tests.md); a real race is an app bug, so file it with the frequency |
-| Fails only in CI: browser launch, DNS, timeouts on every test | **Environment** | Fix CI, not the app; see [error-index.md](../core/error-index.md) CI section |
+| Fails every run; the app looks right in the trace screenshot but the locator or expected value is stale | **Test bug** | Fix the test; see [error-index.md](~/.agents/skills/playwright-core/error-index.md) |
+| Passes alone, fails sometimes under `--repeat-each` or only in parallel | **Flaky test or race in the app** | [flaky-tests.md](~/.agents/skills/playwright-core/flaky-tests.md); a real race is an app bug, so file it with the frequency |
+| Fails only in CI: browser launch, DNS, timeouts on every test | **Environment** | Fix CI, not the app; see [error-index.md](~/.agents/skills/playwright-core/error-index.md) CI section |
 
-Check the trace's network tab and console first: a failed API call or an uncaught page error usually decides it in one look ([trace-analysis.md](../core/trace-analysis.md)).
+Check the trace's network tab and console first: a failed API call or an uncaught page error usually decides it in one look ([trace-analysis.md](~/.agents/skills/playwright-core/trace-analysis.md)).
 
 ### Pattern 2: Write the Report From the Test
 
@@ -90,7 +90,7 @@ test('pay with expired saved card shows an error', {
 | `test.fixme()` | No | The test crashes, hangs, or is too slow while broken |
 | `test.skip()` | No | Not applicable in this configuration; not for bugs |
 
-Never delete the test or loosen the assertion to make CI green. See [test-organization.md](../core/test-organization.md) for annotations and tags.
+Never delete the test or loosen the assertion to make CI green. See [test-organization.md](~/.agents/skills/playwright-core/test-organization.md) for annotations and tags.
 
 ### Pattern 4: Redact Before Attaching
 
@@ -113,7 +113,7 @@ A `trace.zip` contains every network request and response body, cookies and head
 
 ## Related
 
-- [core/trace-analysis.md](../core/trace-analysis.md): read a `trace.zip` from the terminal
-- [core/flaky-tests.md](../core/flaky-tests.md): flake vs race
-- [core/dynamic-test-selection.md](../core/dynamic-test-selection.md): quarantine many known failures at once
-- [playwright-cli/SKILL.md](../playwright-cli/SKILL.md): reproduce a bug interactively
+- [core/trace-analysis.md](~/.agents/skills/playwright-core/trace-analysis.md): read a `trace.zip` from the terminal
+- [core/flaky-tests.md](~/.agents/skills/playwright-core/flaky-tests.md): flake vs race
+- [core/dynamic-test-selection.md](~/.agents/skills/playwright-core/dynamic-test-selection.md): quarantine many known failures at once
+- [playwright-cli/SKILL.md](~/.agents/skills/playwright-cli/SKILL.md): reproduce a bug interactively

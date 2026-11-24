@@ -1,7 +1,7 @@
 # Page Objects vs Fixtures vs Helpers
 
 > **When to use**: When deciding how to organize reusable test code in a Playwright project.
-> **Prerequisites**: [pom/page-object-model.md](page-object-model.md), [core/fixtures-and-hooks.md](../core/fixtures-and-hooks.md)
+> **Prerequisites**: [pom/page-object-model.md](page-object-model.md), [core/fixtures-and-hooks.md](~/.agents/skills/playwright-core/fixtures-and-hooks.md)
 
 ## Quick Answer
 
@@ -932,6 +932,6 @@ class ConfirmationPage {
 ## Related
 
 - [pom/page-object-model.md](page-object-model.md) -- detailed page object patterns and examples
-- [core/fixtures-and-hooks.md](../core/fixtures-and-hooks.md) -- complete guide to Playwright fixtures and lifecycle hooks
-- [core/test-organization.md](../core/test-organization.md) -- file structure and naming conventions
-- [core/test-architecture.md](../core/test-architecture.md) -- when to write E2E vs API vs component tests
+- [core/fixtures-and-hooks.md](~/.agents/skills/playwright-core/fixtures-and-hooks.md) -- complete guide to Playwright fixtures and lifecycle hooks
+- [core/test-organization.md](~/.agents/skills/playwright-core/test-organization.md) -- file structure and naming conventions
+- [core/test-architecture.md](~/.agents/skills/playwright-core/test-architecture.md) -- when to write E2E vs API vs component tests

@@ -166,7 +166,7 @@ class Roadmap(unittest.TestCase):
         self.assertEqual(roadmap.render()["tick"], status)
         self.assertEqual(self.reads, [])
 
-    def local_worker(self, worker, *, stage="Coding", sha=None, mail=(), tracked=True):
+    def local_worker(self, worker, *, stage="Coding", sha=None, mail=(), dispatch_mail=(), tracked=True):
         self.warm()
         with closing(sqlite3.connect(tick.SNAPSHOT.with_name("starts.sqlite"))) as db, db:
             db.execute("CREATE TABLE reviews (run TEXT, issue INTEGER, state TEXT)")
@@ -188,6 +188,9 @@ class Roadmap(unittest.TestCase):
             if args[:2] == ("orchestration", "task-list"):
                 return {"tasks": [{"id": "task_coder", "task_title": "#1 coder", "status": "dispatched"}]}
             if args[:2] == ("orchestration", "inbox"):
+                if "--terminal" in args:
+                    self.assertEqual(args[args.index("--terminal") + 1], "dispatch:ctx_coder")
+                    return {"messages": dispatch_mail}
                 return {"messages": mail}
             raise AssertionError(args)
 
@@ -279,18 +282,33 @@ class Roadmap(unittest.TestCase):
         self.assertEqual(live["status"], "working")
         self.assertEqual(live["who"], [{"role": "coder", "model": "gpt-6.2-sol", "host": "WSL"}])
 
-    def test_prompt_and_operator_question_need_you_without_changing_stage(self):
+    def test_prompts_need_you_even_while_working(self):
         for reason in ("approval", "input"):
             with self.subTest(reason=reason):
-                live, _ = self.live_rows({"projection": {"attention": {"categories": [reason]}}})
+                live, _ = self.live_rows({"projection": {
+                    "stage": {"activity": "working"}, "attention": {"categories": [reason]},
+                }})
                 self.assertEqual((live["stage"], live["status"]), (0, "needs you"))
                 tick.SNAPSHOT.with_name("starts.sqlite").unlink()
+
+    def test_question_badge_tracks_worker_activity_and_threaded_replies(self):
         mail = [{"type": "question", "thread_id": "q1", "from_handle": "dispatch:ctx_coder", "read": 1}]
-        with self.local_worker({}, mail=mail, tracked=False):
-            live = roadmap.render()["issues"][0]["now"]
-            self.assertEqual((live["stage"], live["status"]), (0, "needs you"))
-            mail.append({"type": "status", "thread_id": "q1", "to_handle": "dispatch:ctx_coder"})
-            self.assertEqual(roadmap.render()["issues"][0]["now"]["status"], "working")
+        reply = {"type": "status", "thread_id": "q1", "to_handle": "dispatch:ctx_coder"}
+        cases = (
+            ("working", (), (), "working"),
+            ("waiting", (), (), "needs you"),
+            ("idle", (), (), "needs you"),
+            ("idle", (), (dict(reply, thread_id="other"),), "needs you"),
+            ("idle", (), (reply,), "worker state unavailable"),
+            ("idle", (reply,), (), "worker state unavailable"),
+        )
+        for activity, run_replies, dispatch_mail, status in cases:
+            with self.subTest(activity=activity, run_replies=run_replies, dispatch_mail=dispatch_mail):
+                worker = {"projection": {"stage": {"activity": activity}}}
+                with self.local_worker(worker, mail=[*mail, *run_replies], dispatch_mail=dispatch_mail, tracked=False):
+                    live = roadmap.render()["issues"][0]["now"]
+                self.assertEqual((live["stage"], live["status"]), (0, status))
+                tick.SNAPSHOT.with_name("starts.sqlite").unlink()
 
     def test_a_red_pr_without_a_worker_still_warns_at_the_pr_stage(self):
         self.warm()

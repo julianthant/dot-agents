@@ -2863,7 +2863,10 @@ with TemporaryDirectory() as tmp:
                          ("close", args.repo_paths[1]), ("fill", args.repo_paths[0]), ("fill", args.repo_paths[1])]
         calls.clear()
         bind.side_effect = tick.OrcaError("wrong Run")
-        assert tick.scheduled_tick(args) == 1
+        other_run = [{"truncated": False, "terminals": [{"handle": args.anchor}]},
+                     {"run": {"id": args.run, "coordinator_handle": None}}]
+        with patch.dict(tick.os.environ, {}, clear=True), patch.object(tick, "runtime", side_effect=other_run):
+            assert tick.scheduled_tick(args) == 1
         assert calls == []
         assert json.loads((root / "tick.json").read_text())["errors"] == [{"phase": "adopt", "error": "OrcaError"}]
 

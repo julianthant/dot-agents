@@ -64,7 +64,8 @@ specs.
 
 ## Review loop
 
-- When a coder reports a green SHA, start the reviewer on that exact SHA.
+- Read task heads and CI from the roadmap. When a coder reports a green SHA,
+  verify GitHub once before starting the reviewer on that exact SHA.
 - PUSH: tell the coder to land it the way the repository's AGENTS.md says (PR body ending
   `Closes #<n>`, auto-merge).
 - FIX: send the findings to the coder (`orca orchestration send --to dispatch:<coder>`). If its

@@ -1,6 +1,5 @@
-import { useMemo, useState } from 'react'
+import { useMemo } from 'react'
 import { Counts, FeatureCounts, FeatureList, GridSide, Legend, MilestoneGates, NowTable, Panel, RoadmapGrid, Stamp, StatusBar } from '@/components/roadmap'
-import { Button } from '@/components/ui/button'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { build, type Model } from '@/lib/model'
@@ -51,30 +50,18 @@ function Cockpit({ m }: { m: Model }) {
 }
 
 export default function App() {
-  const [revision, setRevision] = useState(0)
-  const [refreshing, setRefreshing] = useState(false)
-  const [refreshError, setRefreshError] = useState<string | null>(null)
-  const feed = useRoadmapData(revision)
-  const m = useMemo(() => (feed.data ? build(feed.data) : null), [feed.data])
-  const githubTime = feed.data?.githubFetchedAt
-
-  async function refresh() {
-    setRefreshing(true)
-    setRefreshError(null)
-    try {
-      const response = await fetch('/refresh', { method: 'POST', headers: { 'X-Roadmap-Refresh': '1' } })
-      if (response.status === 409) {
-        setRefreshError('A GitHub refresh is already running.')
-      } else if (response.ok) {
-        setRevision((value) => value + 1)
-      } else {
-        setRefreshError('Could not refresh GitHub data. Try again.')
-      }
-    } catch {
-      setRefreshError('Could not reach the roadmap server. Try again.')
-    } finally {
-      setRefreshing(false)
-    }
+  const feed = useRoadmapData()
+  const data = feed.data
+  const githubTime = data?.githubFetchedAt
+  const age = githubTime ? Math.max(0, (Date.now() - Date.parse(githubTime)) / 1000) : null
+  const stale = age === null || age > 60
+  const m = useMemo(() => (data ? build(data) : null), [data])
+  const githubStatus = data?.githubStatus
+  const limitedUntil = Math.max(githubStatus?.limitedUntil ?? 0, githubStatus?.graphql?.limitedUntil ?? 0)
+  const sinceFetch = feed.fetchedAt ? (Date.now() - feed.fetchedAt) / 1000 : 0
+  const sourceNames: Record<string, string> = {
+    'runs:hr-relay': 'HR Relay runs', 'runs:dot-agents': 'dot-agents runs',
+    prs: 'PRs', heads: 'Branch heads', issues: 'Issues', project: 'Project', pipeline: 'Release pipeline',
   }
 
   return (
@@ -85,22 +72,34 @@ export default function App() {
             <h1 className="text-[22px] font-bold tracking-[-0.015em]">hr-relay roadmap</h1>
             <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
               <div className="grid gap-0.5">
-                <span role="status" className="text-xs text-muted-foreground">
-                  {githubTime ? <>GitHub data from <time dateTime={githubTime}>{new Date(githubTime).toLocaleString()}</time></> : 'GitHub refresh time unavailable'}
+                <span className={stale ? 'text-xs text-you' : 'text-xs text-muted-foreground'}>
+                  {age === null ? 'GitHub data stale · awaiting samples' : `GitHub data ${Math.floor(age)}s old${stale ? ' · stale' : ''}`}
                 </span>
                 <Stamp feed={feed} />
               </div>
-              <Button type="button" variant="outline" disabled={refreshing} onClick={refresh} aria-label="Refresh GitHub data">
-                {refreshing ? 'Refreshing…' : 'Refresh'}
-              </Button>
             </div>
           </div>
-          {refreshError && <p role="alert" className="text-xs text-you">{refreshError}</p>}
+          {githubStatus?.sources && <ul aria-label="GitHub source ages" className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+            {Object.entries(githubStatus.sources).map(([name, source]) => {
+              const seconds = source.ageSeconds === null ? null : Math.floor(source.ageSeconds + sinceFetch)
+              const outdated = source.stale || (seconds !== null && seconds > source.maxAgeSeconds)
+              return <li key={name} className={outdated ? 'text-you' : undefined}>
+                {sourceNames[name] ?? name} · {seconds === null ? 'awaiting sample' : `${seconds}s${outdated ? ' · stale' : ''}`}
+              </li>
+            })}
+          </ul>}
+          {limitedUntil * 1000 > Date.now() && <p role="status" className="text-xs text-you">GitHub limit reached, resets <time dateTime={new Date(limitedUntil * 1000).toISOString()}>{new Date(limitedUntil * 1000).toLocaleTimeString()}</time></p>}
           {m && <Counts m={m} />}
         </header>
         {m ? <Cockpit m={m} /> : feed.error
-          ? <p role="alert" className="rounded-[10px] border border-blk/50 bg-card p-4 text-sm">Could not load the roadmap: {feed.error}. The page retries every 30 s; check that the render job is writing data.json.</p>
+          ? <p role="alert" className="rounded-[10px] border border-blk/50 bg-card p-4 text-sm">Could not load the roadmap. {feed.error}</p>
           : <p className="text-sm text-muted-foreground" role="status">Loading the roadmap…</p>}
+        {data?.tick && <section aria-label="Dev-auto tick" className="text-xs text-muted-foreground">
+          Last tick <time dateTime={data.tick.lastRun}>{new Date(data.tick.lastRun).toLocaleString()}</time>
+          {data.tick.errors.length > 0 && <ul className="text-you">
+            {data.tick.errors.map(({ phase, error }, index) => <li key={index}>{phase} · {error}</li>)}
+          </ul>}
+        </section>}
       </main>
     </TooltipProvider>
   )

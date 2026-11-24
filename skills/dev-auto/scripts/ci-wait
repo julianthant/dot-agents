@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Wait for task CI against the roadmap's shared GitHub snapshot."""
+from argparse import ArgumentParser
+import re
+import subprocess
+import sys
+from time import monotonic, sleep
+
+from github_poller import OWNER, REPOS, SHA, Unavailable, read, run_order, task_workflow, workflow_matches
+
+
+def repository():
+    remote = subprocess.run(["git", "remote", "get-url", "origin"], capture_output=True, text=True, timeout=5)
+    match = re.fullmatch(rf"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/){OWNER}/"
+                         rf"({'|'.join(REPOS)})(?:\.git)?", remote.stdout.strip())
+    if remote.returncode or not match:
+        raise Unavailable("run inside an HR Relay or dot-agents checkout, or supply --repo")
+    return match[1]
+
+
+def wait(repo, target):
+    start = monotonic()
+    deadline = start + 90 * 60
+    workflow, event = task_workflow(repo)
+    sha = target.lower() if SHA.fullmatch(target) else None
+    listed = False
+    notified = False
+    while monotonic() < deadline:
+        if sha is None:
+            sha = read("heads")[repo].get(target)
+            if sha:
+                print(f"{target} resolves to {sha}", flush=True)
+        if sha:
+            runs = read("runs", repo=repo, sha=sha, event=event, workflow=workflow, waiting="1")
+            run = max((run for run in runs or () if run["head_sha"] == sha and run["event"] == event
+                       and workflow_matches(run, workflow)), key=run_order, default=None)
+            listed = listed or run is not None
+            if run and run["status"] == "completed":
+                print(f"{sha} {run['conclusion']} {run['html_url']}", flush=True)
+                if run["conclusion"] == "success":
+                    return 0
+                while monotonic() < deadline:
+                    jobs = read("jobs", repo=repo, id=run["id"], attempt=run["run_attempt"] or 1)
+                    if jobs is not None:
+                        for job in jobs["jobs"]:
+                            if job["conclusion"] not in ("success", "neutral", "skipped"):
+                                print(f"  {job['name']} ({job['conclusion']})")
+                        return 1
+                    sleep(2)
+        if not listed and not notified and monotonic() - start >= 180:
+            print(f"ci-wait: no {event} run listed after 3 minutes for {sha or target}. Still waiting.",
+                  file=sys.stderr, flush=True)
+            notified = True
+        sleep(2)
+    raise Unavailable(f"timed out waiting for {sha or target}")
+
+
+def main():
+    parser = ArgumentParser(description=__doc__)
+    parser.add_argument("ref", metavar="SHA_OR_BRANCH")
+    parser.add_argument("--repo", choices=REPOS)
+    args = parser.parse_args()
+    try:
+        return wait(args.repo or repository(), args.ref)
+    except (Unavailable, OSError, subprocess.SubprocessError) as e:
+        print(f"ci-wait: {e}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

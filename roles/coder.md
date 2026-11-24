@@ -5,8 +5,9 @@ ask it, not the operator.
 
 ## Start
 
-- Read the issue (`gh issue view <n>`), the repository's AGENTS.md and the nearest module
-  instructions. Load exactly the skills the issue names.
+- Read the issue from the roadmap's `GET /issues?number=<n>` endpoint and check that
+  `stale` is false. Read the repository's AGENTS.md and the nearest module instructions.
+  Load exactly the skills the issue names.
 - Work only in your worktree on your branch. Never edit another worktree, the main checkout or
   the live `~/.agents` checkout.
 - Stay inside the issue's owned paths. When the change needs a file outside them, keep that
@@ -26,8 +27,8 @@ ask it, not the operator.
 
 - Push your task branch; never force-push published history, and never push `main`, `staging`
   or `development`.
-- Wait on the run in one blocking command:
-  `gh run watch "$(gh run list --branch <branch> --limit 1 --json databaseId -q '.[0].databaseId')" --interval 30 --exit-status`
+- Wait for the exact pushed head using `~/.agents/skills/dev-auto/scripts/ci-wait "$(git rev-parse HEAD)"`.
+  On WSL set `ROADMAP_URL` to the Mac roadmap's tailnet URL.
 - Fix failures you caused and push again until green. When a failure is also red on the base
   branch, report it with that proof instead of changing unrelated tests.
 

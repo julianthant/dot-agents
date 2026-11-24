@@ -83,7 +83,7 @@ A healer patch makes the test pass; it does not prove the app is right. Check ea
 |---|---|
 | Generate a first suite for an untested flow | Test Agents: planner → generator |
 | Repair tests after a UI change | Test Agents: healer, then review the diff |
-| A coding agent drives a browser to explore, reproduce or debug, with limited context | [`playwright-cli`](../playwright-cli/SKILL.md): concise commands, no tool schemas or full accessibility trees in context |
+| A coding agent drives a browser to explore, reproduce or debug, with limited context | [`playwright-cli`](~/.agents/skills/playwright-cli/SKILL.md): concise commands, no tool schemas or full accessibility trees in context |
 | A long-running autonomous loop that reasons over page structure | [Playwright MCP](https://playwright.dev/docs/getting-started-mcp) (`@playwright/mcp`) |
 | Write or fix a specific test by hand | This skill's guides directly; no agent setup needed |
 | Debug one failing CI test from its trace | [trace-analysis.md](trace-analysis.md) |
@@ -100,7 +100,7 @@ A healer patch makes the test pass; it does not prove the app is right. Check ea
 
 ## Related
 
-- [playwright-cli/SKILL.md](../playwright-cli/SKILL.md): terminal browser control for coding agents
+- [playwright-cli/SKILL.md](~/.agents/skills/playwright-cli/SKILL.md): terminal browser control for coding agents
 - [core/trace-analysis.md](trace-analysis.md): agent-native debugging of `trace.zip`
 - [core/flaky-tests.md](flaky-tests.md): judging healer waits and retries
 - [Playwright Test Agents docs](https://playwright.dev/docs/test-agents)

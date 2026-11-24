@@ -116,4 +116,4 @@ A `trace.zip` contains every network request and response body, cookies and head
 - [core/trace-analysis.md](~/.agents/skills/playwright-core/trace-analysis.md): read a `trace.zip` from the terminal
 - [core/flaky-tests.md](~/.agents/skills/playwright-core/flaky-tests.md): flake vs race
 - [core/dynamic-test-selection.md](~/.agents/skills/playwright-core/dynamic-test-selection.md): quarantine many known failures at once
-- [playwright-cli/SKILL.md](../playwright-cli/SKILL.md): reproduce a bug interactively
+- [playwright-cli/SKILL.md](~/.agents/skills/playwright-cli/SKILL.md): reproduce a bug interactively

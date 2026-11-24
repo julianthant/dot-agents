@@ -366,7 +366,7 @@ use: {
 },
 ```
 
-Videos are now encoded with **VP9 instead of VP8**: less CPU and smaller files at the same or better quality, so existing `retain-on-failure` setups get cheaper with no config change. Firefox and WebKit currently capture up to 25 fps regardless of the setting. For demo-quality recordings with styled action callouts, see [screenshots-and-media.md](../playwright-cli/screenshots-and-media.md#annotated-screencasts).
+Videos are now encoded with **VP9 instead of VP8**: less CPU and smaller files at the same or better quality, so existing `retain-on-failure` setups get cheaper with no config change. Firefox and WebKit currently capture up to 25 fps regardless of the setting. For demo-quality recordings with styled action callouts, see [screenshots-and-media.md](~/.agents/skills/playwright-cli/screenshots-and-media.md#annotated-screencasts).
 
 ### Pattern 6: Artifact Organization for CI
 

@@ -27,6 +27,7 @@ version: 2.1
 executors:
   playwright:
     docker:
+      # Replace %%VERSION%% with the version in the project's package.json
       - image: mcr.microsoft.com/playwright:v%%VERSION%%-noble
     working_directory: ~/project
 

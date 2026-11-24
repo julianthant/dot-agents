@@ -630,7 +630,7 @@ test('drive a real browser without changing its focus/media behavior', async () 
 });
 ```
 
-See [playwright-cli/session-management.md](../playwright-cli/session-management.md#attaching-to-a-real-browser-without-overrides-connectovercdp-nodefaults--playwright-160) for the CLI/agent attach workflow.
+See [playwright-cli/session-management.md](~/.agents/skills/playwright-cli/session-management.md#attaching-to-a-real-browser-without-overrides-connectovercdp-nodefaults--playwright-160) for the CLI/agent attach workflow.
 
 ## Decision Guide
 

@@ -490,14 +490,17 @@ def research_root():
     return (SNAPSHOT.parent / "research").resolve()
 
 
-def issue_nodes(state, since=None, limit=None):
+def issue_nodes(state, since=None, limit=None, *, query=None):
     order = ",orderBy:{field:UPDATED_AT,direction:DESC}" if state == "CLOSED" else ""
     out, cursor = [], None
     while limit is None or len(out) < limit:
-        args = ["gh", "api", "graphql", "-f", "query=" + ISSUES_QUERY % order, "-f", "states=" + state]
+        fields = ISSUES_QUERY % order
+        args = ["-f", "states=" + state]
         args += ["-f", "since=" + since] if since else []
         args += ["-f", "endCursor=" + cursor] if cursor else []
-        page = json.loads(command(*args))["data"]["repository"]["issues"]
+        data = (query(fields, *args) if query else
+                json.loads(command("gh", "api", "graphql", "-f", "query=" + fields, *args))["data"])
+        page = data["repository"]["issues"]
         out += page["nodes"]
         if not page["pageInfo"]["hasNextPage"]:
             break
@@ -519,7 +522,7 @@ def snapshot():
     return github_state("issues")
 
 
-def refresh_snapshot():
+def refresh_snapshot(query=None):
     """Refresh the issue snapshot in the roadmap server."""
     import fcntl
     SNAPSHOT.parent.mkdir(parents=True, exist_ok=True)
@@ -530,16 +533,16 @@ def refresh_snapshot():
         except (OSError, ValueError):
             old = {}
         now = time.time()
-        opened = issue_nodes("OPEN")
+        opened = issue_nodes("OPEN", query=query)
         # Closed issues change only when updated, so read the recent ones and a full list every ten minutes.
         full = not 0 <= now - old.get("closed_full", 0) < CLOSED_FULL_SECONDS
         since = None if full else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(old["read"] - 120))
         closed = {} if full else {i["number"]: i for i in old.get("closed", [])}
-        closed.update((i["number"], i) for i in issue_nodes("CLOSED", since))
+        closed.update((i["number"], i) for i in issue_nodes("CLOSED", since, CLOSED_KEPT, query=query))
         numbers = {i["number"] for i in opened}
         closed = sorted((i for n, i in closed.items() if n not in numbers), key=lambda i: i["updatedAt"], reverse=True)
-        new = {"fetched": now, "read": now, "closed_full": now if full else old["closed_full"],
-               "open": opened, "closed": closed}
+        new = {"fetched": time.time(), "read": now, "closed_full": now if full else old["closed_full"],
+               "open": opened, "closed": closed[:CLOSED_KEPT]}
         tmp = SNAPSHOT.with_suffix(".tmp")
         tmp.write_text(json.dumps(new))
         tmp.replace(SNAPSHOT)

@@ -107,7 +107,8 @@ class Roadmap(unittest.TestCase):
         p = patch.object(roadmap, "pull_requests", side_effect=lambda: self.prs)
         p.start()
         self.addCleanup(p.stop)
-        self.poller = github_poller.Poller()
+        self.now = time.time()
+        self.poller = github_poller.Poller(clock=lambda: self.now)
         self.poller.set("project", {"id": "proj", "fields": FIELDS})
 
     def answer(self, a):
@@ -136,7 +137,7 @@ class Roadmap(unittest.TestCase):
         self.poller.set("heads", roadmap.branch_heads())
         self.poller.set("prs", roadmap.pull_requests())
         opened = json.loads(tick.SNAPSHOT.read_text())["open"]
-        with patch.object(tick, "issue_nodes", side_effect=lambda state, *_: opened if state == "OPEN" else []):
+        with patch.object(tick, "issue_nodes", side_effect=lambda state, *_, **kw: opened if state == "OPEN" else []):
             roadmap.poll_issues(self.poller)
 
     def full(self):
@@ -456,6 +457,7 @@ class Roadmap(unittest.TestCase):
         first = roadmap.publish_board(self.poller, None)
         self.sent.clear()
         self.replies.clear()
+        self.now += 30
         self.poller.poll_runs()
         self.poller.set("pipeline", roadmap.pipeline(self.poller))
         self.poller.set("prs", {**self.prs, "devPrs": [dict(self.prs["devPrs"][0], checks="failing")]})
@@ -550,26 +552,84 @@ class Roadmap(unittest.TestCase):
         clock[0] = 3701
         self.assertEqual((rest.budget()["callsLastHour"], rest.slowdown()), (0, 1))
 
-    def test_virtual_hour_with_ten_waiters_counts_upstream_calls(self):
+    def test_graphql_tracks_real_points_and_reserves_quota_for_writes(self):
+        now = 100
+        sent = []
+
+        def upstream(argv, **kw):
+            sent.append(argv)
+            body = json.dumps({"data": {"thing": 1, "rateLimit": {"cost": 4}}})
+            return subprocess.CompletedProcess(argv, 0, f"HTTP/2 200 OK\nX-RateLimit-Resource: graphql\n"
+                f"X-RateLimit-Remaining: {999 if len(sent) == 1 else 100}\nX-RateLimit-Reset: 200\n\n{body}", "")
+
+        graphql = github_poller.GraphQL(clock=lambda: now, run=upstream)
+        self.assertEqual(graphql.query("query { thing }")["thing"], 1)
+        self.assertIn("rateLimit { cost }", sent[0][-1])
+        self.assertEqual(graphql.slowdown(), 2)
+        graphql.query("query { thing }")
+        with self.assertRaises(github_poller.Unavailable):
+            graphql.query("query { thing }")
+        self.assertEqual((len(sent), graphql.budget()["pointsLastHour"], graphql.budget()["limitedUntil"]), (2, 8, 200))
+        now = 200
+        self.assertEqual(graphql.slowdown(), 1)
+
+    def test_rolling_caps_apply_even_when_github_has_quota(self):
+        rest = github_poller.Rest(clock=lambda: 100)
+        rest.hourly_limit = 2
+        self.replies["endpoint"] = R200.format(tag="a", body="{}")
+        for _ in range(2):
+            rest.poll("endpoint")
+        with self.assertRaises(github_poller.Unavailable):
+            rest.poll("endpoint")
+        self.assertEqual((len(self.sent), rest.budget()["pointsLastHour"]), (2, 2))
+
+        graphql = github_poller.GraphQL(clock=lambda: 100, run=lambda argv, **_: subprocess.CompletedProcess(
+            argv, 0, 'HTTP/2 200 OK\n\n{"data":{"rateLimit":{"cost":4}}}', ""))
+        graphql.hourly_limit = 14
+        for _ in range(2):
+            graphql.query("query { thing }")
+        with self.assertRaises(github_poller.Unavailable):
+            graphql.query("query { thing }")
+        self.assertEqual((graphql.budget()["callsLastHour"], graphql.budget()["pointsLastHour"]), (2, 8))
+
+    def test_twice_slower_run_polls_stay_fresh_without_dot_agents_waiters(self):
+        self.prepare()
+        start = self.now
+        for endpoint in RUNS.values():
+            response = self.replies[endpoint].replace("\r\n\r\n", "\r\nX-RateLimit-Remaining: 999\r\n"
+                                                      f"X-RateLimit-Reset: {int(start) + 3600}\r\n\r\n")
+            self.replies[endpoint] = response
+        for elapsed in range(0, 120, 10):
+            self.now = start + elapsed
+            self.poller.poll_runs()
+            self.assertEqual(self.poller.rest.slowdown(), 2)
+            # Read just before the next scheduled pass, when both pages are oldest.
+            self.now = start + elapsed + 9
+            status = self.poller.status()["sources"]
+            self.assertFalse(status["runs:hr-relay"]["stale"])
+            self.assertFalse(status["runs:dot-agents"]["stale"])
+        self.assertEqual([sum(argv[-1] == endpoint for argv in self.sent) for endpoint in RUNS.values()], [12, 3])
+
+    def test_virtual_heavy_ci_hour_counts_every_poll_as_http_200(self):
         now = 1_000
         start = now
-        counts = {"calls": 0, "modified": 0}
+        counts = {}
         waiters = {(repo, f"{i + 10:040x}") for repo in github_poller.REPOS for i in range(5)}
 
         def upstream(argv, **_):
-            counts["calls"] += 1
             path = argv[-1]
+            counts[path] = counts.get(path, 0) + 1
             repo = next((repo for repo, url in RUNS.items() if url == path), None)
             if repo:
-                tag = f"{repo}-{(now - start) // 30}"
+                tag = f"{repo}-{now}"
                 payload = {"workflow_runs": [{"id": i, "head_sha": sha, "status": "in_progress"}
                                              for i, (name, sha) in enumerate(sorted(waiters), 1) if name == repo]}
             else:
                 tag = "release"
-                payload = {"total_count": 7} if path == SEARCH else REST[path.split("/", 3)[-1]]
-            if "-H" in argv and argv[argv.index("-H") + 1] == f'If-None-Match: W/"{tag}"':
-                return subprocess.CompletedProcess(argv, 1, "HTTP/2.0 304 Not Modified\r\n\r\n", "")
-            counts["modified"] += 1
+                name = path.split("/", 3)[-1]
+                payload = ({"total_count": 7} if path == SEARCH else
+                           [] if name == "releases?per_page=1" else
+                           {"commit": {"committer": {"date": SINCE}}} if name == "commits/main" else REST[name])
             return subprocess.CompletedProcess(argv, 0, R200.format(tag=tag, body=json.dumps(payload)), "")
 
         poller = github_poller.Poller(clock=lambda: now, rest=github_poller.Rest(clock=lambda: now, run=upstream))
@@ -577,17 +637,17 @@ class Roadmap(unittest.TestCase):
             now = start + elapsed
             poller.poll_runs()
             poller.poll_details()
-            if elapsed % 30 == 0:
+            if elapsed % 120 == 0:
                 roadmap.pipeline(poller)
             for repo, sha in waiters:
-                answer = poller.read("runs", {"repo": repo, "sha": sha})
+                answer = poller.read("runs", {"repo": repo, "sha": sha, "waiting": "1"})
                 self.assertFalse(answer["stale"])
                 self.assertEqual(answer["data"][0]["head_sha"], sha)
-        self.assertEqual(counts, {"calls": 2040, "modified": 245})
+        self.assertEqual([counts[endpoint] for endpoint in RUNS.values()], [720, 720])
+        self.assertEqual(sum(counts.values()) - 1440, 180)
         status = poller.status()
-        self.assertEqual((status["callsLastHour"], status["notModifiedLastHour"]), (2040, 1795))
-        print("Quota fixture, 10 waiting workers over 1 virtual hour: "
-              "2040 shared REST GETs, 1795 HTTP 304s, 245 HTTP 200s.")
+        self.assertEqual((status["callsLastHour"], status["pointsLastHour"], status["notModifiedLastHour"]), (1620, 1620, 0))
+        print("Heavy CI fixture, 10 waiting workers over 1 virtual hour: 1620 REST GETs, all HTTP 200.")
 
     def test_ci_wait_fails_closed_on_stale_and_unreachable(self):
         scripts = Path(tick.__file__).parent
@@ -622,7 +682,8 @@ class Roadmap(unittest.TestCase):
               "isDraft": False, "updatedAt": SINCE, "closingIssuesReferences": {"nodes": []},
               "baseRef": {"refUpdateRule": {"requiredStatusCheckContexts": ["tests"]}},
               "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": [
-                  {"name": "tests", "conclusion": "SUCCESS"}, {"name": "GitGuardian", "conclusion": "FAILURE"}]}}}}]}}
+                  {"name": "tests", "conclusion": "SUCCESS"},
+                  {"name": "GitGuardian Security Checks", "conclusion": "FAILURE"}]}}}}]}}
         graph = {"relay": {"dev": {"nodes": [pr]}, "staging": {"nodes": []}}, "agents": {"task": {"nodes": []}}}
         with patch.object(roadmap, "pull_requests", REAL_PULL_REQUESTS), patch.object(roadmap, "github_query", return_value=graph):
             self.assertEqual(roadmap.pull_requests()["devPrs"][0]["checks"], "green")

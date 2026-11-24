@@ -858,6 +858,20 @@ with TemporaryDirectory() as tmp:
         tick.refresh_snapshot()
         check.assertEqual(calls[-1], ("CLOSED", None))  # ten minutes on: a full closed read again
 
+with TemporaryDirectory() as tmp:
+    closed_pages = []
+
+    def gh(*args):
+        if "states=OPEN" in args:
+            return issue_page([])
+        closed_pages.append(args)
+        return issue_page([dict(issue_row(n, "closed"), updatedAt=f"{1000 - n}")
+                           for n in range(50 * len(closed_pages) - 50, 50 * len(closed_pages))], more=True)
+
+    with patch.object(tick, "SNAPSHOT", Path(tmp) / "issues.json"), patch.object(tick, "command", gh):
+        check.assertEqual(len(tick.refresh_snapshot()["closed"]), 400)
+        check.assertEqual(len(closed_pages), 8)
+
 # Bug 8: the roadmap moved here renders a recorded snapshot exactly as the live script did for the same GitHub
 # replies (ROADMAP_BEFORE is that script's output), while reading issues from the shared snapshot.
 import roadmap
@@ -942,7 +956,7 @@ with TemporaryDirectory() as tmp:
     with (patch.object(roadmap, "STATE", root / "roadmap.json"),
           patch.object(tick, "SNAPSHOT", root / "issues.json"),
           patch.object(tick, "PROJECT_CACHE", root / "project.json"),
-          patch.object(tick, "issue_nodes", side_effect=lambda state, *_: RM_OPEN if state == "OPEN" else RM_CLOSED),
+          patch.object(tick, "issue_nodes", side_effect=lambda state, *_, **kw: RM_OPEN if state == "OPEN" else RM_CLOSED),
           patch.object(roadmap, "github_query", lambda _: rm_answer(["api", "graphql"])["data"]),
           patch.object(poller.rest, "poll", lambda url, _: (
               200, None, json.dumps({"total_count": 7} if url.startswith("search/issues?")
@@ -3186,6 +3200,64 @@ with TemporaryDirectory() as tmp:
                                          "--repo-path", str(args.repo_paths[1].resolve())]
     assert agent["EnvironmentVariables"]["ORCA_CLI_COMMAND"] == "/cli/orca"
     assert agent["EnvironmentVariables"]["DEV_AUTO_ACCOUNTS"] == str(accounts)
+
+# Sweep the actual runtime phases with an eligible start. Every gh or ls-remote
+# call must belong to the fresh-ticket and exact-ref verifications for that start.
+with TemporaryDirectory() as tmp, ExitStack() as stack:
+    root = Path(tmp).resolve()
+    repo = root / "hr-relay"
+    options = SimpleNamespace(anchor="term_anchor", run="run", repo_paths=[repo])
+    candidate = rm_issue(51, "OPEN", "2026-11-23T09:00:00Z", "area / eligible",
+                         cards=[rm_card("Todo", None, "Queued", "Tick")])
+    candidate["body"] = ("Branch: `task/area/eligible` from development\n"
+                         "Coder: codex / gpt-6.2-sol / medium\nOwned paths: `src/area`")
+    heads = {"hr-relay": {"development": sha}}
+    network, shared = [], []
+
+    def consume(source, **query):
+        shared.append(source)
+        return {"issues": {"open": [candidate], "closed": []}, "heads": heads,
+                "runs": [{"event": "workflow_dispatch", "status": "in_progress"}]}[source]
+
+    def run(argv, **kw):
+        if argv[0] == "gh" or "ls-remote" in argv:
+            network.append(argv)
+        if argv == ("gh", "api", "graphql", "-f", "query=" + tick.ISSUES_QUERY % "", "-f", "states=OPEN"):
+            result = issue_page([candidate])
+        else:
+            result = {
+                ("remote", "get-url", "origin"): "https://github.com/julianthant/hr-relay.git",
+                ("for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes/origin"): "",
+                ("fetch", "--no-tags", "origin", "refs/heads/development:refs/remotes/origin/development"): "",
+                ("ls-remote", "--heads", "origin", "refs/heads/development", "refs/heads/task/area/eligible"):
+                    f"{sha} refs/heads/development",
+                ("rev-parse", "--verify", "origin/development"): sha,
+            }[argv[3:]]
+        return subprocess.CompletedProcess(argv, 0, result, "")
+
+    def orca(*args):
+        return {("orchestration", "inbox"): {"messages": []}, ("orchestration", "task-list"): {"tasks": []},
+                ("worktree", "list"): {"worktrees": [], "truncated": False},
+                ("terminal", "list"): {"terminals": [], "truncated": False}}[args[:2]]
+
+    for target, name, value in ((tick, "SNAPSHOT", root / "issues.json"), (tick, "FULL_RUN_STAMP", root / "full-run.json"),
+                              (tick, "runtime", orca), (tick, "fleet_workers", Mock(return_value=[])),
+                              (tick, "supervisor", Mock(return_value=(["--from", options.anchor], options.run))),
+                              (tick.github_poller, "read", consume), (tick.subprocess, "run", run),
+                              (pick, "HOLDS", root / "holds.json"), (pick, "main", Mock()),
+                              (pick, "due", Mock(return_value=[])), (pick, "pick", Mock(return_value=(account, []))),
+                              (pick.account_usage, "load_config", Mock(return_value={}))):
+        stack.enter_context(patch.object(target, name, value))
+    launch = stack.enter_context(patch.object(tick, "launch"))
+    output = stack.enter_context(redirect_stdout(io.StringIO()))
+    check.assertEqual(tick.scheduled_tick(options), 0, output.getvalue())
+    launch.assert_called_once()
+    check.assertEqual(shared, ["issues", "issues", "issues", "issues", "heads", "runs"])
+    check.assertEqual(network, [
+        ("gh", "api", "graphql", "-f", "query=" + tick.ISSUES_QUERY % "", "-f", "states=OPEN"),
+        ("git", "-C", str(repo), "ls-remote", "--heads", "origin", "refs/heads/development",
+         "refs/heads/task/area/eligible"),
+    ])
 
 print("ok")
 

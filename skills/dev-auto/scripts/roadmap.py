@@ -57,14 +57,15 @@ query { user(login: "julianthant") { projectV2(number: 5) {
   } }
 } } }
 """
+PRS_INTERVAL = 20
+PROJECT_INTERVAL = 25
+ISSUES_INTERVAL = 25
+PIPELINE_INTERVAL = 120
+NON_REQUIRED_CHECKS = {"GitGuardian", "GitGuardian Security Checks"}
 
 
 def github_query(query):
-    body = json.loads(subprocess.run(["gh", "api", "graphql", "-f", f"query={query}"],
-                                     check=True, capture_output=True, text=True, timeout=15).stdout)
-    if body.get("errors"):
-        raise ValueError("GitHub GraphQL query failed")
-    return body["data"]
+    return github_poller.GraphQL().query(query)
 
 
 def row(n):
@@ -81,7 +82,7 @@ def row(n):
         status=v("status"), agent=v("stage"), area=v("area"))
 
 
-def pull_requests():
+def pull_requests(query=None):
     def pr(p):
         commit = p["commits"]["nodes"]
         rollup = (commit[0]["commit"]["statusCheckRollup"] or {}) if commit else {}
@@ -90,16 +91,18 @@ def pull_requests():
         required.update(check["context"] for rule in base.get("rules", {}).get("nodes", [])
                         for check in (rule["parameters"] or {}).get("requiredStatusChecks", []))
         outcomes = {check["name"]: check.get("conclusion", check.get("state"))
-                    for check in rollup.get("contexts", {}).get("nodes", []) if check and check["name"] in required}
+                    for check in rollup.get("contexts", {}).get("nodes", [])
+                    if check and (check["name"] in required if required else check["name"] not in NON_REQUIRED_CHECKS)}
+        expected = required or outcomes.keys()
         passing = {"SUCCESS", "NEUTRAL", "SKIPPED"}
         checks = ("failing" if any(outcome not in {*passing, None, "PENDING", "EXPECTED"} for outcome in outcomes.values())
-                  else "green" if all(outcomes.get(name) in passing for name in required) else "running")
+                  else "green" if expected and all(outcomes.get(name) in passing for name in expected) else "running")
         return dict(n=p["number"], t=p["title"], head=p["headRefName"], auto=p["autoMergeRequest"] is not None,
                     draft=p["isDraft"], checks=checks, updated=p["updatedAt"], sha=p["headRefOid"],
                     issues=[i["number"] for i in p["closingIssuesReferences"]["nodes"]
                             if i and i["repository"]["nameWithOwner"] == REPO])
 
-    data = github_query(PR_QUERY)
+    data = (query or github_query)(PR_QUERY)
     return {"devPrs": [pr(p) for p in data["relay"]["dev"]["nodes"]],
             "stagingPr": [pr(p) for p in data["relay"]["staging"]["nodes"]],
             "agentPrs": [pr(p) for p in data["agents"]["task"]["nodes"] if p["headRefName"].startswith("task/")]}
@@ -381,20 +384,20 @@ def pipeline(poller):
     return {"pipeline": stages, "milestones": api("milestones?state=open&per_page=50", lambda rows: [m["title"] for m in rows])}
 
 
-def project():
-    data = github_query(PROJECT_QUERY)["user"]["projectV2"]
+def project(query):
+    data = query(PROJECT_QUERY)["user"]["projectV2"]
     return {"id": data["id"], "fields": {field["name"]: field for field in data["fields"]["nodes"]}}
 
 
 def poll_project(poller):
-    meta = project()
+    meta = project(poller.graphql.query)
     tick.PROJECT_CACHE.parent.mkdir(parents=True, exist_ok=True)
     write_json(tick.PROJECT_CACHE, meta)
     poller.set("project", meta)
 
 
 def poll_issues(poller):
-    snap = tick.refresh_snapshot()
+    snap = tick.refresh_snapshot(poller.graphql.query)
     poller.samples["issues"] = github_poller.Sample(snap, snap["fetched"])
 
 
@@ -402,31 +405,31 @@ def publish_board(poller, directory):
     snap = read_json(tick.SNAPSHOT, {"open": [], "closed": []})
     samples = poller.samples.copy()
     pages = poller.pages.copy()
-    budget = poller.status()
     now = poller.clock()
-    times = [sample.at for sample in (*samples.values(), *pages.values())] + [snap.get("fetched")]
-    if any(at is None for at in times):
-        return
-    heads = samples["heads"].data
+    times = [samples["prs"].at, samples["heads"].at, snap.get("fetched"), *(page.at for page in pages.values())]
+    oldest = min(times) if all(at is not None for at in times) else None
+    heads = samples["heads"].data or {}
     latest = {}
     for repo, page in pages.items():
         workflow, event = github_poller.task_workflow(repo)
         latest[repo] = {}
-        for run in page.data:
+        for run in page.data or ():
             if run["event"] == event and github_poller.workflow_matches(run, workflow):
                 latest[repo].setdefault(run["head_branch"], run)
-    full_run = next((r for r in pages["hr-relay"].data if r["head_branch"] == tick.FULL_RUN_BRANCH
+    full_run = next((r for r in (pages["hr-relay"].data or ()) if r["head_branch"] == tick.FULL_RUN_BRANCH
                      and r["event"] in ("schedule", "workflow_dispatch")
                      and github_poller.workflow_matches(r, tick.FULL_RUN_WORKFLOW)), None)
-    fields = samples["pipeline"].data
-    data = {**fields, "heads": heads, "areas": area_names(samples["project"].data), "task_runs": latest,
-            "pipeline": {**fields["pipeline"], **samples["prs"].data,
-                         "cuts": sorted((name for name in heads["hr-relay"] if name.startswith("cut/")), reverse=True),
+    fields = samples["pipeline"].data or {}
+    meta = samples["project"].data
+    data = {**fields, "heads": heads, "areas": area_names(meta) if meta is not None else None, "task_runs": latest,
+            "pipeline": {**fields.get("pipeline", {}), **(samples["prs"].data or {}),
+                         "cuts": sorted((name for name in heads.get("hr-relay", {}) if name.startswith("cut/")), reverse=True),
                          "fullRun": dict(status=full_run["status"], conclusion=full_run["conclusion"],
                                          createdAt=full_run["created_at"], headSha=full_run["head_sha"],
                                          url=full_run["html_url"]) if full_run else None},
-            "githubFetchedAt": datetime.datetime.fromtimestamp(min(times), datetime.timezone.utc).isoformat()}
-    if not any(source["stale"] for source in budget["sources"].values()) and now - min(times) <= github_poller.STALE_SECONDS:
+            "githubFetchedAt": (datetime.datetime.fromtimestamp(oldest, datetime.timezone.utc).isoformat()
+                                if oldest else None)}
+    if oldest and now - oldest <= github_poller.STALE_SECONDS:
         data["readiness"] = {str(number): reason for number, reason in readiness(snap, heads).items()}
     return render(directory, state=data)
 
@@ -438,6 +441,20 @@ def make_server(directory, bind, port, poller=None):
         raise ValueError("bind to loopback or the Mac's Tailscale IPv4 address")
 
     class Handler(SimpleHTTPRequestHandler):
+        def parse_request(self):
+            if not super().parse_request():
+                return False
+            hosts = self.headers.get_all("Host", [])
+            names = {bind, "localhost"} if address.is_loopback else {bind}
+            port = self.server.server_port
+            allowed = {f"{name}:{port}" for name in names}
+            if port == 80:
+                allowed.update(names)
+            if len(hosts) == 1 and hosts[0].lower() in allowed:
+                return True
+            self.send_error(400, "Invalid Host")
+            return False
+
         def log_request(self, code="-", size="-"):
             if str(code).startswith(("4", "5")):
                 super().log_request(code, size)
@@ -495,13 +512,13 @@ def serve(directory, bind, port):
         tailnet = make_server(directory, bind, port, poller) if bind != "127.0.0.1" else None
         if tailnet:
             Thread(target=tailnet.serve_forever, daemon=True).start()
-        poller.schedule(stop, 5, poller.poll_runs, rest=True)
-        poller.schedule(stop, 5, poller.poll_details, rest=True)
-        poller.schedule(stop, 10, lambda: poller.set("prs", pull_requests()))
-        poller.schedule(stop, 10, lambda: poll_project(poller))
-        poller.schedule(stop, 30, lambda: poll_issues(poller))
+        poller.schedule(stop, github_poller.RUN_INTERVAL, poller.poll_runs, budget=poller.rest)
+        poller.schedule(stop, 5, poller.poll_details, budget=poller.rest)
+        poller.schedule(stop, PRS_INTERVAL, lambda: poller.set("prs", pull_requests(poller.graphql.query)), budget=poller.graphql)
+        poller.schedule(stop, PROJECT_INTERVAL, lambda: poll_project(poller), budget=poller.graphql)
+        poller.schedule(stop, ISSUES_INTERVAL, lambda: poll_issues(poller), budget=poller.graphql)
         poller.schedule(stop, 10, lambda: poller.set("heads", branch_heads()))
-        poller.schedule(stop, 30, lambda: poller.set("pipeline", pipeline(poller)), rest=True)
+        poller.schedule(stop, PIPELINE_INTERVAL, lambda: poller.set("pipeline", pipeline(poller)), budget=poller.rest)
         poller.schedule(stop, 5, lambda: publish_board(poller, directory))
         try:
             loopback.serve_forever()

@@ -16,7 +16,14 @@ The board polls `/data.json` every five seconds. The API also serves
 `/jobs?repo=hr-relay&id=...&attempt=...`. The GitHub endpoints report
 `ageSeconds` and `stale`. A lookup may return `data: null` while pending.
 The server sends conditional GitHub REST GETs where an ETag is available.
-GitHub GraphQL queries use POST and branch-head reads use Git.
+GitHub GraphQL queries use POST and branch-head reads use Git. Use
+`127.0.0.1:8790` or `localhost:8790` for the loopback listener and the configured
+Tailscale IPv4 address and port for the tailnet listener.
+
+`/status` reports each source's age, REST requests and quota usage, and a
+separate `graphql` budget in primary points. The board shows stale GitHub data
+alongside the latest local Orca and tick state. The release pipeline has its
+own freshness indicator.
 
 ## Mac cutover
 
@@ -93,16 +100,34 @@ git -C "$HOME/.agents" fetch origin "$ROADMAP_RELEASE_SHA"
 git -C "$HOME/.agents" worktree add --detach "$release" "$ROADMAP_RELEASE_SHA"
 ```
 
-On both hosts, install the client and its Python module together, plus the
-hook script.
+On both hosts, wait for the release to land on `main` and update the tracked
+installation with a fast-forward pull. Move aside any untracked files left by
+a previous installation attempt before running the pull. This keeps future
+pulls from colliding with copied files.
 
 ```sh
-scripts="$HOME/.agents/skills/dev-auto/scripts"
-install -d "$scripts" "$HOME/.agents/hooks"
-install -m 755 "$release/skills/dev-auto/scripts/ci-wait" "$scripts/ci-wait"
-install -m 644 "$release/skills/dev-auto/scripts/github_poller.py" "$scripts/github_poller.py"
-install -m 644 "$release/hooks/ci-wait.py" "$HOME/.agents/hooks/ci-wait.py"
+checkout="$HOME/.agents"
+backup_files=$(mktemp -d)
+for path in skills/dev-auto/scripts/ci-wait skills/dev-auto/scripts/github_poller.py hooks/ci-wait.py; do
+  if { test -e "$checkout/$path" || test -L "$checkout/$path"; } &&
+    ! git -C "$checkout" ls-files --error-unmatch -- "$path" >/dev/null 2>&1; then
+    mkdir -p "$backup_files/$(dirname "$path")"
+    mv "$checkout/$path" "$backup_files/$path"
+  fi
+done
+printf 'Previous untracked client files, if any, are in %s\n' "$backup_files"
+git -C "$checkout" pull --ff-only origin main
+for path in skills/dev-auto/scripts/ci-wait skills/dev-auto/scripts/github_poller.py hooks/ci-wait.py; do
+  cmp "$release/$path" "$checkout/$path" || break
+done
 ```
+
+Confirm all three comparisons succeed before enabling the hooks.
+`ci-wait` uses the standard library and needs Python 3.10 or newer. Check
+`python3 --version` in the WSL worker shell. The executable uses the worker's
+`python3` from `PATH`. If the worker uses a different default interpreter,
+invoke the script explicitly with `python3.10` or a newer Python. The Mac
+server and tick have their own Python requirements.
 
 On WSL, set `ROADMAP_URL=http://<mac-tailnet-ip>:8790` in the Orca worker
 environment and open a worker shell that inherits it. Check `$ROADMAP_URL/status`
@@ -121,6 +146,22 @@ Once the service is reachable, add the PreToolUse entry from
 [`hooks/ci-wait.json`](../../../hooks/ci-wait.json) to the `hooks.PreToolUse` array
 in each Claude user `settings.json` and each active Codex account's `hooks.json`.
 Keep existing entries. Reload the sessions and trust the new hook in Codex.
+In each active Codex account, ask Codex to make a shell tool call for
+`gh run watch --help`. It should be denied before execution and show the
+`ci-wait` instruction. The help command makes no GitHub request if the hook
+is inactive. Check that `gh run view --help` still executes. This exercises the
+live `PreToolUse` event, including Codex's `Bash` matcher and
+`tool_input.command` field. [Codex hook payload](https://developers.openai.com/codex/hooks#pretooluse)
+
+For a separate check of the handler, pipe this
+representative payload into the installed script and check for
+`hookSpecificOutput.permissionDecision == "deny"`.
+
+```sh
+printf '%s\n' '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"gh run watch --help"}}' |
+  python3 "$HOME/.agents/hooks/ci-wait.py" |
+  jq -e '.hookSpecificOutput.permissionDecision == "deny"'
+```
 
 ## Rollback
 

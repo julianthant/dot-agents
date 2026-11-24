@@ -268,13 +268,29 @@ def live_workers(numbers):
     if active:
         try:
             mail = tick.runtime("orchestration", "inbox", "--run", RUN, "--limit", "500", "--full")["messages"]
-            replies = {(m.get("thread_id"), m.get("to_handle")) for m in mail if m["type"] == "status"}
-            for m in mail:
-                sender = m.get("from_handle")
-                if m["type"] == "question" and sender in active and (m.get("thread_id"), sender) not in replies:
-                    active[sender]["operatorQuestion"] = True
         except REFUSED as e:
             print(f"roadmap worker questions: {e}", file=sys.stderr)
+            mail = []
+        replies = {(m["thread_id"], m.get("to_handle")) for m in mail if m["type"] == "status" and m.get("thread_id")}
+        questions = {}
+        for m in mail:
+            sender = m.get("from_handle")
+            thread = m.get("thread_id") or m.get("id")
+            if m["type"] == "question" and sender in active and (thread, sender) not in replies:
+                questions.setdefault(sender, set()).add(thread)
+        for sender, threads in questions.items():
+            worker = active[sender]
+            # Only consult mail when the question could change the projected status.
+            if worker_status(worker) != "worker state unavailable":
+                continue
+            try:
+                inbox = tick.runtime("orchestration", "inbox", "--terminal", sender, "--limit", "500", "--full")["messages"]
+                threads.difference_update(m["thread_id"] for m in inbox if m["type"] == "status"
+                                          and m.get("to_handle") == sender and m.get("thread_id"))
+            except REFUSED as e:
+                print(f"roadmap worker question replies: {e}", file=sys.stderr)
+            if threads:
+                worker["operatorQuestion"] = True
     return reviews, current
 
 

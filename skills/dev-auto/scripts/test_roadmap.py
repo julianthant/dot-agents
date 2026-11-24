@@ -307,8 +307,8 @@ class Roadmap(unittest.TestCase):
                 worker = {"projection": {"stage": {"activity": activity}}}
                 with self.local_worker(worker, mail=[*mail, *run_replies], dispatch_mail=dispatch_mail, tracked=False):
                     live = roadmap.render()["issues"][0]["now"]
-                self.assertEqual((live["stage"], live["status"]), (0, status))
                 tick.SNAPSHOT.with_name("starts.sqlite").unlink()
+                self.assertEqual((live["stage"], live["status"]), (0, status))
 
     def test_a_red_pr_without_a_worker_still_warns_at_the_pr_stage(self):
         self.warm()

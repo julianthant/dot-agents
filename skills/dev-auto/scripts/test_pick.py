@@ -94,6 +94,26 @@ with patch.object(pick, "windows", lambda cfg, row, now: use[row["id"]]):
     use["free"] = (95, 20)
     assert seat("gpt-6.2-sol")[0]["id"] == "lite"
 
+# A failed handoff survives hold cleanup and overrides lagging usage until the affected window resets.
+with TemporaryDirectory() as temp, patch.object(pick, "HOLDS", Path(temp) / "holds.json"):
+    fleet = {"account": [dict(row, home="") for row in accounts["account"]]}
+    cfg_row = fleet["account"][0]
+    route = ("codex", "gpt-6.2-sol", "medium", "local")
+    readings = {("codex", "ais"): (990, [(10, 1200, "five_hour"), (20, 8000, "weekly")]),
+                ("codex", "free"): (990, [(50, 1200, "five_hour")])}
+    with patch.object(pick.account_usage, "orca_usage", return_value=readings), \
+            patch.object(pick.account_usage, "orca_key", side_effect=lambda row, now: (row["agent"], row["id"])):
+        assert pick.pick(fleet, *route, 1000, holds=[])[0]["id"] == "ais"
+        pick.record_usage_handoff(fleet, "local", "ais", 1000, "5-hour limit")
+        chosen, why = pick.pick(fleet, *route, 1199, holds=[])
+        assert chosen["id"] == "free" and why == ["ais: waiting for 5-hour reset after usage handoff"]
+        assert pick.pick(fleet, *route, 1200, holds=[])[0]["id"] == "ais"
+        pick.record_usage_handoff(fleet, "local", "ais", 1300, "weekly limit")
+        assert pick.pick(fleet, *route, 7999, holds=[])[0]["id"] == "free"
+        assert pick.pick(fleet, *route, 8000, holds=[])[0]["id"] == "ais"
+        paired = {"account": [dict(cfg_row, host="other")]}
+        assert pick.pick(paired, *route[:3], "other", 1400, holds=[])[0]["id"] == "ais"
+
 # Coordinator: keep the selected Codex account while under its handoff point, else switch.
 row = {"id": "a", "label": "a", "agent": "codex", "plan": "plus"}
 other = {"id": "b", "label": "b", "agent": "codex", "plan": "plus"}

@@ -72,16 +72,53 @@ def windows(cfg, row, now):
     """(five_hour %, weekly %), each window from the newest reading that has it, Orca's or the CLI
     file's; a window whose reset has passed reads 0. (None, None) when the account was never read.
     Codex homes share one sessions folder whose newest row names no account: Codex reads only Orca's."""
+    found = window_readings(row, now)
+    if not found:
+        return None, None
+    out = {w: (0.0 if r and r <= now else p) for w, (p, r) in found.items()}
+    return out.get("five_hour", 0.0), out.get("weekly", 0.0)
+
+
+def window_readings(row, now):
     readings = account_usage.orca_usage(now, row["host"])
     key = account_usage.orca_key(row, now)
     shared = row["agent"] == "codex" or row["host"] != "local"
     found = [r for r in (readings.get(key), None if shared else account_usage.file_usage(row)) if r]
-    if not found:
-        return None, None
     out = {}
     for _at, read in sorted(found, key=lambda r: float(r[0])):
-        out.update({w: (0.0 if r and float(r) <= now else float(p)) for p, r, w in read})
-    return out.get("five_hour", 0.0), out.get("weekly", 0.0)
+        out.update({w: (float(p), float(r) if r else None) for p, r, w in read})
+    return out
+
+
+def usage_handoffs(host):
+    return (account_usage.load_json(HOLDS.with_name("usage-handoffs.json")) or {}).get(host, {})
+
+
+def record_usage_handoff(cfg, host, account, now, why):
+    row = next((row for row in cfg["account"] if row["host"] == host and row["id"] == account), None)
+    if not row:
+        return
+    plan = LIM.get(row["agent"], {}).get(row.get("plan"), {})
+    readings = window_readings(row, now)
+    five, _ = readings.get("five_hour", (0, None))
+    week, weekly_reset = readings.get("weekly", (0, None))
+    # Generic limit messages usually mean the session window. The reading can still identify
+    # a weekly limit, and a plan without a session window always uses the weekly reset.
+    why = why.lower()
+    session_hint = any(w in why for w in ("5-hour", "5h", "session"))
+    weekly_hint = "weekly" in why
+    weekly = ("handoff_5h" not in plan
+              or (weekly_hint and not session_hint)
+              or (weekly_hint == session_hint and 100 - week < MIN_LEFT_WEEKLY
+                  and 100 - five >= MIN_LEFT_5H and (not weekly_reset or weekly_reset > now)))
+    window, seconds = ("weekly", 7 * 86400) if weekly else ("five_hour", 5 * 3600)
+    _, reset = readings.get(window, (0, None))
+    until = reset if reset and reset > now else now + seconds
+    with edit_holds(HOLDS.with_name("usage-handoffs.json")) as records:
+        active = {a: r for a, r in records.get(host, {}).items() if r["until"] > now}
+        if account not in active or active[account]["until"] < until:
+            active[account] = {"until": until, "window": "weekly" if weekly else "5-hour"}
+        records[host] = active
 
 
 def claude_reason(plan, model, held, five, week):
@@ -148,6 +185,7 @@ def pick(cfg, agent, model, effort, host, now, holds=None):
         holds = live_holds(host)
     route = f"{model}:{effort}"
     why = []
+    handoffs = usage_handoffs(host)
     # A plan's prefer_models go there first; every other model tries that plan's accounts last.
     def rank(row):
         prefer = LIM.get(agent, {}).get(row.get("plan"), {}).get("prefer_models")
@@ -156,6 +194,10 @@ def pick(cfg, agent, model, effort, host, now, holds=None):
         if row["agent"] != agent or row["host"] != host or not row["enabled"]:
             continue
         name = row["label"]
+        handoff = handoffs.get(row["id"])
+        if handoff and now < handoff["until"]:
+            why.append(f"{name}: waiting for {handoff['window']} reset after usage handoff")
+            continue
         plan = LIM.get(agent, {}).get(row.get("plan"))
         if plan is None:
             why.append(f"{name}: no {agent}.{row.get('plan')} plan in limits.toml")
@@ -202,7 +244,8 @@ def past_handoff(row, five, week):
 def coordinator(cfg, host, now, active):
     """The selected Codex account also runs the coordinator bot; past its handoff point, choose another."""
     row = next((r for r in cfg["account"] if r.get("host", "local") == host and r["id"] == active), None)
-    if row is not None:
+    cooldown = usage_handoffs(host).get(active)
+    if row is not None and (not cooldown or now >= cooldown["until"]):
         five, week = windows(cfg, row, now)
         if five is not None and past_handoff(row, five, week) is None:
             return None

@@ -1331,7 +1331,8 @@ with TemporaryDirectory() as tmp, patch.object(pick, "HOLDS", Path(tmp) / "holds
     assert not any("other" in call.args for call in cli.call_args_list)
 
 # A reviewer's failed worker_done needs the operator, unless watch is restarting it from a handoff.
-for handoff in (False, True):
+for handoff in ({}, {"handoff": 1}, {"pending": {"why": "handed off with a checkpoint", "crash": False}},
+                {"pending": {"why": "handed off at a usage limit", "crash": False}}):
     ticket, state = review_fixture()
     state.update(stage="Reviewing", expected="reader", sha=sha, reviewer={"dispatch": "reader", "terminal": "pane-r"})
     failed = dict(report("reader", "Stopping: cannot read the diff.", msg_id="f1"),
@@ -1339,7 +1340,7 @@ for handoff in (False, True):
     db = sqlite3.connect(":memory:")
     if handoff:
         db.execute("CREATE TABLE watch (run TEXT, terminal TEXT, state TEXT, PRIMARY KEY(run,terminal))")
-        db.execute("INSERT INTO watch VALUES ('run','pane-r',?)", (json.dumps({"handoff": 1}),))
+        db.execute("INSERT INTO watch VALUES ('run','pane-r',?)", (json.dumps(handoff),))
     with patch.object(tick, "review_card") as card, patch.object(tick, "runtime") as cli:
         for _ in range(2):
             tick.review_step(db, "run", [], ticket, state, [failed])
@@ -1417,6 +1418,55 @@ with patch.object(tick, "tickets", return_value=[ticket]), patch.object(tick, "s
                        {"worktree": {"id": "tree", "path": "/fixture", "branch": "refs/heads/task/ui/header"}}]
     tick.review_tick(args, sqlite3.connect(":memory:"))
     assert step.call_args.args[-2]["expected"] == "coder"
+
+# An uncertain reservation is isolated to its ticket.
+with sqlite3.connect(":memory:") as db:
+    ticket, state = review_fixture()
+    other = dict(ticket, number=42)
+    tick.review_state(db, "run", 41)
+    tick.save_review(db, "run", 41, dict(state, host="local", pending="missing", sha=sha))
+    tick.save_review(db, "run", 42, dict(state, host="local", coder="other-coder", expected="other-coder"))
+    other_report = report("other-coder", "red at the old head", msg_id="other-report")
+    cli = [{"messages": [other_report]}, {"tasks": []}, *followup_replies("fix", previous="other-coder")]
+    with patch.object(tick, "supervisor", return_value=([], "run")), \
+            patch.object(tick, "tickets", return_value=[ticket, other]), \
+            patch.object(tick, "green_report", return_value=None), patch.object(tick, "review_card"), \
+            patch.object(tick, "runtime", side_effect=cli), patch.object(tick, "log") as log:
+        tick.review_tick(SimpleNamespace(issue=None, coder=None), db)
+    assert tick.review_state(db, "run", 41)["pending"] == "missing"
+    assert tick.review_state(db, "run", 42)["stage"] == "Fixing"
+    log.assert_any_call("Needs you", {"issue": 41, "reason": "inspect uncertain Orca action for message missing before continuing"})
+
+# A manual follow-up may create both a new Task and a new pane, including while review has a reservation.
+for pending in (False, True):
+    ticket, state = review_fixture()
+    state.update(coder_terminal="old-pane")
+    original = dict(recorded, created_at="2026-11-23T08:00:00Z")
+    manual = dict(report("manual", "red at the old head", msg_id="manual-report"), sequence=3,
+                  from_handle="manual-pane",
+                  payload={"taskId": "manual-task", "dispatchId": "manual", "outcome": "succeeded"})
+
+    def manual_lineage(*args):
+        if args[:2] == ("orchestration", "send"):
+            assert "dispatch:manual" in args
+            return {"delivery": "follow_up", "followUpOf": "manual", "dispatchId": "fix"}
+        if args[:2] == ("orchestration", "task-list"):
+            return {"tasks": []}  # no reviewer was created for the superseded report
+        if args[3] == "coder":
+            return followup_worker("coder", "old-pane", previous=None)
+        if args[3] == "manual":
+            return followup_worker("manual", "manual-pane", task="manual-task")
+        assert args[3] == "fix"
+        return followup_worker("fix", "fix-pane", previous="manual")
+
+    with sqlite3.connect(":memory:") as db, patch.object(tick, "green_report", return_value=None), \
+            patch.object(tick, "review_card"), \
+            patch.object(tick, "runtime", side_effect=manual_lineage):
+        if pending:
+            tick.review_state(db, "run", 41)
+            tick.save_review(db, "run", 41, dict(state, pending=original["id"], sha=sha))
+        tick.review_step(db, "run", [], ticket, state, [original, manual])
+        assert tick.review_state(db, "run", 41)["coder"] == "fix"
 
 # An explicit coder that reports to another Run fails loudly instead of exiting quietly.
 args = SimpleNamespace(issue=41, coder="ctx_elsewhere", run=None, anchor=None)
@@ -1714,8 +1764,9 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
             return {"messages": mailbox}
         raise AssertionError(args)
 
+    actor = ["--from", "term_anchor", "--run", "run"] if ticks > 1 else []
     with sqlite3.connect(":memory:") as db, patch.object(pick, "HOLDS", holds), \
-            patch.object(tick, "supervisor", return_value=([], "run")), \
+            patch.object(tick, "supervisor", return_value=(actor, "run")), \
             patch.object(tick, "project_fields", return_value=("project", [("status", "progress"),
                          ("stage", "coding"), ("agent", None)], ("stage", "needs"))), \
             patch.object(tick, "runtime", side_effect=orca), patch.object(tick, "command", side_effect=cli), \
@@ -1768,7 +1819,13 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
     else:
         assert present and local_ref == sha
         assert edits == [("stage", "--single-select-option-id", "needs")] * (2 if card_fails or rollback else 1)
-        assert "Needs you" in output.getvalue()
+        notices = [line for line in output.getvalue().splitlines() if line.startswith("Needs you")]
+        assert len(notices) == (0 if pre_upgrade else 1), notices
+        if notices:
+            assert "tick.py close --repo-path" in notices[0] and "--issue 41" in notices[0], notices
+            if actor:
+                assert "--anchor term_anchor --run run" in notices[0], notices
+                assert "plain shell outside Orca" in notices[0], notices
         # One notice in the Run's mailbox, pre-upgrade or new, besides an older state's notice.
         assert len(mailbox) == (2 if rollback or pre_upgrade in ("other", "foreign", "foreign_wrapped", "prefixed")
                                 else 1), mailbox
@@ -1877,6 +1934,8 @@ class Fleet:
         self.stop_lost = False  # worker-stop applies, but its reply is lost
         self.active, self.fresh = "coord", None  # the coordinator bot's Codex account; pick.coordinator's choice
         self.events, self.cards, self.now = [], [], 1_795_389_500
+        self.head = "a" * 40
+        self.next_start = ("ctx_restart", "term_restart")
         self.ticket = dict(number=553, item="card", agent=f"coder {model} medium @jzaw", stage="Coding")
         self.title = "#553 coder"
         self.notes = []
@@ -1927,6 +1986,9 @@ class Fleet:
                               agentTerminalHandle=None, resource=None)
                 return {"workers": [newest, retried], "page": {"hasMore": False, "nextCursor": None}}
             return {"workers": [*fresh, *follow, *before, row, *olds, retried, *replaced], "page": {"hasMore": False, "nextCursor": None}}
+        if verb == ("worktree", "show"):
+            assert args[2:] == ("--worktree", "id:repo::/wt"), args
+            return {"worktree": {"id": "repo::/wt", "path": str(self.tmp), "branch": "task/test/work"}}
         if verb == ("orchestration", "dispatch-show") and args[3] == "task_follow":
             current = "ctx_follow_retry" if self.follow_retried else "ctx_follow"
             return {"dispatch": {"id": current, "status": "dispatched", "taskId": None, "assigneeHandle": None}}
@@ -1992,12 +2054,12 @@ class Fleet:
             self.started_retry = "--retry-of" in args
             assert "--spec" not in args and "--task-title" not in args and self.status == "failed", args
             assert args[args.index("--worktree") + 1] == "id:repo::/wt"
-            self.dispatch, self.terminal = "ctx_restart", "term_restart"
+            self.dispatch, self.terminal = self.next_start
             self.status, self.state, self.liveness, self.failure = "dispatched", "ready", "live", None
             self.screen = CLAUDE_WORKING
             if self.lose_start:
                 raise tick.OrcaError("timed out")
-            return full_start("ctx_restart", "term_restart")
+            return full_start(self.dispatch, self.terminal)
         if verb == ("orchestration", "send"):
             if args[args.index("--to") + 1] == "dispatch:ctx_restart":
                 if self.note_error:
@@ -2028,6 +2090,10 @@ class Fleet:
                            "effects": [{"kind": "terminal", "role": "agent", "action": "created", "id": self.follow_terminal}]}
                 } if self.follow_terminal else {}
 
+    def git(self, *args):
+        assert args == ("git", "-C", str(self.tmp), "rev-parse", "--verify", "refs/heads/task/test/work"), args
+        return self.head + "\n"
+
     def tick(self, minutes=0):
         self.now += minutes * 60
         self.events.clear()
@@ -2037,8 +2103,10 @@ class Fleet:
         record = lambda ticket, stage, agent: (self.cards.append((stage, agent)), ticket.update(agent=agent))
         out = io.StringIO()
         with patch.object(tick, "supervisor", return_value=([], "run")), patch.object(tick, "runtime", self.orca), \
+                patch.object(tick, "command", self.git), \
                 patch.object(tick, "tickets", side_effect=self.tickets_error, return_value=[self.ticket]), patch.object(tick, "review_card", record), \
                 patch.object(pick, "main", return_value=0) as self.pick_main, patch.object(pick, "due", return_value=[]), \
+                patch.object(pick, "record_usage_handoff") as self.usage_handoff, \
                 patch.object(pick, "pick", seat), patch.object(pick.account_usage, "load_config", return_value=cfg), \
                 patch.object(pick, "coordinator", return_value=self.fresh and {"id": self.fresh}), \
                 patch.object(tick.time, "time", return_value=self.now), redirect_stdout(out):
@@ -2100,6 +2168,7 @@ with TemporaryDirectory() as tmp:
                             "body": "Stopping at the usage limit.", "reportPath": "/wt/.handoff-553.md"})
     calls = f.tick(1)
     assert ("orchestration", "worker-start") in calls and ("orchestration", "worker-stop") not in calls
+    assert f.usage_handoff.call_args.args[1:4] == ("local", "jzaw", f.now)
     assert len(f.notes) == 1 and "/wt/.handoff-553.md" in f.notes[0] and "Stopping at the usage limit." in f.notes[0]
     selects = [e[-1] for e in f.events if e[:2] == ("account", "select")]
     assert selects == ["x2", "coord"] and f.active == "coord"  # the coordinator gets its account back
@@ -2111,6 +2180,53 @@ with TemporaryDirectory() as tmp:
     assert review["agent"] == "coder gpt-6.2-astra medium @x2"  # review publishes keep the new seat
     # Review discovery still finds exactly one "#553 coder" Task, whose newest Dispatch is the retry.
     assert [t["id"] for t in f.orca("orchestration", "task-list")["tasks"] if t["task_title"] == "#553 coder"] == ["task_coder"]
+
+# A context handoff can continue in a fresh session even when its old account is the only usable seat.
+for role, stage in (("coder", "Fixing"), ("reviewer", "Reviewing")):
+    with TemporaryDirectory() as tmp:
+        f = Fleet(tmp, screen=CLAUDE_WORKING)
+        f.title, f.ticket["stage"] = f"#553 {role}", stage
+        f.seats = ["jzaw"]
+        f.status, f.state, f.liveness = "failed", "failed", "exited"
+        f.failure = json.dumps({"provenance": "worker_report", "outcome": "failed",
+                                "body": "Context limit reached.", "reportPath": "/wt/.handoff-553.md"})
+        calls = f.tick()
+        assert ("orchestration", "worker-start") in calls and ("orchestration", "worker-stop") not in calls
+        start = next(e for e in f.events if e[:2] == ("orchestration", "worker-start"))
+        assert start[start.index("--agent") + 1:start.index("--full")] == (
+            "codex", "--model", "gpt-6.2-astra", "--effort", "medium")
+        assert "/wt/.handoff-553.md" in f.notes[0] and f.cards[-1][0] == stage
+        assert ("account", "select", "--agent", "codex", "--account", "jzaw") in f.events
+        f.usage_handoff.assert_not_called()
+
+# A second checkpoint at the same branch head needs the operator, once.
+for progressed in (False, True):
+    with TemporaryDirectory() as tmp:
+        f = Fleet(tmp, screen=CLAUDE_WORKING)
+        failure = json.dumps({"provenance": "worker_report", "outcome": "failed",
+                              "reportPath": "/wt/.handoff-553.md"})
+        start = ("orchestration", "worker-start")
+        f.status, f.state, f.liveness, f.failure = "failed", "failed", "exited", failure
+        assert f.tick().count(start) == 1
+        if progressed:
+            f.head = "b" * 40
+            f.next_start = ("ctx_restart2", "term_restart2")
+            f.status, f.state, f.liveness, f.failure = "failed", "failed", "exited", failure
+            assert f.tick(3).count(start) == 1 and f.ticket["stage"] == "Coding"
+        f.status, f.state, f.liveness, f.failure = "failed", "failed", "exited", failure
+        assert start not in f.tick(3)
+        assert f.ticket["stage"] == "Needs you" and f.sent() == [("run:run", "#553: checkpoint restart limit")]
+        assert start not in f.tick(3) and not f.sent()
+
+# A worker can hit a usage limit and hand off between watch passes.
+with TemporaryDirectory() as tmp:
+    f = Fleet(tmp, screen=CLAUDE_WORKING)
+    f.status, f.state, f.liveness = "failed", "failed", "exited"
+    f.failure = json.dumps({"provenance": "worker_report", "outcome": "failed", "subject": "Usage limit",
+                            "reportPath": "/wt/.handoff-553.md"})
+    assert ("orchestration", "worker-start") in f.tick()
+    assert ("account", "select", "--agent", "codex", "--account", "x2") in f.events
+    assert f.usage_handoff.call_args.args[1:4] == ("local", "jzaw", f.now)
 
 # At the limit or on a model-switch menu: stop it, then retry on another account.
 for agent, model, screen in (("codex", "gpt-6.2-astra", CODEX_AT_LIMIT),
@@ -2800,7 +2916,10 @@ with TemporaryDirectory() as tmp:
                          ("close", args.repo_paths[1]), ("fill", args.repo_paths[0]), ("fill", args.repo_paths[1])]
         calls.clear()
         bind.side_effect = tick.OrcaError("wrong Run")
-        assert tick.scheduled_tick(args) == 1
+        other_run = [{"truncated": False, "terminals": [{"handle": args.anchor}]},
+                     {"run": {"id": args.run, "coordinator_handle": None}}]
+        with patch.dict(tick.os.environ, {}, clear=True), patch.object(tick, "runtime", side_effect=other_run):
+            assert tick.scheduled_tick(args) == 1
         assert calls == []
         assert json.loads((root / "tick.json").read_text())["errors"] == [{"phase": "adopt", "error": "OrcaError"}]
 
@@ -2999,7 +3118,7 @@ def remote_start(root, stack, db, has_receipt, repo="hr-relay"):
 
 for has_receipt, repo in ((True, "hr-relay"), (False, "hr-relay"), (True, "dot-agents")):
     with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory:") as db:
-        remote_start(Path(tmp), stack, db, has_receipt, repo)
+        remote_start(Path(tmp).resolve(), stack, db, has_receipt, repo)
 
 # Review rows written before host tracking identify their coder through the Run's server records.
 with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory:") as db:
@@ -3091,6 +3210,75 @@ with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory
     state = tick.review_state(db, "run", 41)
     assert (state["coder"], state["coder_terminal"], state["stage"], state["host"]) == (
         "wsl-land", "wsl-merge", "Merging", host)
+
+# launchd can recover a closed anchor and uses the saved replacement on the next invocation.
+def check_anchor(scenario):
+    with TemporaryDirectory() as tmp, ExitStack() as stack:
+        root = Path(tmp).resolve()
+        args = SimpleNamespace(anchor="term_old", run="run_live", repo_paths=[root])
+        owner = "term_other" if scenario == "other-owner" else "term_old"
+        terminals = {"term_other"} if scenario == "other-owner" else set()
+        if scenario == "live-unbound":
+            terminals.add("term_old")
+        calls, watched = [], []
+        fail_bind = scenario.startswith("bind-")
+
+        def rpc(*args):
+            nonlocal owner, fail_bind
+            verb = args[:2]
+            calls.append(args)
+            if verb == ("orchestration", "run-current"):
+                return {"runId": "run_live" if args[-1] in terminals and args[-1] == owner
+                        and scenario != "live-unbound" else None}
+            if verb == ("orchestration", "run-show"):
+                return {"run": {"id": "run_live", "coordinator_handle": owner}}
+            if verb == ("terminal", "list"):
+                return {"terminals": [{"handle": h} for h in terminals], "truncated": False}
+            if verb == ("terminal", "create"):
+                assert args[2:4] == ("--worktree", f"path:{root}")
+                terminals.add("term_new")
+                if scenario == "owner-raced":
+                    owner = "term_other"
+                    terminals.add(owner)
+                return {"terminal": {"handle": "term_new"}}
+            if verb == ("orchestration", "run-use"):
+                assert args[2:] == ("--id", "run_live", "--from", "term_new")
+                if fail_bind:
+                    fail_bind = False
+                    if scenario == "bind-receipt-lost":
+                        owner = "term_new"
+                    raise tick.OrcaError("interrupted bind")
+                owner = "term_new"
+                return {"runId": "run_live"}
+            raise AssertionError(args)
+
+        stack.enter_context(patch.dict(tick.os.environ, {}, clear=True))
+        stack.enter_context(patch.object(tick, "SNAPSHOT", root / "issues.json"))
+        stack.enter_context(patch.object(tick, "runtime", side_effect=rpc))
+        stack.enter_context(patch.object(tick, "watch_tick", side_effect=lambda opts, db: watched.append(opts.anchor)))
+        for phase in ("review_tick", "close_tick", "fill_tick", "full_run_tick"):
+            stack.enter_context(patch.object(tick, phase))
+        output = stack.enter_context(redirect_stdout(io.StringIO()))
+        if scenario in ("other-owner", "live-unbound"):
+            assert tick.scheduled_tick(args) == 1
+            assert not watched and not any(call[:2] == ("terminal", "create") for call in calls)
+            assert ("held by another live terminal" if scenario == "other-owner" else "not bound") in output.getvalue()
+        elif scenario == "owner-raced":
+            assert tick.scheduled_tick(args) == tick.scheduled_tick(args) == 1
+            assert not watched and not any(call[:2] == ("orchestration", "run-use") for call in calls)
+            assert "changed coordinator" in output.getvalue() and "held by another live terminal" in output.getvalue()
+        else:
+            if scenario.startswith("bind-"):
+                assert tick.scheduled_tick(args) == 1 and not watched
+            assert tick.scheduled_tick(args) == tick.scheduled_tick(args) == 0
+            assert watched == ["term_new", "term_new"]
+            assert sum(call[:2] == ("terminal", "create") for call in calls) == 1
+            assert sum(call[:2] == ("orchestration", "run-use") for call in calls) == (
+                2 if scenario == "bind-interrupted" else 1)
+
+
+for scenario in ("closed", "other-owner", "owner-raced", "bind-interrupted", "bind-receipt-lost", "live-unbound"):
+    check_anchor(scenario)
 
 # The tick dispatches the development full run at most every 20 minutes and never twice at once.
 with TemporaryDirectory() as tmp:

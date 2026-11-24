@@ -18,8 +18,11 @@ default host is `local` and the default effort is `medium`.
    account ID, label, plan, and selection command for the caller to run. When no
    account qualifies, the picker exits 1 and writes skip reasons to stderr.
    It skips an account with under 10% of its 5-hour window or 5% of its week
-   left, so no start or restart lands on an account about to hand off. Each
-   window comes from the newest reading that has it; a Codex account never reads
+   left. Watch records usage handoffs in `usage-handoffs.json` beside the holds,
+   so the picker skips the account through that window's reset even when its
+   usage reading lags. If the reset time is unavailable, watch uses the affected
+   window's duration from the handoff. Each
+   window comes from the newest reading that has it. A Codex account never reads
    the shared sessions file. A plan's
    `prefer_models` in `limits.toml` put those models on its accounts first and
    every other model on them last (Pro Lite takes gpt-6.2-astra before Plus).
@@ -132,6 +135,10 @@ the current attempt of every live worker in the Run and logs one `watch` line:
   replacement then gets mail with the predecessor's `reportPath` and report.
 - A near-limit screen or an account `pick.py due` lists: one handoff request
   to the Dispatch. Its failed `worker_done` starts the replacement.
+- A failed `worker_done` with a handoff path starts a fresh session on the same
+  agent, model and effort. For a context handoff the original account remains
+  eligible under the standard picker rules. Each Task lineage gets one checkpoint
+  restart per branch head. A second checkpoint at the same head goes to **Needs you**.
 - The limited account comes from the worker's hold, remembered while it runs.
   With none recorded, the watch stops nothing and escalates to the Run.
 - The card shows **Handed off** until the replacement starts; with no seat it
@@ -151,11 +158,17 @@ is still current when the review state names its Dispatch.
 
 The review tick moves a ticket to **Needs you** on an invalid verdict or a
 reviewer's failed `worker_done` (unless watch is restarting it from a
-handoff). A PUSH whose branch head moved or whose task CI is not green goes
-back to the coder with that reason. Close-tick and third-FIX mail goes to the
-Run as `status`.
+handoff). It logs an unconfirmed review reservation as **Needs you** for that
+ticket and continues with the rest. A newer coder report can supersede an old
+reservation when its Dispatch traces back to the coder and no matching
+reviewer Task exists. A PUSH whose branch head moved or whose task CI is not green
+goes back to the coder with that reason. Close-tick and third-FIX mail goes to the
+Run as `status`. A blocked close logs its reason and a retry command once per
+blocked state.
 
 ## launchd cutover
+
+The launchd Run is local to this machine.
 
 Pause manual fleet ticks and starts. Keep the coordinating Run and its live
 workers in place. Use a plain shell outside the worker sessions to create a
@@ -181,8 +194,11 @@ and skips while a full run is queued or running, because GitHub never fires
 that schedule. The workflow's decide job judges whether CI is idle and the head
 untested. The tick dispatches nothing else: staging, production and release
 workflows stay operator-only. Existing dispatches keep their hold
-records and Project cards. A detached anchor fails the tick before any fleet
-action. Rebind the Run from a plain shell and reinstall with the new anchor.
+records and Project cards. The tick saves its anchor for this Run in
+`~/.local/state/dev-auto/anchor.json`. If the anchor closes, the tick checks
+the Run's owner and the live terminal inventory, then opens a replacement in the
+first configured checkout and binds it to the same Run. If another live terminal
+owns the Run, the tick reports that and stops before any fleet action.
 
 Disable automatic starts with one command. This persists across logins and
 unloads the running job.

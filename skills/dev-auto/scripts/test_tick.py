@@ -13,6 +13,15 @@ _snapshot_dir = TemporaryDirectory()  # never read or write the live issue snaps
 tick.SNAPSHOT = tick.Path(_snapshot_dir.name) / "issues.json"
 tick.PROJECT_CACHE = tick.Path(_snapshot_dir.name) / "project.json"
 
+def fixture_roadmap(source, **query):
+    if source == "heads":
+        return {repo: {"main": "abc"} for repo in ("hr-relay", "dot-agents")}
+    raise AssertionError((source, query))
+
+
+fixture_patch = patch.object(tick.github_poller, "read", side_effect=fixture_roadmap)
+fixture_patch.start()
+
 L = tick.limited
 assert L(["⏺ working", "⎿  You've hit your 5-hour limit · resets 5pm"]) == "⎿  You've hit your 5-hour limit · resets 5pm"
 assert L(["■ You’ve hit your usage limit. Try again in 3 days"]).startswith("■ You’ve hit")
@@ -534,8 +543,7 @@ with TemporaryDirectory() as tmp, ExitStack() as stack:
     holds.write_text('{"dead": {"host": "local"}}')
     stack.enter_context(patch.object(tick, "tickets", return_value=[dict(ticket)]))
     stack.enter_context(patch.object(tick, "inventory", return_value=set()))
-    stack.enter_context(patch.object(tick, "command", side_effect=["git@github.com:julianthant/hr-relay.git", "origin/main",
-                                                              "abcdef refs/heads/main"]))
+    stack.enter_context(patch.object(tick, "command", side_effect=["git@github.com:julianthant/hr-relay.git", "origin/main"]))
     stack.enter_context(patch.object(pick.account_usage, "load_config", return_value={}))
     stack.enter_context(patch.object(pick, "pick", return_value=(account, [])))
     launch = stack.enter_context(patch.object(tick, "launch"))
@@ -730,11 +738,11 @@ with TemporaryDirectory() as tmp:
         (checkout / ".codex/config.toml").write_text("x = 1\n")
         check.assertEqual(run("-C", str(checkout), "status", "--porcelain", "--untracked-files=all"), "")
 
-with patch.object(tick, "command", side_effect=[json.dumps({"id": "project"}), json.dumps({"fields": [
-        {"name": "Status", "id": "status", "options": [{"name": "In Progress", "id": "progress"}]},
-        {"name": "Agent state", "id": "stage", "options": [{"name": "Coding", "id": "coding"},
+with patch.object(tick, "project_meta", return_value={"id": "project", "fields": {
+        "Status": {"name": "Status", "id": "status", "options": [{"name": "In Progress", "id": "progress"}]},
+        "Agent state": {"name": "Agent state", "id": "stage", "options": [{"name": "Coding", "id": "coding"},
                                                            {"name": "Needs you", "id": "waiting"}]},
-        {"name": "Agent", "id": "agent"}]})]):
+        "Agent": {"name": "Agent", "id": "agent"}}}):
     check.assertEqual(tick.project_fields()[2], ("stage", "waiting"))
 
 # Git owns the fixture worktree and refs; only the Orca transport is simulated.
@@ -814,7 +822,7 @@ research_body = ("Branch: none (read-only).\nReviewer: none (the orchestrator ch
 research_ticket, = tick.tickets(rows=[issue_row(762, "dependencies / package review: research", research_body)])
 assert (research_ticket["branch"], research_ticket["base"], research_ticket["paths"]) == (None, "origin/development", [])
 
-# Bug 8: one issue read a minute across processes; closed issues are read incrementally between full reads.
+# The poller reads closed issues incrementally, while consumers only see its saved result.
 with TemporaryDirectory() as tmp:
     calls, closed_rows = [], [dict(issue_row(n, f"c / {n}"), updatedAt=f"2026-11-23T10:0{n % 10}:00Z") for n in (1, 2)]
 
@@ -827,25 +835,42 @@ with TemporaryDirectory() as tmp:
     clock = [1_795_400_000]
     with patch.object(tick, "SNAPSHOT", Path(tmp) / "issues.json"), patch.object(tick, "command", gh), \
             patch.object(tick.time, "time", lambda: clock[0]):
-        check.assertEqual(len(tick.tickets()), 3)
+        snap = tick.refresh_snapshot()
+        check.assertEqual(len(snap["open"]), 3)
         check.assertEqual(calls, [("OPEN", None), ("OPEN", None), ("CLOSED", None)])  # two open pages, one full closed read
-        tick.tickets(), tick.snapshot()  # another verb, or the roadmap, within the minute
+        with patch.object(tick.github_poller, "read", return_value=snap) as shared:
+            tick.tickets(), tick.snapshot()
+            check.assertEqual([request.args for request in shared.call_args_list], [("issues",), ("issues",)])
         check.assertEqual(len(calls), 3)
         clock[0] += 61
-        snap = tick.snapshot()
+        snap = tick.refresh_snapshot()
         check.assertEqual(calls[3:], [("OPEN", None), ("OPEN", None), ("CLOSED", "since=2026-11-23T02:11:20Z")])
         # An edited closed issue is replaced; one still open is never listed as closed.
         check.assertEqual([(i["number"], i["title"]) for i in snap["closed"]], [(2, "c / 2"), (1, "edited")])
-        tick.stale_snapshot()  # a Project write: the next read refetches open issues and still reads closed ones since
-        tick.tickets()
+        tick.stale_snapshot()
+        tick.refresh_snapshot()
         check.assertEqual(calls[6:], [("OPEN", None), ("OPEN", None), ("CLOSED", "since=2026-11-23T02:12:21Z")])
         with patch.object(tick, "SNAPSHOT", Path(tmp) / "missing" / "issues.json"):
             tick.stale_snapshot()  # no snapshot yet (nor its directory): nothing to mark
         tick.tickets(fresh=True)  # fill's refresh before side effects never uses a cached read
-        check.assertEqual(len(calls), 12)
+        check.assertEqual(len(calls), 11)
         clock[0] += 600
-        tick.snapshot()
+        tick.refresh_snapshot()
         check.assertEqual(calls[-1], ("CLOSED", None))  # ten minutes on: a full closed read again
+
+with TemporaryDirectory() as tmp:
+    closed_pages = []
+
+    def gh(*args):
+        if "states=OPEN" in args:
+            return issue_page([])
+        closed_pages.append(args)
+        return issue_page([dict(issue_row(n, "closed"), updatedAt=f"{1000 - n}")
+                           for n in range(50 * len(closed_pages) - 50, 50 * len(closed_pages))], more=True)
+
+    with patch.object(tick, "SNAPSHOT", Path(tmp) / "issues.json"), patch.object(tick, "command", gh):
+        check.assertEqual(len(tick.refresh_snapshot()["closed"]), 400)
+        check.assertEqual(len(closed_pages), 8)
 
 # Bug 8: the roadmap moved here renders a recorded snapshot exactly as the live script did for the same GitHub
 # replies (ROADMAP_BEFORE is that script's output), while reading issues from the shared snapshot.
@@ -870,7 +895,9 @@ RM_OPEN = [rm_issue(10, "OPEN", "2026-11-23T09:00:00Z", "area / older", cards=[r
 RM_CLOSED = [rm_issue(3, "CLOSED", "2026-11-22T08:00:00Z", "done one", reason="COMPLETED", cards=[rm_card("Done", None, None, "Tick")]),
           rm_issue(4, "CLOSED", "2026-11-22T07:00:00Z", "dropped", reason="NOT_PLANNED", kind=None)]
 RM_PR = lambda n, state: {"number": n, "title": f"pr {n}", "headRefName": f"task/a/{n}", "autoMergeRequest": None if n % 2 else {},
-                          "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": state}}}]}, "isDraft": False,
+                          "headRefOid": "a" * 40, "baseRef": {"refUpdateRule": {"requiredStatusCheckContexts": ["tests"]}},
+                          "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": [
+                              {"name": "tests", "state": state}]}}}}]}, "isDraft": False,
                           "closingIssuesReferences": {"nodes": [{"number": 11, "repository": {"nameWithOwner": "julianthant/hr-relay"}}]},
                           "updatedAt": "2026-11-23T09:00:00Z"}
 def rm_answer(args):
@@ -894,10 +921,10 @@ def rm_answer(args):
         return {"commit": {"committer": {"date": "2026-11-19T00:00:00Z"}}}
     if a.endswith("matching-refs/heads/cut/"):
         return [{"ref": "refs/heads/cut/2026-11-21"}]
-    if "actions/workflows/" in a:
+    if "actions/runs" in a:
         return {"workflow_runs": [{"event": "schedule", "head_branch": "development", "conclusion": "success",
                                    "status": "completed", "created_at": "2026-11-23T06:00:00Z",
-                                   "head_sha": "abc", "html_url": "u"}]}
+                                   "head_sha": "abc", "html_url": "u", "path": ".github/workflows/full.yml"}]}
     if "milestones" in a:
         return [{"title": "Staging cut"}, {"title": "Later"}]
     raise AssertionError(args)
@@ -924,16 +951,25 @@ ROADMAP_BEFORE = json.loads(
 
 with TemporaryDirectory() as tmp:
     root = Path(tmp)
+    from urllib.parse import unquote_plus
+    poller = roadmap.github_poller.Poller()
     with (patch.object(roadmap, "STATE", root / "roadmap.json"),
           patch.object(tick, "SNAPSHOT", root / "issues.json"),
           patch.object(tick, "PROJECT_CACHE", root / "project.json"),
-          patch.object(tick, "issue_nodes", side_effect=lambda state, *_: RM_OPEN if state == "OPEN" else RM_CLOSED),
-          patch.object(tick, "command", lambda *a: json.dumps(rm_answer(list(a[1:])))),
-          patch.object(roadmap, "gh", lambda *a: rm_answer(list(a))),
-          patch.object(roadmap, "poll", lambda url, _: (200, None, json.dumps(rm_answer(["api", url])))),
-          patch.object(roadmap, "branch_heads", return_value={}),
+          patch.object(tick, "issue_nodes", side_effect=lambda state, *_, **kw: RM_OPEN if state == "OPEN" else RM_CLOSED),
+          patch.object(roadmap, "github_query", lambda _: rm_answer(["api", "graphql"])["data"]),
+          patch.object(poller.rest, "poll", lambda url, _: (
+              200, None, json.dumps({"total_count": 7} if url.startswith("search/issues?")
+                                   else rm_answer(["api", unquote_plus(url)])))),
           patch.object(roadmap, "readiness", return_value={})):
-        built = roadmap.render(full=True)
+        poller.poll_runs()
+        poller.set("heads", {"hr-relay": {"cut/2026-11-21": "cut"}, "dot-agents": {}})
+        poller.set("project", {"id": "proj", "fields": {
+            f["name"]: f for f in rm_answer(["project", "field-list"])["fields"]}})
+        poller.set("prs", roadmap.pull_requests())
+        poller.set("pipeline", roadmap.pipeline(poller))
+        roadmap.poll_issues(poller)
+        built = roadmap.publish_board(poller, None)
         check.assertEqual(roadmap.render()["pipeline"], built["pipeline"])
 
 built.pop("generated")
@@ -948,33 +984,35 @@ for card in built["issues"]:
         check.assertFalse(card.pop("ready"))
         check.assertEqual(card.pop("holdReason"), "readiness unavailable")
 check.assertEqual(built["pipeline"].pop("agentPrs"), [])
+for pr in built["pipeline"]["devPrs"]:
+    check.assertEqual(pr.pop("sha"), "a" * 40)
 built["pipeline"]["stagingPr"] = [{k: p[k] for k in ("n", "head", "checks")} for p in built["pipeline"]["stagingPr"]]
 check.assertEqual(built, {**ROADMAP_BEFORE, "tick": None})
 
-# Bug 8: field-list costs about 100 points, so the Project's ids are cached and refetched only on a miss or a failed edit.
+# Project writes read IDs from the roadmap, including when its field options change.
 with TemporaryDirectory() as tmp:
     reads = []
     fields = {"fields": [{"name": "Agent", "id": "f_agent"},
                          {"name": "Agent state", "id": "f_stage", "options": [{"name": "Coding", "id": "o_coding"}]}]}
 
     def gh(*a):
-        if a[1:3] == ("project", "field-list"):
-            reads.append(a)
-            return json.dumps(fields)
-        if a[1:3] == ("project", "view"):
-            return json.dumps({"id": "proj"})
         if a[1:3] == ("project", "item-edit"):
             return "{}"
         raise AssertionError(a)
 
-    with patch.object(tick, "PROJECT_CACHE", Path(tmp) / "project.json"), patch.object(tick, "command", gh):
+    def project(source):
+        reads.append(source)
+        return {"id": "proj", "fields": {f["name"]: f for f in fields["fields"]}}
+
+    with patch.object(tick, "PROJECT_CACHE", Path(tmp) / "project.json"), patch.object(tick, "command", gh), \
+            patch.object(tick.github_poller, "read", side_effect=project):
         card = {"item": "card"}
         tick.review_card(card, "Coding", "coder")
         tick.review_card(card, "Coding", "coder")
-        check.assertEqual(len(reads), 1)  # the second card edit reads no ids
+        check.assertEqual(reads, ["project", "project"])
         fields["fields"][1]["options"].append({"name": "Fixing", "id": "o_fixing"})
-        tick.review_card(card, "Fixing", "coder")  # an option added since the cache: one refetch
-        check.assertEqual(len(reads), 2)
+        tick.review_card(card, "Fixing", "coder")
+        check.assertEqual(reads, ["project", "project", "project"])
     # A failed edit drops the cache through command(), so the next edit refetches.
     cache = Path(tmp) / "project.json"
     with patch.object(tick, "PROJECT_CACHE", cache), patch.object(tick.subprocess, "run",
@@ -991,7 +1029,7 @@ with TemporaryDirectory() as tmp:
     with (patch.object(roadmap, "STATE", root / "roadmap.json"),
           patch.object(tick, "PROJECT_CACHE", cache), patch.object(tick, "SNAPSHOT", snap),
           patch.object(tick, "command", side_effect=AssertionError("local render called GitHub")),
-          patch.object(roadmap, "gh", side_effect=AssertionError("local render called GitHub"))):
+          patch.object(roadmap, "github_query", side_effect=AssertionError("local render called GitHub"))):
         check.assertEqual(roadmap.render()["areas"], [])
         cache.write_text(json.dumps({"id": "proj", "fields": {"Area": {"options": [{"name": "Driver"}]}}}))
         data = roadmap.render()
@@ -1021,10 +1059,14 @@ check.assertEqual([t["number"] for t, a, _ in plan if a], [484])
 review_ticket = {"number": 41, "branch": "task/ui/header", "repo": "hr-relay"}
 sha = "a" * 40
 def green_check(head, conclusion, body=sha):
-    with patch.object(tick, "command", side_effect=[
+    cached = [{"head_branch": "task/ui/header", "status": "completed", "conclusion": conclusion}]
+    with patch.object(tick.github_poller, "read", side_effect=[{"hr-relay": {"task/ui/header": head}}, cached]), \
+            patch.object(tick, "command", side_effect=[
         head, json.dumps([{"headSha": head, "headBranch": "task/ui/header", "status": "completed",
-                              "conclusion": conclusion}])]):
-        return tick.green_report(review_ticket, body)
+                              "conclusion": conclusion}])]) as git:
+        result = tick.green_report(review_ticket, body)
+        check.assertEqual(git.call_count, 2 if head == body and conclusion == "success" else 0)
+        return result
 assert green_check(sha, "success") == sha
 assert green_check(sha, "failure") is None
 assert green_check("b" * 40, "success") is None
@@ -1667,7 +1709,7 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
                 project={"number": 5, "owner": {"login": "julianthant"}})
     pr = dict(merged=True, headRefName=branch, headRefOid=sha, isCrossRepository=False,
               repository={"nameWithOwner": "julianthant/dot-agents"})
-    issue = dict(number=41, title="dev-auto / example", body=f"Branch: dot-agents `{branch}`",
+    issue = dict(issue_row(41, "dev-auto / example", f"Branch: dot-agents `{branch}`"), state="CLOSED",
                  projectItems={"totalCount": 1, "nodes": [card]},
                  closedByPullRequestsReferences={"totalCount": int(merged), "nodes": [pr] if merged else []})
     # Projected fields from the #551 worker-list and worker-show receipts.
@@ -1701,7 +1743,8 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
         nonlocal local_ref, remote_present
         events.append(args)
         if args[:2] == ("gh", "api"):
-            return json.dumps([{"data": {"repository": {"issues": {"nodes": [issue]}}}}])
+            assert args[-2:] == ("-F", "number=41"), args
+            return json.dumps({"data": {"repository": {"issue": issue}}})
         if args[0] == "gh":
             assert args[1:3] == ("project", "item-edit")
             if card_fails and sum(e[:3] == ("gh", "project", "item-edit") for e in events) == 1:
@@ -1788,6 +1831,7 @@ def close_fixture(tmp, *, merged=True, dirty=False, refused=False, release_uncer
             patch.object(tick, "supervisor", return_value=(actor, "run")), \
             patch.object(tick, "project_fields", return_value=("project", [("status", "progress"),
                          ("stage", "coding"), ("agent", None)], ("stage", "needs"))), \
+            patch.object(tick.github_poller, "read", return_value={"closed": [issue]}), \
             patch.object(tick, "runtime", side_effect=orca), patch.object(tick, "command", side_effect=cli), \
             redirect_stdout(io.StringIO()) as output:
         if pre_upgrade:
@@ -3157,6 +3201,64 @@ with TemporaryDirectory() as tmp:
     assert agent["EnvironmentVariables"]["ORCA_CLI_COMMAND"] == "/cli/orca"
     assert agent["EnvironmentVariables"]["DEV_AUTO_ACCOUNTS"] == str(accounts)
 
+# Sweep the actual runtime phases with an eligible start. Every gh or ls-remote
+# call must belong to the fresh-ticket and exact-ref verifications for that start.
+with TemporaryDirectory() as tmp, ExitStack() as stack:
+    root = Path(tmp).resolve()
+    repo = root / "hr-relay"
+    options = SimpleNamespace(anchor="term_anchor", run="run", repo_paths=[repo])
+    candidate = rm_issue(51, "OPEN", "2026-11-23T09:00:00Z", "area / eligible",
+                         cards=[rm_card("Todo", None, "Queued", "Tick")])
+    candidate["body"] = ("Branch: `task/area/eligible` from development\n"
+                         "Coder: codex / gpt-6.2-sol / medium\nOwned paths: `src/area`")
+    heads = {"hr-relay": {"development": sha}}
+    network, shared = [], []
+
+    def consume(source, **query):
+        shared.append(source)
+        return {"issues": {"open": [candidate], "closed": []}, "heads": heads,
+                "runs": [{"event": "workflow_dispatch", "status": "in_progress"}]}[source]
+
+    def run(argv, **kw):
+        if argv[0] == "gh" or "ls-remote" in argv:
+            network.append(argv)
+        if argv == ("gh", "api", "graphql", "-f", "query=" + tick.ISSUES_QUERY % "", "-f", "states=OPEN"):
+            result = issue_page([candidate])
+        else:
+            result = {
+                ("remote", "get-url", "origin"): "https://github.com/julianthant/hr-relay.git",
+                ("for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes/origin"): "",
+                ("fetch", "--no-tags", "origin", "refs/heads/development:refs/remotes/origin/development"): "",
+                ("ls-remote", "--heads", "origin", "refs/heads/development", "refs/heads/task/area/eligible"):
+                    f"{sha} refs/heads/development",
+                ("rev-parse", "--verify", "origin/development"): sha,
+            }[argv[3:]]
+        return subprocess.CompletedProcess(argv, 0, result, "")
+
+    def orca(*args):
+        return {("orchestration", "inbox"): {"messages": []}, ("orchestration", "task-list"): {"tasks": []},
+                ("worktree", "list"): {"worktrees": [], "truncated": False},
+                ("terminal", "list"): {"terminals": [], "truncated": False}}[args[:2]]
+
+    for target, name, value in ((tick, "SNAPSHOT", root / "issues.json"), (tick, "FULL_RUN_STAMP", root / "full-run.json"),
+                              (tick, "runtime", orca), (tick, "fleet_workers", Mock(return_value=[])),
+                              (tick, "supervisor", Mock(return_value=(["--from", options.anchor], options.run))),
+                              (tick.github_poller, "read", consume), (tick.subprocess, "run", run),
+                              (pick, "HOLDS", root / "holds.json"), (pick, "main", Mock()),
+                              (pick, "due", Mock(return_value=[])), (pick, "pick", Mock(return_value=(account, []))),
+                              (pick.account_usage, "load_config", Mock(return_value={}))):
+        stack.enter_context(patch.object(target, name, value))
+    launch = stack.enter_context(patch.object(tick, "launch"))
+    output = stack.enter_context(redirect_stdout(io.StringIO()))
+    check.assertEqual(tick.scheduled_tick(options), 0, output.getvalue())
+    launch.assert_called_once()
+    check.assertEqual(shared, ["issues", "issues", "issues", "issues", "heads", "runs"])
+    check.assertEqual(network, [
+        ("gh", "api", "graphql", "-f", "query=" + tick.ISSUES_QUERY % "", "-f", "states=OPEN"),
+        ("git", "-C", str(repo), "ls-remote", "--heads", "origin", "refs/heads/development",
+         "refs/heads/task/area/eligible"),
+    ])
+
 print("ok")
 
 # A concurrent tick: while another process holds fill.lock, fill skips and release refuses, through the real CLI.
@@ -3187,8 +3289,7 @@ with TemporaryDirectory() as tmp, ExitStack() as stack:
     args = SimpleNamespace(repo_path=root, dry_run=True, issue=None, holds=root / "holds.json")
     work = [dict(base, base="origin/main", number=n, branch=f"task/test/{n}", paths=[str(n)]) for n in range(1, 4)]
     stack.enter_context(patch.object(tick, "tickets", return_value=work))
-    stack.enter_context(patch.object(tick, "command", side_effect=["git@github.com:julianthant/hr-relay.git", "",
-                                                                   "abc refs/heads/main"]))
+    stack.enter_context(patch.object(tick, "command", side_effect=["git@github.com:julianthant/hr-relay.git", ""]))
     stack.enter_context(patch.object(pick.account_usage, "load_config", return_value={
         "local_target_tickets": 1, "hosts": {"Juzzark-WSL": {"target_tickets": 1}}}))
     stack.enter_context(patch.object(pick.account_usage, "host_checkout", return_value="/remote/relay"))
@@ -3494,20 +3595,22 @@ with TemporaryDirectory() as tmp:
     stamp = Path(tmp) / "full-run.json"
     sent = []
 
-    def gh(runs):
-        def run(*a):
-            sent.append(a)
-            return json.dumps(runs) if a[:3] == ("gh", "run", "list") else ""
-        return run
-
     def lines(now, runs):
         out = io.StringIO()
-        with patch.object(tick, "FULL_RUN_STAMP", stamp), patch.object(tick, "command", gh(runs)), redirect_stdout(out):
+        def read(source, **query):
+            sent.append((source, query))
+            return runs
+
+        def write(*args):
+            assert args == dispatch, args
+            sent.append(args)
+
+        with (patch.object(tick, "FULL_RUN_STAMP", stamp), patch.object(tick, "command", write),
+              patch.object(tick.github_poller, "read", side_effect=read), redirect_stdout(out)):
             tick.full_run_tick(now)
         return out.getvalue()
 
-    listing = ("gh", "run", "list", "-R", "julianthant/hr-relay", "--workflow", "full.yml",
-               "--branch", "development", "--limit", "20", "--json", "status,event")
+    listing = ("runs", {"repo": "hr-relay", "workflow": "full.yml", "branch": "development"})
     dispatch = ("gh", "workflow", "run", "full.yml", "-R", "julianthant/hr-relay", "--ref", "development")
     assert "dispatched" in lines(10_000, [{"status": "completed", "event": "push"}])
     assert sent == [listing, dispatch]
@@ -3592,6 +3695,8 @@ with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory
 
     stack.enter_context(patch.object(tick, "SNAPSHOT", root / "issues.json"))
     stack.enter_context(patch.object(tick, "tickets", return_value=[ticket]))
+    stack.enter_context(patch.object(tick.github_poller, "read",
+                                    return_value={"hr-relay": {"development": head}}))
     stack.enter_context(patch.object(tick, "supervisor", return_value=([], "run")))
     stack.enter_context(patch.object(tick, "project_fields", return_value=(
         "project", [("status", "progress"), ("stage", "coding"), ("agent", None)], ("stage", "needs-you"))))

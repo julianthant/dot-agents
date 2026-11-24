@@ -32,6 +32,8 @@ import sys
 import time
 import uuid
 
+import github_poller
+
 ORCA = os.environ.get("ORCA_CLI_COMMAND") or "orca"
 # An agent's own limit message opens its line (from the retired dev_auto.py tick): Claude's
 # "You've hit your 5-hour limit" and "⚠ Usage limit reached ·", Codex's "You’ve hit your usage
@@ -389,9 +391,7 @@ ISSUES_QUERY = """query($endCursor:String,$states:IssueState!,$since:DateTime) {
   }
 }
 """
-# One issue read per minute, shared by every tick verb and the roadmap rebuild (#592 bug 8).
 SNAPSHOT = Path.home() / ".local/state/dev-auto/issues.json"
-SNAPSHOT_SECONDS = 60
 CLOSED_FULL_SECONDS = 600
 CLOSED_KEPT = 400
 # The Project's id and its field and option ids are stable; field-list alone costs about 100 GraphQL points.
@@ -490,14 +490,17 @@ def research_root():
     return (SNAPSHOT.parent / "research").resolve()
 
 
-def issue_nodes(state, since=None, limit=None):
+def issue_nodes(state, since=None, limit=None, *, query=None):
     order = ",orderBy:{field:UPDATED_AT,direction:DESC}" if state == "CLOSED" else ""
     out, cursor = [], None
     while limit is None or len(out) < limit:
-        args = ["gh", "api", "graphql", "-f", "query=" + ISSUES_QUERY % order, "-f", "states=" + state]
+        fields = ISSUES_QUERY % order
+        args = ["-f", "states=" + state]
         args += ["-f", "since=" + since] if since else []
         args += ["-f", "endCursor=" + cursor] if cursor else []
-        page = json.loads(command(*args))["data"]["repository"]["issues"]
+        data = (query(fields, *args) if query else
+                json.loads(command("gh", "api", "graphql", "-f", "query=" + fields, *args))["data"])
+        page = data["repository"]["issues"]
         out += page["nodes"]
         if not page["pageInfo"]["hasNextPage"]:
             break
@@ -505,8 +508,22 @@ def issue_nodes(state, since=None, limit=None):
     return out[:limit]
 
 
-def snapshot(fresh=False):
-    """Open issues and the newest closed ones, refetched at most once a minute across processes."""
+def github_state(source, **query):
+    try:
+        data = github_poller.read(source, **query)
+    except github_poller.Unavailable as e:
+        raise OrcaError(str(e)) from e
+    if data is None:
+        raise OrcaError(f"roadmap {source} lookup pending")
+    return data
+
+
+def snapshot():
+    return github_state("issues")
+
+
+def refresh_snapshot(query=None):
+    """Refresh the issue snapshot in the roadmap server."""
     import fcntl
     SNAPSHOT.parent.mkdir(parents=True, exist_ok=True)
     with SNAPSHOT.with_suffix(".lock").open("a+") as lock:
@@ -516,17 +533,15 @@ def snapshot(fresh=False):
         except (OSError, ValueError):
             old = {}
         now = time.time()
-        if not fresh and 0 <= now - old.get("fetched", 0) < SNAPSHOT_SECONDS:
-            return old
-        opened = issue_nodes("OPEN")
+        opened = issue_nodes("OPEN", query=query)
         # Closed issues change only when updated, so read the recent ones and a full list every ten minutes.
         full = not 0 <= now - old.get("closed_full", 0) < CLOSED_FULL_SECONDS
         since = None if full else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(old["read"] - 120))
         closed = {} if full else {i["number"]: i for i in old.get("closed", [])}
-        closed.update((i["number"], i) for i in issue_nodes("CLOSED", since, CLOSED_KEPT if full else None))
+        closed.update((i["number"], i) for i in issue_nodes("CLOSED", since, CLOSED_KEPT, query=query))
         numbers = {i["number"] for i in opened}
         closed = sorted((i for n, i in closed.items() if n not in numbers), key=lambda i: i["updatedAt"], reverse=True)
-        new = {"fetched": now, "read": now, "closed_full": now if full else old["closed_full"],
+        new = {"fetched": time.time(), "read": now, "closed_full": now if full else old["closed_full"],
                "open": opened, "closed": closed[:CLOSED_KEPT]}
         tmp = SNAPSHOT.with_suffix(".tmp")
         tmp.write_text(json.dumps(new))
@@ -551,7 +566,7 @@ def edit_snapshot(change):
 
 
 def stale_snapshot():
-    """After a Project write, the next reader refetches open issues but keeps the closed list."""
+    """Make readers wait for the poller when a Project write cannot be reconciled."""
     edit_snapshot(lambda old: {**old, "fetched": 0})
 
 
@@ -584,7 +599,9 @@ def write_through(args):
 
 def tickets(fresh=False, *, rows=None):
     result = []
-    for i in snapshot(fresh)["open"] if rows is None else rows:
+    if rows is None:
+        rows = issue_nodes("OPEN") if fresh else snapshot()["open"]
+    for i in rows:
         card = next((c for c in nodes(i["projectItems"]) if c["project"]["number"] == PROJECT
                      and c["project"]["owner"]["login"] == OWNER), None)
         body = i["body"]
@@ -737,29 +754,12 @@ def reserve(db, number, receipt):
         raise OrcaError(f"issue #{number} already reserved") from e
 
 
-def project_meta(refresh=False):
-    """{"id", "fields": {name: field}} from the cache, fetched only when missing or on refresh."""
-    if not refresh:
-        try:
-            return json.loads(PROJECT_CACHE.read_text())
-        except (OSError, ValueError):
-            pass
-    args = (str(PROJECT), "--owner", OWNER, "--format", "json")
-    meta = {"id": json.loads(command("gh", "project", "view", *args))["id"],
-            "fields": {f["name"]: f for f in json.loads(command("gh", "project", "field-list", *args))["fields"]}}
-    PROJECT_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = PROJECT_CACHE.with_name(f"{PROJECT_CACHE.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(meta))
-    tmp.replace(PROJECT_CACHE)
-    return meta
+def project_meta():
+    return github_state("project")
 
 
 def with_project(use):
-    """use(meta) on the cached ids; an unknown field or option refetches them once."""
-    try:
-        return use(project_meta())
-    except (KeyError, StopIteration):
-        return use(project_meta(refresh=True))
+    return use(project_meta())
 
 
 def project_fields():
@@ -828,7 +828,7 @@ def inventory(repo_path, issues, repo, emit=log, host="local", counts=None):
     return {t["handle"] for t in terms["terminals"]}
 
 
-def fill_tick(args, db, *, issues=None, emit=log):
+def fill_tick(args, db, *, issues=None, heads=None, emit=log):
     import pick
     repo_path = args.repo_path.resolve()
     remote = command("git", "-C", str(repo_path), "remote", "get-url", "origin").strip()
@@ -905,15 +905,14 @@ def fill_tick(args, db, *, issues=None, emit=log):
     snapshot = scan(issues)
     refs = set(command("git", "-C", str(repo_path), "for-each-ref", "--format=%(refname:short)",
                        "refs/heads", "refs/remotes/origin").splitlines())
-    remote_refs = command("git", "-C", str(repo_path), "ls-remote", "--heads", "origin")
-    heads = {line.split()[1] for line in remote_refs.splitlines()}
+    repo_heads = (github_state("heads") if heads is None else heads)[repo]
     for t in issues:
         t["skip"] = []
         if t["number"] in previous:
             t["skip"].append("reserved or completed")
-        if t["branch"] in refs or "origin/" + (t["branch"] or "") in refs or "refs/heads/" + (t["branch"] or "") in heads:
+        if t["branch"] in refs or "origin/" + (t["branch"] or "") in refs or t["branch"] in repo_heads:
             t["skip"].append("task branch exists")
-        if not t["base"] or "refs/heads/" + t["base"].removeprefix("origin/") not in heads:
+        if not t["base"] or t["base"].removeprefix("origin/") not in repo_heads:
             t["skip"].append("base missing on origin")
     holds_path = (args.holds or pick.HOLDS).resolve()
     def seat(route, extra, state=snapshot, reservations=pending.copy(), *, local_only=False):
@@ -1557,15 +1556,15 @@ def reconcile_start(db, number, rec, actor):
     log("started", {"issue": number, "dispatch": dispatch_id})
 
 
-def fill(args, *, issues=None, emit=log):
+def fill(args, *, issues=None, heads=None, emit=log):
     import fcntl
     state = Path.home() / ".local/state/dev-auto"
     path = state / "starts.sqlite"
     if args.dry_run:
         if path.exists():
             with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
-                return fill_tick(args, db, issues=issues, emit=emit)
-        return fill_tick(args, None, issues=issues, emit=emit)
+                return fill_tick(args, db, issues=issues, heads=heads, emit=emit)
+        return fill_tick(args, None, issues=issues, heads=heads, emit=emit)
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (state / "fill.lock").open("a+") as lock:
         try:
@@ -1657,16 +1656,24 @@ def latest_coder_report(state, run, messages, handled=()):
 
 
 def green_report(ticket, body):
-    repo = f"{OWNER}/{ticket['repo']}"
+    name = ticket["repo"]
+    repo = f"{OWNER}/{name}"
     branch = ticket["branch"]
-    head = command("gh", "api", f"repos/{repo}/git/matching-refs/heads/{branch}", "--jq",
-                   f'.[] | select(.ref == "refs/heads/{branch}") | .object.sha').strip()
+    head = github_state("heads")[name].get(branch)
     if head not in re.findall(r"(?i)\b[0-9a-f]{40}\b", body):
         return None
-    dot = ticket["repo"] == "dot-agents"
+    workflow, event = github_poller.task_workflow(name)
+    cached = github_state("runs", repo=name, sha=head, workflow=workflow, event=event)
+    if not cached or (cached[0]["head_branch"], cached[0]["status"], cached[0]["conclusion"]) != (
+            branch, "completed", "success"):
+        return None
+    # The report would start a reviewer or advance to merge. Recheck the exact head once.
+    current = command("gh", "api", f"repos/{repo}/git/matching-refs/heads/{branch}", "--jq",
+                      f'.[] | select(.ref == "refs/heads/{branch}") | .object.sha').strip()
+    if current != head:
+        return None
     runs = json.loads(command("gh", "run", "list", "--repo", repo, "--branch", branch, "--commit", head,
-                              "--workflow", "tests.yml" if dot else "development.yml",
-                              "--event", "pull_request" if dot else "push", "--limit", "1",
+                              "--workflow", workflow, "--event", event, "--limit", "1",
                               "--json", "headSha,headBranch,status,conclusion"))
     if runs and runs[0] == {"headSha": head, "headBranch": branch, "status": "completed", "conclusion": "success"}:
         return head
@@ -2209,12 +2216,10 @@ def review(args):
 
 
 CLOSE_QUERY = """
-query($endCursor:String) {
+query($number:Int!) {
   repository(owner:"julianthant",name:"hr-relay") {
-    issues(first:50,states:CLOSED,after:$endCursor) {
-      pageInfo { hasNextPage endCursor }
-      nodes {
-        number title body
+    issue(number:$number) {
+        state
         projectItems(first:20) { totalCount nodes {
           id project { number owner { ... on User { login } ... on Organization { login } } }
           agent:fieldValueByName(name:"Agent") { ... on ProjectV2ItemFieldTextValue { text } }
@@ -2223,7 +2228,6 @@ query($endCursor:String) {
         closedByPullRequestsReferences(first:50) { totalCount nodes {
           merged headRefName headRefOid isCrossRepository repository { nameWithOwner }
         }}
-      }
     }
   }
 }
@@ -2231,27 +2235,19 @@ query($endCursor:String) {
 
 
 def close_cards(repo, issue):
-    pages = json.loads(command("gh", "api", "graphql", "--paginate", "--slurp", "-f", "query=" + CLOSE_QUERY))
-    for page in pages:
-        for row in page["data"]["repository"]["issues"]["nodes"]:
-            if issue and row["number"] != issue:
-                continue
-            branch_section = section(row["body"], "Branch")
-            if research_brief(row["body"]):
-                continue
-            if repo != ("dot-agents" if "dot-agents" in branch_section else "hr-relay"):
-                continue
-            card = next((c for c in nodes(row["projectItems"])
-                         if c["project"] == {"number": PROJECT, "owner": {"login": OWNER}}), None)
-            if not card or not (card["agent"] or card["stage"]):
-                continue
-            match = re.search(r"\btask/[\w-]+/[\w-]+", branch_section)
-            branch = match[0] if match else None
-            if not branch:
-                slug = re.fullmatch(r"([\w-]+)\s*/\s*([\w-]+(?:[ \t]+[\w-]+)*)(?:\s*:.*)?", row["title"].strip())
-                if slug:
-                    branch = f"task/{slug[1].lower()}/" + "-".join(slug[2].lower().split())
-            yield row, card, branch
+    rows = [row for row in snapshot()["closed"] if not issue or row["number"] == issue]
+    for ticket in tickets(rows=rows):
+        if not ticket["research"] and ticket["repo"] == repo and ticket["item"] and (ticket["agent"] or ticket["stage"]):
+            yield ticket
+
+
+def verify_closed(number, item):
+    response = json.loads(command("gh", "api", "graphql", "-f", "query=" + CLOSE_QUERY, "-F", f"number={number}"))
+    issue = response["data"]["repository"]["issue"]
+    if not issue or issue["state"] != "CLOSED" or not any(
+            card["id"] == item for card in nodes(issue["projectItems"])):
+        raise OrcaError("ticket closure or Project card changed")
+    return nodes(issue["closedByPullRequestsReferences"])
 
 
 def close_workers(run):
@@ -2408,8 +2404,8 @@ def close_tick(args, db):
     db.execute("CREATE TABLE IF NOT EXISTS close_request (run TEXT, issue INTEGER, reason TEXT, request TEXT,"
                " PRIMARY KEY(run,issue))")
     unconfirmed = []
-    for issue, card, branch in candidates:
-        number = issue["number"]
+    for ticket in candidates:
+        number, branch, item = ticket["number"], ticket["branch"], ticket["item"]
         review = review_state(db, run, number) or {}
         saved = db.execute("SELECT workspace FROM closing WHERE run=? AND issue=?", (run, number)).fetchone()
         matching = [tree for tree in trees["worktrees"] if
@@ -2425,18 +2421,19 @@ def close_tick(args, db):
         workers = roster.get(workspace)
         if not workers and not args.issue and not saved and not review:
             continue
-        edit = ("gh", "project", "item-edit", "--project-id", project, "--id", card["id"], "--field-id")
+        edit = ("gh", "project", "item-edit", "--project-id", project, "--id", item, "--field-id")
         try:
             if (not workers or not branch or len(matching) > 1 or (saved and workspace != saved[0])
                     or (recorded_path and workspace.partition("::")[2] != recorded_path)):
                 raise OrcaError("no unique ticket worktree and worker inventory in this Run")
+            merged_prs = verify_closed(number, item)
             with db:
                 db.execute("INSERT OR IGNORE INTO closing VALUES (?,?,?)", (run, number, workspace))
             paths = {pick.HOLDS, args.holds or pick.HOLDS}
             paths.update(Path(review[key]["holds"]) for key in ("hold", "reviewer", "release")
                          if review.get(key) and review[key].get("holds"))
             release_close_workers(workers, workspace, run, paths)
-            heads = {pr["headRefOid"] for pr in nodes(issue["closedByPullRequestsReferences"])
+            heads = {pr["headRefOid"] for pr in merged_prs
                      if pr["merged"] and not pr["isCrossRepository"] and pr["headRefName"] == branch
                      and pr["repository"]["nameWithOwner"] == f"{OWNER}/{repo_name}"}
             if len(heads) != 1:
@@ -3227,8 +3224,7 @@ def full_run_tick(now=None):
     if now - last < FULL_RUN_SECONDS:
         log("full-run", "skipped: dispatched within 20 minutes")
         return
-    runs = json.loads(command("gh", "run", "list", "-R", FULL_RUN_REPO, "--workflow", FULL_RUN_WORKFLOW,
-                              "--branch", FULL_RUN_BRANCH, "--limit", "20", "--json", "status,event"))
+    runs = github_state("runs", repo="hr-relay", workflow=FULL_RUN_WORKFLOW, branch=FULL_RUN_BRANCH)
     if any(r.get("status") in ("queued", "in_progress", "waiting", "requested", "pending") for r in runs):
         log("full-run", "skipped: a full run is already queued or running")
         return

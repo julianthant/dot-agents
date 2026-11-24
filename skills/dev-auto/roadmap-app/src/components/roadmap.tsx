@@ -184,7 +184,7 @@ export function Stamp({ feed }: { feed: Feed }) {
   const gen = feed.data?.generated
   const stale = gen ? Date.now() - Date.parse(gen) > 10 * 60_000 : false
   if (feed.error && !feed.data) return null
-  if (feed.error) return <span role="status" className="text-xs text-you">Board update failed ({feed.error}). Retrying every 30 s.</span>
+  if (feed.error) return <span role="status" className="text-xs text-you">Board update failed ({feed.error}). Retrying every 5 s.</span>
   return (
     <span role="status" className={cn('text-xs', stale ? 'text-you' : 'text-muted-foreground')}>
       {gen ? `Board updated ${new Date(gen).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}` : 'Board update time unavailable'}

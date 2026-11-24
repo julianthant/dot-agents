@@ -131,5 +131,19 @@ class RepeatTest(unittest.TestCase):
             self.assertEqual(list(Path(t).iterdir()), [], "records nothing")
 
 
+class CiWaitHookTest(unittest.TestCase):
+    def test_blocks_watches_but_allows_one_shot_reads(self):
+        for command in ("gh run watch 123", "gh pr checks 42 --watch", "git push && /usr/bin/gh run watch 4",
+                        "gh -R example/repo pr checks 42 --watch=true"):
+            with self.subTest(command=command):
+                payload = {"tool_name": "Bash", "tool_input": {"command": command}}
+                out = json.loads(run("ci-wait.py", payload))["hookSpecificOutput"]
+                self.assertEqual(out["permissionDecision"], "deny")
+                self.assertIn("ci-wait <sha|branch>", out["permissionDecisionReason"])
+        for command in ("gh run view 123", "gh pr checks 42", "echo 'gh run watch 123'"):
+            with self.subTest(command=command):
+                self.assertEqual(run("ci-wait.py", {"tool_name": "Bash", "tool_input": {"command": command}}), "")
+
+
 if __name__ == "__main__":
     unittest.main()

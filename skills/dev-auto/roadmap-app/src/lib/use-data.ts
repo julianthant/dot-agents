@@ -2,12 +2,12 @@ import { useEffect, useState } from 'react'
 import type { Data } from './model'
 
 const URL_ = '/data.json'
-const EVERY = 30_000
+const EVERY = 5_000
 
 export type Feed = { data: Data | null; error: string | null; fetchedAt: number | null }
 
 // Polls data.json; a failed poll keeps the last good data and reports the error.
-export function useRoadmapData(revision: number): Feed {
+export function useRoadmapData(): Feed {
   const [feed, setFeed] = useState<Feed>({ data: null, error: null, fetchedAt: null })
   useEffect(() => {
     let pending: AbortController | undefined
@@ -28,6 +28,6 @@ export function useRoadmapData(revision: number): Feed {
     load()
     const id = setInterval(load, EVERY)
     return () => { pending?.abort(); clearInterval(id) }
-  }, [revision])
+  }, [])
   return feed
 }

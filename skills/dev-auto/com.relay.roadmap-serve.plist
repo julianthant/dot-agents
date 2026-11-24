@@ -18,7 +18,7 @@
         <string>--directory</string>
         <string>ROADMAP_DIRECTORY</string>
         <string>--bind</string>
-        <string>ROADMAP_BIND</string>
+        <string>ROADMAP_TAILNET_IP</string>
         <string>--port</string>
         <string>8790</string>
     </array>

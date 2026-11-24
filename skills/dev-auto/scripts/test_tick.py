@@ -3098,7 +3098,7 @@ def discovered(ticket):
     with patch.object(tick, "supervisor", return_value=([], "run")), patch.object(tick, "runtime", orca), \
             patch.object(tick, "tickets", return_value=[ticket]), \
             patch.object(tick, "command", return_value="https://github.com/julianthant/dot-agents.git"), \
-            patch.object(tick, "review_step", lambda *a: found.append(a[3]["number"])):
+            patch.object(tick, "review_step", lambda *a, **_: found.append(a[3]["number"])):
         tick.review_tick(SimpleNamespace(issue=None, coder=None), sqlite3.connect(":memory:"))
     return found
 

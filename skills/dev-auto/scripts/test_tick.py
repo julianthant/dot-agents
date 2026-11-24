@@ -864,8 +864,8 @@ def rm_answer(args):
     if args[:2] == ["api", "graphql"]:
         return {"data": {"relay": {"dev": {"nodes": [RM_PR(21, "PENDING"), RM_PR(22, "FAILURE")]},
                                    "staging": {"nodes": [RM_PR(30, "SUCCESS")]}}, "agents": {"task": {"nodes": []}}}}
-    if args[:2] == ["release", "list"]:
-        return [{"tagName": "v1.2.0", "publishedAt": "2026-11-20T12:00:00Z"}]
+    if "releases?per_page=1" in a:
+        return [{"tag_name": "v1.2.0", "published_at": "2026-11-20T12:00:00Z"}]
     if "search/issues" in args:
         assert "q=repo:julianthant/hr-relay is:pr is:merged base:development merged:>2026-11-20" in args, args
         return {"total_count": 7, "items": [{}]}
@@ -875,8 +875,10 @@ def rm_answer(args):
         return {"commit": {"committer": {"date": "2026-11-19T00:00:00Z"}}}
     if a.endswith("matching-refs/heads/cut/"):
         return [{"ref": "refs/heads/cut/2026-11-21"}]
-    if args[:2] == ["run", "list"]:
-        return [{"conclusion": "success", "status": "completed", "createdAt": "2026-11-23T06:00:00Z", "headSha": "abc", "url": "u"}]
+    if "actions/workflows/" in a:
+        return {"workflow_runs": [{"event": "schedule", "head_branch": "development", "conclusion": "success",
+                                   "status": "completed", "created_at": "2026-11-23T06:00:00Z",
+                                   "head_sha": "abc", "html_url": "u"}]}
     if "milestones" in a:
         return [{"title": "Staging cut"}, {"title": "Later"}]
     raise AssertionError(args)
@@ -901,10 +903,33 @@ ROADMAP_BEFORE = json.loads(
     "\"},\"cuts\":[\"cut/2026-11-21\"],\"fullRun\":{\"conclusion\":\"success\",\"status\":\"completed\",\"createdAt\":\"2026-11-23T06"
     ":00:00Z\",\"headSha\":\"abc\",\"url\":\"u\"}}}")
 
-with patch.object(roadmap, "gh", lambda *a: rm_answer(list(a))), \
-        patch.object(tick, "command", lambda *a: json.dumps(rm_answer(list(a[1:])))):
-    built = roadmap.build({"open": RM_OPEN, "closed": RM_CLOSED})  # open issues in creation order, as the snapshot keeps them
+with TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    with (patch.object(roadmap, "STATE", root / "roadmap.json"),
+          patch.object(tick, "SNAPSHOT", root / "issues.json"),
+          patch.object(tick, "PROJECT_CACHE", root / "project.json"),
+          patch.object(tick, "issue_nodes", side_effect=lambda state, *_: RM_OPEN if state == "OPEN" else RM_CLOSED),
+          patch.object(tick, "command", lambda *a: json.dumps(rm_answer(list(a[1:])))),
+          patch.object(roadmap, "gh", lambda *a: rm_answer(list(a))),
+          patch.object(roadmap, "poll", lambda url, _: (200, None, json.dumps(rm_answer(["api", url])))),
+          patch.object(roadmap, "branch_heads", return_value={}),
+          patch.object(roadmap, "readiness", return_value={})):
+        built = roadmap.render(full=True)
+        check.assertEqual(roadmap.render()["pipeline"], built["pipeline"])
+
 built.pop("generated")
+check.assertIsNotNone(built.pop("githubFetchedAt"))
+for card in built["issues"]:
+    live = card.pop("now")
+    if card["n"] == 11:
+        check.assertEqual((live["stage"], live["pr"]["n"]), (3, 21))
+    else:
+        check.assertIsNone(live)
+    if card["open"] and card["type"] == "Task":
+        check.assertFalse(card.pop("ready"))
+        check.assertEqual(card.pop("holdReason"), "readiness unavailable")
+check.assertEqual(built["pipeline"].pop("agentPrs"), [])
+built["pipeline"]["stagingPr"] = [{k: p[k] for k in ("n", "head", "checks")} for p in built["pipeline"]["stagingPr"]]
 check.assertEqual(built, {**ROADMAP_BEFORE, "tick": None})
 
 # Bug 8: field-list costs about 100 points, so the Project's ids are cached and refetched only on a miss or a failed edit.
@@ -939,23 +964,21 @@ with TemporaryDirectory() as tmp:
             tick.command("gh", "project", "item-edit", "--id", "card")
     check.assertFalse(cache.exists())
 
-# The roadmap survives a 0-remaining GraphQL quota: a cold Project lookup renders without Areas, a warm cache keeps
-# its order and stays on disk, and a refused issue refetch renders the last good snapshot.
+# The local roadmap survives an unavailable GitHub API and preserves the cached Area order.
 with TemporaryDirectory() as tmp:
-    cache, snap = Path(tmp) / "project.json", Path(tmp) / "issues.json"
-    def refused(*a):
-        if a[:2] == ("gh", "project"):
-            raise tick.OrcaError("gh project failed: API rate limit already exceeded")
-        return json.dumps(rm_answer(list(a[1:])))
-    with patch.object(roadmap, "gh", lambda *a: rm_answer(list(a))), patch.object(tick, "PROJECT_CACHE", cache), \
-            patch.object(tick, "SNAPSHOT", snap), patch.object(tick, "command", refused):
-        check.assertEqual(roadmap.build({"open": RM_OPEN, "closed": RM_CLOSED})["areas"], [])
+    root = Path(tmp)
+    cache, snap = root / "project.json", root / "issues.json"
+    snap.write_text(json.dumps({"open": RM_OPEN, "closed": RM_CLOSED, "fetched": 0}))
+    with (patch.object(roadmap, "STATE", root / "roadmap.json"),
+          patch.object(tick, "PROJECT_CACHE", cache), patch.object(tick, "SNAPSHOT", snap),
+          patch.object(tick, "command", side_effect=AssertionError("local render called GitHub")),
+          patch.object(roadmap, "gh", side_effect=AssertionError("local render called GitHub"))):
+        check.assertEqual(roadmap.render()["areas"], [])
         cache.write_text(json.dumps({"id": "proj", "fields": {"Area": {"options": [{"name": "Driver"}]}}}))
-        check.assertEqual(roadmap.build({"open": RM_OPEN, "closed": RM_CLOSED})["areas"], ["Driver"])
+        data = roadmap.render()
+        check.assertEqual(data["areas"], ["Driver"])
         check.assertTrue(cache.exists())
-        snap.write_text(json.dumps({"open": RM_OPEN, "closed": RM_CLOSED}))
-        with patch.object(tick, "snapshot", side_effect=tick.OrcaError("gh api failed: rate limit")):
-            check.assertEqual(roadmap.last_snapshot()["open"], RM_OPEN)
+        check.assertEqual([card["n"] for card in data["issues"]], [11, 12, 10, 3, 4])
 
 # Orca identifies agent terminals separately from plain shells and links recovery worktrees to issues.
 items = [dict(base, number=row["number"], branch=row["branch"], paths=[str(row["number"])]) for row in parsed]

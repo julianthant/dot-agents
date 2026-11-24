@@ -8,8 +8,11 @@ import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Event, Thread
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 import tick
 import roadmap
@@ -40,6 +43,13 @@ FIELDS = {"Status": {"id": "f_status", "name": "Status", "options": [{"id": "o_d
                           "options": [{"id": "o_coding", "name": "Coding"}, {"id": "o_review", "name": "Reviewing"}]},
           "Area": {"id": "f_area", "name": "Area", "options": [{"id": "o_tick", "name": "Tick"}]}}
 GITHUB = {"pipeline": {"devPrs": []}, "milestones": ["Staging cut"]}
+REST = {
+    "releases?per_page=1": [{"tag_name": "v1", "published_at": SINCE}],
+    "git/matching-refs/heads/cut/": [{"ref": "refs/heads/cut/old"}],
+    "compare/staging...development?per_page=1": {"ahead_by": 8},
+    "compare/main...development?per_page=1": {"ahead_by": 9},
+    "milestones?state=open&per_page=50": [{"title": "Staging cut"}],
+}
 
 
 class Roadmap(unittest.TestCase):
@@ -56,7 +66,7 @@ class Roadmap(unittest.TestCase):
                                              "open": [issue(1, "Queued"), issue(2, None)], "closed": []}))
         tick.PROJECT_CACHE.write_text(json.dumps({"id": "proj", "fields": FIELDS}))
         self.replies, self.sent = {}, []
-        self.prs = None
+        self.prs = {"devPrs": [], "stagingPr": [], "agentPrs": []}
         # Any GitHub read outside the conditional polls fails the test unless it expects one.
         self.reads = []
         for target, name in ((tick, "command"), (roadmap, "gh")):
@@ -80,30 +90,34 @@ class Roadmap(unittest.TestCase):
         if argv[0] == "git":
             return subprocess.CompletedProcess(argv, 0, getattr(self, "heads", ""), "")
         self.sent.append(argv)
-        name = next((k for k, url in roadmap.POLLS.items() if argv[-1].startswith(url.split("?")[0] + "?")), argv[-1])
-        reply = self.replies.get(name) or R304.format(tag=name)
+        reply = self.replies.get(argv[-1], R304.format(tag="cached"))
         return subprocess.CompletedProcess(argv, 1 if reply.startswith("HTTP/2.0 304") else 0, reply, "")
 
-    def warm(self, built=None, anchored=None, seen=()):
-        roadmap.STATE.write_text(json.dumps({"etags": {k: f'"{k}"' for k in roadmap.POLLS}, "since": SINCE,
-                                             "anchored": anchored or time.time(), "seen": list(seen),
-                                             "built": built or time.time(), **GITHUB}))
-
-    def issues(self, *pairs, tag="i"):
-        self.replies["issues"] = R200.format(tag=tag, body=json.dumps([{"number": n, "updated_at": u} for n, u in pairs]))
+    def warm(self):
+        if not roadmap.STATE.exists():
+            roadmap.STATE.write_text(json.dumps(GITHUB))
 
     def runs(self, *runs):
-        self.replies["runs"] = R200.format(tag="r2", body=json.dumps({"workflow_runs": runs}))
+        self.replies[roadmap.RUNS] = R200.format(tag="runs", body=json.dumps({"workflow_runs": runs}))
 
-    def fetches(self, fail=False):
-        """Patch the snapshot read to record each fresh flag, failing as a refused refetch when asked."""
-        calls = []
-        def snapshot(fresh=False):
-            calls.append(fresh)
-            if fail and fresh:
-                raise tick.OrcaError("gh api failed: rate limit")
-            return json.loads(tick.SNAPSHOT.read_text())
-        return calls, patch.object(tick, "snapshot", side_effect=snapshot)
+    def full(self, *, render=True):
+        for path, body in REST.items():
+            self.replies[f"repos/{roadmap.REPO}/{path}"] = R200.format(tag="cached", body=json.dumps(body))
+        self.replies.setdefault(roadmap.RUNS, R200.format(tag="runs", body='{"workflow_runs":[]}'))
+
+        def github(*args):
+            if args[:2] == ("api", "-X"):
+                self.reads.append(args)
+                return {"total_count": 7}
+            return self.answer(args)
+
+        opened = json.loads(tick.SNAPSHOT.read_text())["open"]
+        patches = (patch.object(roadmap, "gh", side_effect=github),
+                   patch.object(tick, "issue_nodes", side_effect=lambda state, *_: opened if state == "OPEN" else []))
+        if not render:
+            return patches
+        with patches[0], patches[1]:
+            return roadmap.render(full=True)
 
     def edit(self, field, *value, item="item1"):
         with patch.object(tick.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "{}", "")):
@@ -134,7 +148,8 @@ class Roadmap(unittest.TestCase):
               patch.object(tick, "inventory", return_value=set()),
               patch.object(pick.account_usage, "load_config", return_value={}),
               patch.object(pick, "pick", side_effect=seat)):
-            rows = roadmap.render()["issues"]
+            rows = self.full()["issues"]
+            self.assertEqual(roadmap.render()["issues"], rows)
             with redirect_stdout(StringIO()) as output:
                 tick.fill(SimpleNamespace(repo_path=Path("/fixture"), issue=None, dry_run=True, holds=None))
         starts = [json.loads(line.split("would start ", 1)[-1])["issue"]
@@ -154,6 +169,18 @@ class Roadmap(unittest.TestCase):
         self.assertEqual((rows[1]["agent"], rows[1]["who"], rows[2]["agent"]), ("Coding", "coder m e @a", None))
         self.assertEqual(self.reads, [])
         self.assertGreater(json.loads(tick.SNAPSHOT.read_text())["fetched"], 0)  # still fresh: no refetch owed
+
+    def test_local_render_with_stale_snapshot_and_cold_caches_stays_offline(self):
+        snap = json.loads(tick.SNAPSHOT.read_text())
+        tick.SNAPSHOT.write_text(json.dumps({**snap, "fetched": 0}))
+        tick.PROJECT_CACHE.unlink()
+        with (patch.object(roadmap, "readiness", READINESS),
+              patch.object(roadmap.subprocess, "run", side_effect=AssertionError("unexpected subprocess")),
+              patch.object(roadmap, "pull_requests", side_effect=AssertionError("unexpected PR query"))):
+            data = roadmap.render()
+        self.assertEqual({r["n"] for r in data["issues"]}, {1, 2})
+        self.assertIsNone(data["githubFetchedAt"])
+        self.assertEqual(self.reads, [])
 
     def test_each_render_reads_the_latest_tick_even_when_github_is_unchanged(self):
         self.warm()
@@ -222,10 +249,10 @@ class Roadmap(unittest.TestCase):
         tick.SNAPSHOT.with_name("starts.sqlite").touch()
         log = StringIO()
         with (patch.dict(os.environ, {}, clear=True), patch.object(tick, "command", side_effect=command),
-              patch.object(roadmap, "readiness", side_effect=tick.OrcaError(diagnostic)), redirect_stderr(log)):
+              redirect_stderr(log)):
             live = roadmap.render()["issues"][0]["now"]
         self.assertEqual(live["status"], "working")
-        self.assertIn(f"roadmap readiness: {diagnostic}", log.getvalue())
+        self.assertEqual(log.getvalue(), "")
 
     def test_refused_worker_inventory_fails_the_render_instead_of_publishing_empty_now(self):
         diagnostic = "terminal_surface_ownership_unavailable"
@@ -252,6 +279,7 @@ class Roadmap(unittest.TestCase):
         self.heads = "green refs/heads/task/lane/1\n"
         self.runs({"head_branch": "task/lane/1", "head_sha": "green", "event": "push",
                    "status": "completed", "conclusion": "success"})
+        self.full()
         with self.local_worker({"dispatchStatus": "failed", "workerState": "stopped"}, stage="Merging", sha="green"):
             live = roadmap.render()["issues"][0]["now"]
         self.assertEqual((live["stage"], live["status"], live["warning"]), (3, "parked on #653, #655", False))
@@ -261,6 +289,7 @@ class Roadmap(unittest.TestCase):
         self.heads = "red refs/heads/task/lane/1\n"
         self.runs({"head_branch": "task/lane/1", "head_sha": "red", "event": "push",
                    "status": "completed", "conclusion": "failure"})
+        self.full()
         with self.local_worker({"dispatchStatus": "completed", "workerState": "succeeded"}):
             live = roadmap.render()["issues"][0]["now"]
         self.assertEqual((live["stage"], live["status"], live["warning"]), (1, "parked on #653 · CI failed", True))
@@ -268,6 +297,7 @@ class Roadmap(unittest.TestCase):
     def test_a_parked_ticket_with_failed_pr_checks_still_warns(self):
         self.block_ticket({"number": 653, "state": "OPEN"})
         self.prs = {"devPrs": [{"n": 637, "head": "task/lane/1", "checks": "failing", "issues": [1]}]}
+        self.full()
         live, _ = self.live_rows({"dispatchStatus": "failed", "workerState": "stopped"})
         self.assertEqual((live["stage"], live["status"], live["warning"]),
                          (3, "parked on #653 · PR checks failing", True))
@@ -318,18 +348,19 @@ class Roadmap(unittest.TestCase):
         live = roadmap.render()["issues"][1]["now"]
         self.assertEqual((live["stage"], live["status"], live["who"]), (3, "PR checks failing", []))
 
-    def test_task_ci_uses_only_the_pushed_head_and_updates_on_the_existing_run_poll(self):
+    def test_task_ci_uses_only_the_pushed_head_from_the_last_manual_refresh(self):
         self.heads = "new refs/heads/task/lane/1\n"
         run = {"head_branch": "task/lane/1", "head_sha": "old", "event": "push",
                "status": "completed", "conclusion": "success"}
         self.runs(run)
+        self.full()
         with self.local_worker({"dispatchStatus": "completed", "workerState": "succeeded"}, stage="Reviewing", sha="old"):
             live = roadmap.render()["issues"][0]["now"]
             self.assertEqual((live["stage"], live["status"]), (1, "waiting for CI"))
             self.runs(dict(run, head_sha="new", conclusion="failure"), run)
-            live = roadmap.render()["issues"][0]["now"]
+            self.assertEqual(roadmap.render()["issues"][0]["now"], live)
+            live = self.full()["issues"][0]["now"]
             self.assertEqual((live["stage"], live["status"], live["warning"]), (1, "CI failed", True))
-            self.replies.clear()
             self.assertEqual(roadmap.render()["issues"][0]["now"], live)
 
     def test_a_close_time_edit_reaches_the_cached_closed_card(self):
@@ -349,123 +380,91 @@ class Roadmap(unittest.TestCase):
         self.edit("f_unknown", "--text", "x")
         self.assertEqual(json.loads(tick.SNAPSHOT.read_text())["fetched"], 0)
 
-    def test_an_unchanged_poll_sends_only_conditional_requests_that_return_304(self):
-        self.warm()
-        roadmap.render()
-        roadmap.render()
-        self.assertEqual(len(self.sent), 4)
-        for argv in self.sent:
-            self.assertIn("-H", argv)
-            self.assertTrue(argv[argv.index("-H") + 1].startswith("If-None-Match: "))
-        self.assertIn(f"since={SINCE}", self.sent[0][-1])
-        self.assertEqual(self.reads, [])
-
-    def test_a_second_update_in_the_same_second_is_a_change_and_a_repeat_is_not(self):
-        t = "2026-11-23T13:05:00Z"
-        self.warm(seen=[[1, t]])
-        calls, snapshot = self.fetches()
-        with snapshot, patch.object(roadmap, "pipeline", return_value=GITHUB):
-            self.issues((1, t), (2, t), tag="i2")
-            roadmap.render()
-            self.issues((2, t), (1, t), tag="i2")  # the same updates again: no change
-            roadmap.render()
-        self.assertEqual(calls, [True, False])
-        state = json.loads(roadmap.STATE.read_text())
-        self.assertEqual((state["since"], state["etags"]["issues"]), (SINCE, 'W/"i2"'))  # the query stays stable
-
-    def test_a_moved_since_overlaps_the_old_window_and_keeps_its_new_etag(self):
-        t = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 10))
-        self.warm(anchored=time.time() - roadmap.ANCHOR_SECONDS - 1, seen=[[1, SINCE + "x"], [2, t]])
-        calls, snapshot = self.fetches()
-        with snapshot:
-            self.issues((2, t), tag="moved")
-            roadmap.render()
-            self.replies.clear()
-            roadmap.render()
-        self.assertEqual(calls, [False, False])  # the overlap repeats a known update: nothing changed
-        self.assertNotIn("-H", self.sent[0])  # only the first poll of the new window is unconditional
-        self.assertNotIn(f"since={SINCE}", self.sent[0][-1])
-        self.assertIn('If-None-Match: W/"moved"', self.sent[2])
-        self.assertEqual(self.reads, [])
-
-    def test_a_refused_refresh_stays_pending_until_it_succeeds(self):
-        self.warm()
-        built = []
-        rebuild = patch.object(roadmap, "pipeline", side_effect=lambda _: built.append(1) or GITHUB)
-        calls, snapshot = self.fetches(fail=True)
-        with snapshot, rebuild:
-            self.issues((1, "2026-11-23T13:05:00Z"))
-            rows = roadmap.render()["issues"]
-            self.replies.clear()
-            roadmap.render()  # every poll 304: the failed refresh is still owed
-        self.assertEqual((calls, len(rows)), ([True, True], 2))
-        calls, snapshot = self.fetches()
-        with snapshot, rebuild:
-            roadmap.render()
-            roadmap.render()
-        self.assertEqual(calls, [True, False])
-        self.assertEqual(len(built), 1)  # only the real change rebuilt the pipeline; retries reuse the cache
-
-    def test_runs_update_the_full_run_without_rebuilding_the_pipeline(self):
-        self.warm()
+    def test_full_refresh_reuses_etags_and_local_renders_keep_the_github_timestamp(self):
         full = {"head_branch": "development", "event": "workflow_dispatch", "status": "in_progress",
                 "conclusion": None, "created_at": SINCE, "head_sha": "abc", "html_url": "https://example.com/run"}
         self.runs(dict(full, event="push", head_sha="other"), full)
-        expected = {"status": "in_progress", "conclusion": None, "createdAt": SINCE,
-                    "headSha": "abc", "url": "https://example.com/run"}
-        with patch.object(roadmap, "pipeline", return_value=GITHUB) as rebuild:
-            self.assertEqual(roadmap.render()["pipeline"].get("fullRun"), expected)
-            self.replies.clear()
-            self.assertEqual(roadmap.render()["pipeline"].get("fullRun"), expected)
-            self.runs(dict(full, event="push", head_sha="other"))
-            self.assertEqual(roadmap.render()["pipeline"].get("fullRun"), expected)
-        rebuild.assert_not_called()
-        self.assertEqual(self.reads, [])
-
-    def test_issue_and_pr_changes_and_the_minute_rebuild_the_pipeline(self):
-        calls, snapshot = self.fetches()
-        with snapshot, patch.object(roadmap, "pipeline", return_value=GITHUB) as rebuild:
-            self.warm()
-            self.issues((1, "2026-11-23T13:05:00Z"))
-            roadmap.render()
-            self.assertEqual(rebuild.call_count, 1)
-            self.replies.clear()
-            self.prs = {"devPrs": [{"n": 7, "head": "task/example", "issues": [], "checks": "running"}]}
-            roadmap.render()
-            self.assertEqual(rebuild.call_count, 2)
-            self.prs["devPrs"][0]["checks"] = "failing"
-            roadmap.render()
-            self.assertEqual(rebuild.call_count, 2)
-            self.warm(built=time.time() - 61)
-            roadmap.render()
-            self.assertEqual(rebuild.call_count, 3)
-        self.assertEqual(calls, [True, False, False, False])
-        self.assertEqual(self.reads, [])
-
-    def test_minute_refresh_reuses_unchanged_rest_fields(self):
-        endpoints = {"releases?per_page=1": [{"tag_name": "v1", "published_at": SINCE}],
-                     "git/matching-refs/heads/cut/": [{"ref": "refs/heads/cut/old"}],
-                     "compare/staging...development?per_page=1": {"ahead_by": 8},
-                     "compare/main...development?per_page=1": {"ahead_by": 9},
-                     "milestones?state=open&per_page=50": [{"title": "Staging cut"}]}
-        self.warm(built=time.time() - 61)
-        for path, body in endpoints.items():
-            self.replies[f"repos/{roadmap.REPO}/{path}"] = R200.format(tag="cached", body=json.dumps(body))
-        with patch.object(self, "answer", side_effect=lambda a: [] if a[:2] == ("pr", "list") else {"total_count": 7}):
-            first = roadmap.render()
+        self.prs["devPrs"] = [{"n": 7, "head": "task/example", "issues": [], "checks": "running"}]
+        gh, issues = self.full(render=False)
+        with gh, issues:
+            first = roadmap.render(full=True)
             self.sent.clear()
             self.replies.clear()
-            state = json.loads(roadmap.STATE.read_text())
-            roadmap.STATE.write_text(json.dumps({**state, "built": time.time() - 61}))
-            second = roadmap.render()
-        self.assertEqual(first["pipeline"]["release"], {"tagName": "v1", "publishedAt": SINCE})
-        self.assertEqual(first["pipeline"]["cuts"], ["cut/old"])
-        self.assertEqual(first["pipeline"]["devAheadOfStaging"], 8)
-        self.assertEqual(first["pipeline"]["devAheadOfMain"], 9)
-        self.assertEqual(first["milestones"], ["Staging cut"])
-        self.assertEqual((second["pipeline"], second["milestones"]), (first["pipeline"], first["milestones"]))
-        self.assertEqual([a[-1] for a in self.sent[2:]], [f"repos/{roadmap.REPO}/{path}" for path in endpoints])
-        self.assertTrue(all('If-None-Match: W/"cached"' in a for a in self.sent[2:]))
+            self.prs = {**self.prs, "devPrs": [dict(self.prs["devPrs"][0], checks="failing")]}
+            second = roadmap.render(full=True)
+        self.assertEqual(len(self.sent), 6)
+        self.assertTrue(all("-H" in argv for argv in self.sent))
+        self.assertEqual(first["pipeline"]["fullRun"]["headSha"], "abc")
+        self.assertEqual(second["pipeline"]["release"], {"tagName": "v1", "publishedAt": SINCE})
+        self.assertEqual(second["pipeline"]["mergedSinceRelease"], 7)
+        self.assertEqual(second["pipeline"]["devPrs"][0]["checks"], "failing")
+        self.assertEqual(second["milestones"], ["Staging cut"])
+        self.assertNotEqual(first["githubFetchedAt"], second["githubFetchedAt"])
+        self.assertEqual(roadmap.render()["githubFetchedAt"], second["githubFetchedAt"])
+
+    def test_refresh_endpoint_publishes_once_for_overlapping_and_rapid_clicks(self):
+        directory = tick.SNAPSHOT.parent
+        entered, release = Event(), Event()
+        gh, issues = self.full(render=False)
+
+        def wait_for_github(argv, **kwargs):
+            if argv[-1] == roadmap.RUNS:
+                entered.set()
+                if not release.wait(5):
+                    raise TimeoutError("test did not release the refresh")
+            return self.gh_api(argv, **kwargs)
+
+        def request(method, *, header=True, path="/refresh"):
+            headers = {"X-Roadmap-Refresh": "1"} if header else {}
+            try:
+                with urlopen(Request(base + path, method=method, headers=headers), timeout=5) as response:
+                    return response.status, response.read()
+            except HTTPError as error:
+                error.close()
+                return error.code, b""
+
+        with roadmap.make_server(directory, "127.0.0.1", 0) as server:
+            base = f"http://127.0.0.1:{server.server_port}"
+            serving = Thread(target=server.serve_forever, daemon=True)
+            serving.start()
+            first = []
+            clicking = Thread(target=lambda: first.append(request("POST")[0]), daemon=True)
+            try:
+                self.assertEqual(request("POST", header=False)[0], 403)
+                with gh, issues, patch.object(roadmap.subprocess, "run", side_effect=wait_for_github):
+                    clicking.start()
+                    self.assertTrue(entered.wait(5))
+                    self.assertEqual(request("POST")[0], 409)
+                    local = Thread(target=roadmap.publish, args=(False, directory), daemon=True)
+                    local.start()
+                    local.join(2)
+                    self.assertFalse(local.is_alive(), "local render waited on GitHub")
+                    _, body = request("GET", path="/data.json")
+                    self.assertIsNone(json.loads(body)["githubFetchedAt"])
+                    release.set()
+                    clicking.join(5)
+                    self.assertEqual(first, [204])
+                    self.assertEqual(request("POST")[0], 204)
+                    _, body = request("GET", path="/data.json")
+                    data = json.loads(body)
+                    self.assertIsNotNone(data["githubFetchedAt"])
+                    self.assertEqual(sum(argv[-1] == roadmap.RUNS for argv in self.sent), 1)
+            finally:
+                release.set()
+                server.shutdown()
+                serving.join(5)
+
+    def test_failed_manual_refresh_preserves_the_published_data(self):
+        directory = tick.SNAPSHOT.parent
+        gh, issues = self.full(render=False)
+        with gh, issues:
+            roadmap.publish(True, directory)
+        saved = (directory / "data.json").read_bytes()
+        self.replies[roadmap.RUNS] = "HTTP/2.0 403 Forbidden\r\n\r\n"
+        with self.assertRaisesRegex(ValueError, "GitHub REST request returned 403"):
+            roadmap.publish(True, directory)
+        self.assertEqual((directory / "data.json").read_bytes(), saved)
+        self.assertEqual(roadmap.render()["githubFetchedAt"], json.loads(saved)["githubFetchedAt"])
 
 
 if __name__ == "__main__":

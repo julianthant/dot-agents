@@ -32,6 +32,8 @@ def wait(repo, target):
             runs = read("runs", repo=repo, sha=sha, event=event, workflow=workflow)
             if runs and runs[0]["status"] == "completed":
                 run = runs[0]
+                if run["head_sha"] != sha:
+                    raise Unavailable("roadmap returned a run for a different commit")
                 print(f"{sha} {run['conclusion']} {run['html_url']}", flush=True)
                 if run["conclusion"] == "success":
                     return 0

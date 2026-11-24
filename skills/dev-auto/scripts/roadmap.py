@@ -454,6 +454,7 @@ def make_server(directory, bind, port, poller=None):
         def do_GET(self):
             path = urlsplit(self.path)
             source = path.path.strip("/")
+            query = dict(parse_qsl(path.query))
             if source == "status":
                 return self.send_json(poller.status())
             if source == "data.json":
@@ -464,10 +465,15 @@ def make_server(directory, bind, port, poller=None):
             if source == "issues":
                 snap = read_json(tick.SNAPSHOT, None)
                 if snap is not None:
-                    return self.send_json(github_poller.Sample(snap, snap["fetched"]).answer(poller.clock()))
+                    data = snap
+                    if number := query.get("number"):
+                        if not re.fullmatch(r"[0-9]{1,10}", number):
+                            return self.send_json({"error": "invalid issue number"}, 400)
+                        data = next((row for row in snap["open"] + snap["closed"] if row["number"] == int(number)), None)
+                    return self.send_json(github_poller.Sample(data, snap.get("fetched")).answer(poller.clock()))
             if source in ("runs", "jobs", "prs", "heads", "issues", "project"):
                 try:
-                    self.send_json(poller.read(source, dict(parse_qsl(path.query))))
+                    self.send_json(poller.read(source, query))
                 except ValueError as e:
                     self.send_json({"error": str(e)}, 400)
                 except github_poller.Unavailable as e:
@@ -479,6 +485,10 @@ def make_server(directory, bind, port, poller=None):
 
 
 def serve(directory, bind, port):
+    if bind != "127.0.0.1":
+        addresses = subprocess.check_output(["tailscale", "ip", "-4"], text=True, timeout=5).split()
+        if bind not in addresses:
+            raise ValueError("the configured address is absent from this Mac's Tailscale interface")
     poller = github_poller.Poller()
     stop = Event()
     with make_server(directory, "127.0.0.1", port, poller) as loopback:

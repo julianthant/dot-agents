@@ -3433,6 +3433,8 @@ with TemporaryDirectory() as tmp, ExitStack() as stack, sqlite3.connect(":memory
 
     stack.enter_context(patch.object(tick, "SNAPSHOT", root / "issues.json"))
     stack.enter_context(patch.object(tick, "tickets", return_value=[ticket]))
+    stack.enter_context(patch.object(tick.github_poller, "read",
+                                    return_value={"hr-relay": {"development": head}}))
     stack.enter_context(patch.object(tick, "supervisor", return_value=([], "run")))
     stack.enter_context(patch.object(tick, "project_fields", return_value=(
         "project", [("status", "progress"), ("stage", "coding"), ("agent", None)], ("stage", "needs-you"))))

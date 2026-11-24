@@ -728,5 +728,5 @@ npx playwright show-report
 - [core/fixtures-and-hooks.md](fixtures-and-hooks.md) -- custom fixtures that replace `globalSetup` for per-test state
 - [core/test-organization.md](test-organization.md) -- file structure, naming conventions, test grouping
 - [core/authentication.md](authentication.md) -- setup projects for shared auth state
-- [ci/ci-github-actions.md](../ci/ci-github-actions.md) -- CI-specific config and caching
-- [ci/projects-and-dependencies.md](../ci/projects-and-dependencies.md) -- advanced multi-project patterns
+- [ci/ci-github-actions.md](~/.agents/skills/playwright-ci/ci-github-actions.md) -- CI-specific config and caching
+- [ci/projects-and-dependencies.md](~/.agents/skills/playwright-ci/projects-and-dependencies.md) -- advanced multi-project patterns

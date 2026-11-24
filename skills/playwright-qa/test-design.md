@@ -1,7 +1,7 @@
 # Test Design: From Requirements to Test Cases
 
 > **When to use**: A QA engineer hands you a ticket, PRD or acceptance criteria and asks what to test, which cases to automate first, or for a test plan Playwright's generator can turn into specs.
-> **Prerequisites**: [core/test-architecture.md](../core/test-architecture.md), [core/test-agents.md](../core/test-agents.md)
+> **Prerequisites**: [core/test-architecture.md](~/.agents/skills/playwright-core/test-architecture.md), [core/test-agents.md](~/.agents/skills/playwright-core/test-agents.md)
 
 ## Quick Reference
 
@@ -43,7 +43,7 @@
 
 DC-08 exposes an ambiguity ("rejected or replaces?"). Raise it with the product owner instead of guessing; an unanswered question is a finding.
 
-Server-side time can't be faked from Playwright: `page.clock` only changes the browser's `Date`. For the exact-second boundary (23:59:59 vs 00:00:00 UTC) the app needs a test hook, such as an injectable clock or a test-only time endpoint; otherwise seed codes with end dates relative to now, as DC-04 and DC-05 do. Use `page.clock` only where the browser computes the time, such as an "expires in 3 hours" countdown ([clock-and-time-mocking.md](../core/clock-and-time-mocking.md)). For the browser timezone, `use: { timezoneId: 'America/Los_Angeles' }`.
+Server-side time can't be faked from Playwright: `page.clock` only changes the browser's `Date`. For the exact-second boundary (23:59:59 vs 00:00:00 UTC) the app needs a test hook, such as an injectable clock or a test-only time endpoint; otherwise seed codes with end dates relative to now, as DC-04 and DC-05 do. Use `page.clock` only where the browser computes the time, such as an "expires in 3 hours" countdown ([clock-and-time-mocking.md](~/.agents/skills/playwright-core/clock-and-time-mocking.md)). For the browser timezone, `use: { timezoneId: 'America/Los_Angeles' }`.
 
 ### Pattern 2: Rank by Risk Before Automating
 
@@ -57,13 +57,13 @@ Score each case 1-3 on **impact** (money, data loss, security, blocked users) an
 | 3-4 | Automate in the regression suite |
 | 1-2 | Manual or exploratory check, or skip with a written reason |
 
-Tag with the `tag` option so CI can run tiers separately (`npx playwright test --grep @smoke`). See [test-organization.md](../core/test-organization.md).
+Tag with the `tag` option so CI can run tiers separately (`npx playwright test --grep @smoke`). See [test-organization.md](~/.agents/skills/playwright-core/test-organization.md).
 
 ### Pattern 3: Push Each Case to the Lowest Layer That Proves It
 
 **Use when**: Deciding which cases become Playwright E2E tests.
 
-- **Unit / API**: validation rules, calculations, permissions, state transitions. Fast, and they fail with a precise message. Playwright's `request` fixture covers the API layer ([api-testing.md](../core/api-testing.md)).
+- **Unit / API**: validation rules, calculations, permissions, state transitions. Fast, and they fail with a precise message. Playwright's `request` fixture covers the API layer ([api-testing.md](~/.agents/skills/playwright-core/api-testing.md)).
 - **E2E**: that the UI is wired to those rules (error shown, total updates), the critical happy path, and cross-page flows.
 
 A password-reset feature, for example: token expiry, reuse and weak-password rules are API tests; "user requests a reset, opens the email link, sets a password, and can log in" is one E2E test.
@@ -108,7 +108,7 @@ Shop cart: add products, see the badge count, check out.
     - expect: The Checkout button is disabled
 ```
 
-Write expected results as observable facts ("badge shows 1"), not intentions ("cart works"). See [test-agents.md](../core/test-agents.md) for running the generator.
+Write expected results as observable facts ("badge shows 1"), not intentions ("cart works"). See [test-agents.md](~/.agents/skills/playwright-core/test-agents.md) for running the generator.
 
 ### Pattern 5: Keep a Requirement → Case Map
 
@@ -134,7 +134,7 @@ Put the case ID in the test title or an annotation so the report links back ([ma
 
 ## Related
 
-- [core/test-agents.md](../core/test-agents.md): generate specs from the plan
-- [core/test-architecture.md](../core/test-architecture.md): E2E vs component vs API
-- [core/test-data-management.md](../core/test-data-management.md): data for each case
+- [core/test-agents.md](~/.agents/skills/playwright-core/test-agents.md): generate specs from the plan
+- [core/test-architecture.md](~/.agents/skills/playwright-core/test-architecture.md): E2E vs component vs API
+- [core/test-data-management.md](~/.agents/skills/playwright-core/test-data-management.md): data for each case
 - [qa/manual-to-automated.md](manual-to-automated.md): when cases already exist as manual tests

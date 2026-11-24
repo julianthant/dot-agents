@@ -1012,4 +1012,4 @@ webServer: [
 - [core/network-mocking.md](network-mocking.md) -- mocking external APIs that Next.js API routes call
 - [core/when-to-mock.md](when-to-mock.md) -- when to mock vs hit real services
 - [core/react.md](react.md) -- React-specific patterns that apply to Next.js client components
-- [ci/ci-github-actions.md](../ci/ci-github-actions.md) -- CI setup with `npm run build` caching for Next.js
+- [ci/ci-github-actions.md](~/.agents/skills/playwright-ci/ci-github-actions.md) -- CI setup with `npm run build` caching for Next.js

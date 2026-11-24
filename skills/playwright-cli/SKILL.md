@@ -21,7 +21,7 @@ description: Automates browser interactions for testing and validating your own 
 
 - **playwright-cli**: for coding agents working in a codebase. Short commands keep tool schemas and full accessibility trees out of the context window.
 - **Playwright MCP** (`@playwright/mcp`): for long-running autonomous loops that reason over page structure across many steps.
-- **Test Agents** (`npx playwright init-agents`): to plan, generate and heal test files. See [core/test-agents.md](../core/test-agents.md).
+- **Test Agents** (`npx playwright init-agents`): to plan, generate and heal test files. See [core/test-agents.md](~/.agents/skills/playwright-core/test-agents.md).
 
 ## Quick Start
 

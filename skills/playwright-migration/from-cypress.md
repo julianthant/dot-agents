@@ -1148,7 +1148,7 @@ This replaces Cypress's time-travel debugger with a more detailed, offline-capab
 
 ### Component testing with framework support
 
-Test components from any framework in real browsers (not jsdom). Since 1.62 the built-in `mount` fixture renders a *story* (a small wrapper component) from a gallery page served by your own dev server; the `@playwright/experimental-ct-*` packages are deprecated. See [component testing](../core/component-testing.md):
+Test components from any framework in real browsers (not jsdom). Since 1.62 the built-in `mount` fixture renders a *story* (a small wrapper component) from a gallery page served by your own dev server; the `@playwright/experimental-ct-*` packages are deprecated. See [component testing](~/.agents/skills/playwright-core/component-testing.md):
 
 ```typescript
 import { test, expect } from '@playwright/test';
@@ -1199,10 +1199,10 @@ await page.routeFromHAR('tests/fixtures/products.har', {
 
 ## Related
 
-- [core/locators.md](../core/locators.md) -- locator strategy for Playwright (replaces Cypress `cy.get()` patterns)
-- [core/fixtures-and-hooks.md](../core/fixtures-and-hooks.md) -- deep dive on fixtures (replaces Cypress custom commands)
-- [core/assertions-and-waiting.md](../core/assertions-and-waiting.md) -- web-first assertions (replaces Cypress `should` chains)
-- [core/configuration.md](../core/configuration.md) -- playwright.config setup
-- [core/authentication.md](../core/authentication.md) -- auth patterns (replaces Cypress `cy.session()`)
-- [core/network-mocking.md](../core/network-mocking.md) -- route mocking (replaces Cypress `cy.intercept()`)
-- [ci/ci-github-actions.md](../ci/ci-github-actions.md) -- CI setup for Playwright
+- [core/locators.md](~/.agents/skills/playwright-core/locators.md) -- locator strategy for Playwright (replaces Cypress `cy.get()` patterns)
+- [core/fixtures-and-hooks.md](~/.agents/skills/playwright-core/fixtures-and-hooks.md) -- deep dive on fixtures (replaces Cypress custom commands)
+- [core/assertions-and-waiting.md](~/.agents/skills/playwright-core/assertions-and-waiting.md) -- web-first assertions (replaces Cypress `should` chains)
+- [core/configuration.md](~/.agents/skills/playwright-core/configuration.md) -- playwright.config setup
+- [core/authentication.md](~/.agents/skills/playwright-core/authentication.md) -- auth patterns (replaces Cypress `cy.session()`)
+- [core/network-mocking.md](~/.agents/skills/playwright-core/network-mocking.md) -- route mocking (replaces Cypress `cy.intercept()`)
+- [ci/ci-github-actions.md](~/.agents/skills/playwright-ci/ci-github-actions.md) -- CI setup for Playwright

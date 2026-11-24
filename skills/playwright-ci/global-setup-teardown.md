@@ -535,8 +535,8 @@ setup('authenticate', async ({ page }) => {
 
 ## Related
 
-- [core/fixtures-and-hooks.md](../core/fixtures-and-hooks.md) -- per-test and per-worker fixtures (preferred over globalSetup for most cases)
-- [core/configuration.md](../core/configuration.md) -- `globalSetup`, `globalTeardown`, `webServer` config
+- [core/fixtures-and-hooks.md](~/.agents/skills/playwright-core/fixtures-and-hooks.md) -- per-test and per-worker fixtures (preferred over globalSetup for most cases)
+- [core/configuration.md](~/.agents/skills/playwright-core/configuration.md) -- `globalSetup`, `globalTeardown`, `webServer` config
 - [ci/projects-and-dependencies.md](projects-and-dependencies.md) -- setup projects with `dependencies`
-- [core/authentication.md](../core/authentication.md) -- authentication patterns using setup projects
-- [core/test-data-management.md](../core/test-data-management.md) -- seeding and managing test data
+- [core/authentication.md](~/.agents/skills/playwright-core/authentication.md) -- authentication patterns using setup projects
+- [core/test-data-management.md](~/.agents/skills/playwright-core/test-data-management.md) -- seeding and managing test data

@@ -375,7 +375,7 @@ playwright-cli webmcp-list
 playwright-cli webmcp-call search_catalog --params '{"query":"cats"}'
 ```
 
-Calling a tool is the fastest way to check that it is wired to real app state: call it, then `snapshot` to see the page update. For writing tests against these tools, see [core/webmcp-testing.md](../core/webmcp-testing.md).
+Calling a tool is the fastest way to check that it is wired to real app state: call it, then `snapshot` to see the page update. For writing tests against these tools, see [core/webmcp-testing.md](~/.agents/skills/playwright-core/webmcp-testing.md).
 
 ## More Commands
 

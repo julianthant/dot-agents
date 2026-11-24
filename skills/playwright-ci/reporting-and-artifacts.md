@@ -140,7 +140,7 @@ test('payment integration', async ({ context, page }, testInfo) => {
 });
 ```
 
-The attached HAR shows up alongside traces and screenshots in the HTML report and CI artifacts. See [core/network-mocking.md](../core/network-mocking.md#on-demand-har-recording-in-tracing-playwright-160) for the full API and `await using` cleanup.
+The attached HAR shows up alongside traces and screenshots in the HTML report and CI artifacts. See [core/network-mocking.md](~/.agents/skills/playwright-core/network-mocking.md#on-demand-har-recording-in-tracing-playwright-160) for the full API and `await using` cleanup.
 
 ### Pattern 2d: Aria and Screen Snapshots in Traces (Playwright 1.63+)
 
@@ -169,7 +169,7 @@ export default defineConfig({
 npx playwright test --add-reporter json
 ```
 
-Use `--add-reporter` in any pipeline where the config already registers a reporter that must keep running — a quarantine reporter using `preprocess()`, for instance. See [core/dynamic-test-selection.md](../core/dynamic-test-selection.md).
+Use `--add-reporter` in any pipeline where the config already registers a reporter that must keep running — a quarantine reporter using `preprocess()`, for instance. See [core/dynamic-test-selection.md](~/.agents/skills/playwright-core/dynamic-test-selection.md).
 
 Other reporter changes worth knowing:
 
@@ -602,5 +602,5 @@ The HTML report automatically embeds screenshots from `test-results/`. If you mo
 - [ci/ci-github-actions.md](ci-github-actions.md) -- artifact upload in GitHub Actions
 - [ci/ci-gitlab.md](ci-gitlab.md) -- artifact configuration in GitLab
 - [ci/parallel-and-sharding.md](parallel-and-sharding.md) -- blob reporter for sharded runs
-- [core/configuration.md](../core/configuration.md) -- trace, screenshot, video settings
-- [core/debugging.md](../core/debugging.md) -- using traces and screenshots for debugging
+- [core/configuration.md](~/.agents/skills/playwright-core/configuration.md) -- trace, screenshot, video settings
+- [core/debugging.md](~/.agents/skills/playwright-core/debugging.md) -- using traces and screenshots for debugging

@@ -793,6 +793,6 @@ console.log(JSON.stringify(snapshot, null, 2));
 
 - [core/locator-strategy.md](locator-strategy.md) — deep-dive decision framework for choosing locator strategies at the project level
 - [core/assertions-and-waiting.md](assertions-and-waiting.md) — pair locators with web-first assertions
-- [pom/page-object-model.md](../pom/page-object-model.md) — encapsulate locators in page objects
+- [pom/page-object-model.md](~/.agents/skills/playwright-pom/page-object-model.md) — encapsulate locators in page objects
 - [core/iframes-and-shadow-dom.md](iframes-and-shadow-dom.md) — advanced iframe and Shadow DOM patterns
 - [core/i18n-and-localization.md](i18n-and-localization.md) — locator strategies for internationalized apps

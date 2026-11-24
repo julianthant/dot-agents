@@ -604,5 +604,5 @@ test('homepage meets performance budget', async ({ page }) => {
 - [core/configuration.md](configuration.md) -- timeout and retry settings for performance-sensitive tests
 - [core/network-mocking.md](network-mocking.md) -- mocking slow APIs for performance boundary testing
 - [core/browser-apis.md](browser-apis.md) -- using browser APIs for measurement
-- [ci/ci-github-actions.md](../ci/ci-github-actions.md) -- CI configuration for performance budgets
+- [ci/ci-github-actions.md](~/.agents/skills/playwright-ci/ci-github-actions.md) -- CI configuration for performance budgets
 - [core/clock-and-time-mocking.md](clock-and-time-mocking.md) -- time-related performance testing

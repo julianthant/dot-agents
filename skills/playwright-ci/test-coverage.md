@@ -467,5 +467,5 @@ const coverageFile = path.join(
 - [ci/parallel-and-sharding.md](parallel-and-sharding.md) -- merging coverage from sharded runs
 - [ci/ci-github-actions.md](ci-github-actions.md) -- coverage thresholds in CI
 - [ci/reporting-and-artifacts.md](reporting-and-artifacts.md) -- uploading coverage reports
-- [core/configuration.md](../core/configuration.md) -- project setup for coverage
-- [core/test-architecture.md](../core/test-architecture.md) -- E2E vs unit test coverage strategies
+- [core/configuration.md](~/.agents/skills/playwright-core/configuration.md) -- project setup for coverage
+- [core/test-architecture.md](~/.agents/skills/playwright-core/test-architecture.md) -- E2E vs unit test coverage strategies

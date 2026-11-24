@@ -2,7 +2,7 @@
 
 > **When to use**: When authoring or reviewing UI components, or whenever a test/AI agent needs a durable handle on an element.
 > **Audience**: frontend engineers writing the app (not test authors).
-> **Companion**: [examples.md](examples.md) for framework code; [../core/locators.md](../core/locators.md) for the consumer side.
+> **Companion**: [examples.md](examples.md) for framework code; [~/.agents/skills/playwright-core/locators.md](~/.agents/skills/playwright-core/locators.md) for the consumer side.
 
 A `data-testid` is a **public API for your UI's automation layer**. Once a test or an agent depends on `data-testid="login-submit"`, renaming it is a breaking change. Treat these attributes with the same care as a function signature: deliberate, named well, unique, and stable across refactors.
 
@@ -19,7 +19,7 @@ A `data-testid` is a **public API for your UI's automation layer**. Once a test 
 
 ## Locator priority (build this in order)
 
-Locate elements in this order (most → least preferred), the same order [core/locator-strategy.md](../core/locator-strategy.md) uses. Playwright itself recommends role locators first and CSS/XPath last. As the **author of the markup**, your goal is to make the *higher* tiers possible, and only fall to `data-testid` when they genuinely don't fit.
+Locate elements in this order (most → least preferred), the same order [core/locator-strategy.md](~/.agents/skills/playwright-core/locator-strategy.md) uses. Playwright itself recommends role locators first and CSS/XPath last. As the **author of the markup**, your goal is to make the *higher* tiers possible, and only fall to `data-testid` when they genuinely don't fit.
 
 | Priority | Strategy | What you provide in markup | Notes |
 |---|---|---|---|
@@ -52,7 +52,7 @@ Add one when **at least one** of these is true:
 - **Decorative / layout-only elements** — wrappers, spacers, purely presentational `<div>`s nothing interacts with.
 - **Every single element.** Test-ID soup is noise; it bloats markup and signals nothing. Add IDs at the elements automation actually targets, plus the containers used to scope them.
 - **As a substitute for accessibility.** If you're tempted to add `data-testid` to a `<div onClick>`, first convert it to a `<button>` (or add `role`/`aria-label`). You get a better app *and* a `getByRole` locator for free.
-- **On something already locatable by a unique role + name.** Tests should use `getByRole` there; see [core/locator-strategy.md](../core/locator-strategy.md).
+- **On something already locatable by a unique role + name.** Tests should use `getByRole` there; see [core/locator-strategy.md](~/.agents/skills/playwright-core/locator-strategy.md).
 
 ---
 
@@ -209,5 +209,5 @@ Use this when writing or reviewing a component:
 ## Related
 
 - [examples.md](examples.md) — copy-paste patterns for React/JSX, Vue, Angular, Svelte; centralizing IDs; production stripping config.
-- [../core/locators.md](../core/locators.md) / [../core/locator-strategy.md](../core/locator-strategy.md) — choosing locators when *writing tests*.
+- [~/.agents/skills/playwright-core/locators.md](~/.agents/skills/playwright-core/locators.md) / [~/.agents/skills/playwright-core/locator-strategy.md](~/.agents/skills/playwright-core/locator-strategy.md) — choosing locators when *writing tests*.
 - Playwright official docs: [Locators](https://playwright.dev/docs/locators), [Best Practices](https://playwright.dev/docs/best-practices).

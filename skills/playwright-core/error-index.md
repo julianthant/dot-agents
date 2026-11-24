@@ -487,7 +487,7 @@ module.exports = defineConfig({
 });
 ```
 
-**Related**: [core/configuration.md](configuration.md), [ci/ci-github-actions.md](../ci/ci-github-actions.md)
+**Related**: [core/configuration.md](configuration.md), [ci/ci-github-actions.md](~/.agents/skills/playwright-ci/ci-github-actions.md)
 
 ---
 
@@ -834,7 +834,7 @@ expect(sanitized).toMatchSnapshot('dashboard-content.txt');
 ```bash
 npx playwright test --update-snapshots=missing
 # Linux baselines from macOS/Windows: run inside the official image
-docker run --rm --init --ipc=host -v $(pwd):/work -w /work mcr.microsoft.com/playwright:v1.64.0-noble npx playwright test --update-snapshots
+docker run --rm --init --ipc=host -v $(pwd):/work -w /work mcr.microsoft.com/playwright:v%%VERSION%%-noble npx playwright test --update-snapshots
 ```
 
 **Related**: [core/visual-regression.md](visual-regression.md)
@@ -933,7 +933,7 @@ For CI pipelines, always include the install step:
   run: npx playwright install --with-deps
 ```
 
-**Related**: [ci/ci-github-actions.md](../ci/ci-github-actions.md), [ci/docker-and-containers.md](../ci/docker-and-containers.md)
+**Related**: [ci/ci-github-actions.md](~/.agents/skills/playwright-ci/ci-github-actions.md), [ci/docker-and-containers.md](~/.agents/skills/playwright-ci/docker-and-containers.md)
 
 ---
 
@@ -1293,7 +1293,7 @@ npx playwright install --with-deps chromium
 
 # If using Docker, use the official Playwright image
 # Dockerfile
-FROM mcr.microsoft.com/playwright:v1.64.0-noble
+FROM mcr.microsoft.com/playwright:v%%VERSION%%-noble
 WORKDIR /app
 COPY . .
 RUN npm ci
@@ -1309,7 +1309,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     container:
-      image: mcr.microsoft.com/playwright:v1.64.0-noble
+      image: mcr.microsoft.com/playwright:v%%VERSION%%-noble
       options: --shm-size=2gb
 
 # Docker run — increase shared memory
@@ -1340,7 +1340,7 @@ module.exports = defineConfig({
 });
 ```
 
-**Related**: [ci/ci-github-actions.md](../ci/ci-github-actions.md), [ci/docker-and-containers.md](../ci/docker-and-containers.md)
+**Related**: [ci/ci-github-actions.md](~/.agents/skills/playwright-ci/ci-github-actions.md), [ci/docker-and-containers.md](~/.agents/skills/playwright-ci/docker-and-containers.md)
 
 ---
 
@@ -1579,7 +1579,7 @@ test('multi-user test', async ({ browser }) => {
 });
 ```
 
-**Related**: [ci/parallel-and-sharding.md](../ci/parallel-and-sharding.md), [core/multi-user-and-collaboration.md](multi-user-and-collaboration.md)
+**Related**: [ci/parallel-and-sharding.md](~/.agents/skills/playwright-ci/parallel-and-sharding.md), [core/multi-user-and-collaboration.md](multi-user-and-collaboration.md)
 
 ---
 
@@ -1680,7 +1680,7 @@ await expect(page.getByRole('progressbar')).toBeHidden();
 await expect(page.getByRole('main')).toBeVisible();
 ```
 
-**Related**: [core/locators.md](locators.md), [core/assertions-and-waiting.md](assertions-and-waiting.md), [migration/from-selenium.md](../migration/from-selenium.md)
+**Related**: [core/locators.md](locators.md), [core/assertions-and-waiting.md](assertions-and-waiting.md), [migration/from-selenium.md](~/.agents/skills/playwright-migration/from-selenium.md)
 
 ---
 

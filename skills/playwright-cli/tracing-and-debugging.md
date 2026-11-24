@@ -131,7 +131,7 @@ npx playwright trace close
 
 Use the GUI Trace Viewer when you want the richest visual timeline. Use the CLI trace tools when you need quick answers in a terminal-first workflow.
 
-> For the full `npx playwright trace` command surface (`requests`, `console`, `errors`, `attachments`, `screenshot`), agent decision trees, and failure-type playbooks for debugging a `trace.zip` post-mortem, see [core/trace-analysis.md](../core/trace-analysis.md).
+> For the full `npx playwright trace` command surface (`requests`, `console`, `errors`, `attachments`, `screenshot`), agent decision trees, and failure-type playbooks for debugging a `trace.zip` post-mortem, see [core/trace-analysis.md](~/.agents/skills/playwright-core/trace-analysis.md).
 
 ## Agent Debugging With `--debug=cli` (Playwright 1.59+)
 
@@ -275,7 +275,7 @@ playwright-cli run-code "async page => {
 }"
 ```
 
-Inside the Playwright test runner the same API supports `await using` for automatic cleanup — see [core/network-mocking.md](../core/network-mocking.md#on-demand-har-recording-in-tracing-playwright-160).
+Inside the Playwright test runner the same API supports `await using` for automatic cleanup — see [core/network-mocking.md](~/.agents/skills/playwright-core/network-mocking.md#on-demand-har-recording-in-tracing-playwright-160).
 
 ## Debugging Strategies
 

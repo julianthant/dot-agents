@@ -272,7 +272,7 @@ test('good: retry entire assertion block', async ({ page }) => {
 
 Isolation issues come from shared state: module-level variables, database rows, localStorage, cookies, or file system artifacts.
 
-When the shared state cannot be made per-test (one external account, a global setting), declare a test `lock` (1.63+) so only the tests that contend for it serialize. See [Serializing Tests on a Shared Resource](../ci/parallel-and-sharding.md#pattern-6-serializing-tests-on-a-shared-resource-lock-playwright-163).
+When the shared state cannot be made per-test (one external account, a global setting), declare a test `lock` (1.63+) so only the tests that contend for it serialize. See [Serializing Tests on a Shared Resource](~/.agents/skills/playwright-ci/parallel-and-sharding.md#pattern-6-serializing-tests-on-a-shared-resource-lock-playwright-163).
 
 **TypeScript**
 ```typescript

@@ -64,7 +64,7 @@ If the app needs auth, wire it through a setup project and `storageState` (see [
 
 1. **Plan**: ask the planner for one flow ("Plan guest checkout"), optionally attaching a PRD. Review `specs/<flow>.md` before generating: wrong expected results in the plan become wrong assertions.
 2. **Generate**: point the generator at the plan. Each test gets `// spec:` and `// seed:` header comments linking it back.
-3. **Review** the generated tests against the [Golden Rules](../SKILL.md#golden-rules): role-based locators, web-first assertions, no `waitForTimeout`, one behavior per test. Agents produce working tests, not necessarily maintainable ones.
+3. **Review** the generated tests against the [Golden Rules](SKILL.md#golden-rules): role-based locators, web-first assertions, no `waitForTimeout`, one behavior per test. Agents produce working tests, not necessarily maintainable ones.
 4. **Heal**: run the suite; hand failures to the healer.
 
 ### Pattern 3: Treat Healer Output as a Code Review

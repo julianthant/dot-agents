@@ -1672,4 +1672,4 @@ export default defineConfig({
 - [core/service-workers-and-pwa.md](service-workers-and-pwa.md) -- in-depth PWA testing beyond mobile context
 - [core/performance-testing.md](performance-testing.md) -- comprehensive performance testing including mobile metrics
 - [core/browser-apis.md](browser-apis.md) -- geolocation, permissions, and other browser APIs in detail
-- [ci/projects-and-dependencies.md](../ci/projects-and-dependencies.md) -- advanced multi-project patterns for responsive testing matrices
+- [ci/projects-and-dependencies.md](~/.agents/skills/playwright-ci/projects-and-dependencies.md) -- advanced multi-project patterns for responsive testing matrices

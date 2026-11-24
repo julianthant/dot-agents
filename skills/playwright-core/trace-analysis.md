@@ -158,4 +158,4 @@ done; npx playwright trace close
 - [debugging.md](debugging.md) — broader debugging workflow (UI mode, inspector, trace viewer)
 - [error-index.md](error-index.md) — map an exact error string to its fix
 - [flaky-tests.md](flaky-tests.md) — timing/race root causes and fixes
-- [../ci/reporting-and-artifacts.md](../ci/reporting-and-artifacts.md) — where CI stores `trace.zip` and how to retrieve it
+- [~/.agents/skills/playwright-ci/reporting-and-artifacts.md](~/.agents/skills/playwright-ci/reporting-and-artifacts.md) — where CI stores `trace.zip` and how to retrieve it

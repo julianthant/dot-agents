@@ -1,7 +1,7 @@
 # Reviewing Playwright Tests
 
 > **When to use**: The user asks you to review Playwright test code or a pull request with tests, wants a review checklist, or wants bad test patterns caught automatically.
-> **Prerequisites**: [core/common-pitfalls.md](../core/common-pitfalls.md), [core/assertions-and-waiting.md](../core/assertions-and-waiting.md)
+> **Prerequisites**: [core/common-pitfalls.md](~/.agents/skills/playwright-core/common-pitfalls.md), [core/assertions-and-waiting.md](~/.agents/skills/playwright-core/assertions-and-waiting.md)
 
 ## Quick Reference
 
@@ -30,17 +30,17 @@ Review order: **can it pass when the feature is broken?** → **can it fail when
 | Missing `await` on `expect(locator)...` or an action | The check never runs before the test ends | `await` every Playwright call |
 | `if (await x.isVisible()) { ... }` in the test | One branch silently skips the check | Make state deterministic; assert it |
 | `try { ... } catch {}` around steps or assertions | Swallows the failure | Remove; use `expect.soft` if you want to continue |
-| `{ force: true }` | Clicks through overlays and disabled states a user would hit | Fix the cause; see [error-index.md](../core/error-index.md) |
+| `{ force: true }` | Clicks through overlays and disabled states a user would hit | Fix the cause; see [error-index.md](~/.agents/skills/playwright-core/error-index.md) |
 | `test.only`, unexplained `test.skip` / `fixme` | Silently shrinks the suite | Remove, or add a reason and issue link |
 
 **Major: the test will be flaky or brittle**
 
 | Look for | Why | Fix |
 |---|---|---|
-| `page.waitForTimeout(...)` | Too short in CI, wasted time locally | Web-first assertion or `waitForResponse` ([assertions-and-waiting.md](../core/assertions-and-waiting.md)) |
-| CSS/XPath (`.btn-primary`, `#pw`, `div > span:nth-child(2)`) | Breaks on markup change | `getByRole` / `getByLabel` / `getByTestId` ([locator-strategy.md](../core/locator-strategy.md)) |
+| `page.waitForTimeout(...)` | Too short in CI, wasted time locally | Web-first assertion or `waitForResponse` ([assertions-and-waiting.md](~/.agents/skills/playwright-core/assertions-and-waiting.md)) |
+| CSS/XPath (`.btn-primary`, `#pw`, `div > span:nth-child(2)`) | Breaks on markup change | `getByRole` / `getByLabel` / `getByTestId` ([locator-strategy.md](~/.agents/skills/playwright-core/locator-strategy.md)) |
 | `.nth()` / `.first()` without a reason | Picks by position; breaks on reorder | Filter by text or scope to a container |
-| Shared data between tests (same user, same record name) | Collides in parallel and in reruns | Unique data per test ([test-data-management.md](../core/test-data-management.md)) |
+| Shared data between tests (same user, same record name) | Collides in parallel and in reruns | Unique data per test ([test-data-management.md](~/.agents/skills/playwright-core/test-data-management.md)) |
 | Depends on another test's leftovers | Fails alone, with `--shuffle`, or on another shard | Own setup per test; fixtures |
 | `waitForLoadState('networkidle')` | Discouraged; hangs on polling or analytics | Wait for the element or response you need |
 | Hard-coded credentials or URLs | Leaks secrets; breaks across environments | Env vars, `baseURL` |
@@ -49,7 +49,7 @@ Review order: **can it pass when the feature is broken?** → **can it fail when
 
 | Look for | Fix |
 |---|---|
-| The same setup copied across files | Fixture or page object ([pom-vs-fixtures-vs-helpers.md](../pom/pom-vs-fixtures-vs-helpers.md)) |
+| The same setup copied across files | Fixture or page object ([pom-vs-fixtures-vs-helpers.md](~/.agents/skills/playwright-pom/pom-vs-fixtures-vs-helpers.md)) |
 | Title doesn't state the behavior ("test 3", "login works") | "rejects login with an expired password" |
 | One test covering several behaviors | Split; one behavior per test |
 | Missing negative path for a new validation rule | Ask for it ([test-design.md](test-design.md)) |
@@ -72,7 +72,7 @@ A cheaper variant when you can't touch the app: invert the key assertion (`toBeV
 npx playwright test --only-changed=origin/main --repeat-each=10 --fully-parallel
 ```
 
-Any failure in 10 runs is a flake; send it back with the trace. `--shuffle` additionally catches order dependence ([flaky-tests.md](../core/flaky-tests.md)).
+Any failure in 10 runs is a flake; send it back with the trace. `--shuffle` additionally catches order dependence ([flaky-tests.md](~/.agents/skills/playwright-core/flaky-tests.md)).
 
 ### Pattern 4: Automate the Mechanical Checks
 
@@ -139,6 +139,6 @@ test('login', async ({ page }) => {
 
 ## Related
 
-- [core/common-pitfalls.md](../core/common-pitfalls.md): the mistakes behind most findings
-- [core/flaky-tests.md](../core/flaky-tests.md): diagnosing flakes found in review
+- [core/common-pitfalls.md](~/.agents/skills/playwright-core/common-pitfalls.md): the mistakes behind most findings
+- [core/flaky-tests.md](~/.agents/skills/playwright-core/flaky-tests.md): diagnosing flakes found in review
 - [qa/test-design.md](test-design.md): judging whether the right cases exist

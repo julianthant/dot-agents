@@ -43,9 +43,8 @@ operator's chat overrides both.
 - Match checks to the changed behavior and the repository's gate schedule. Update relevant tests;
   if tests run, run lint too. Preserve assertions, membership, isolation, coverage floors and
   timeouts.
-- After pushing a task branch, wait on its CI in one blocking command
-  (`gh run watch <run-id> --interval 30 --exit-status`); never poll in a loop. The default
-  3-second refresh drains the account's shared GitHub API limit.
+- After pushing a task branch, run `~/.agents/skills/dev-auto/scripts/ci-wait "$(git rev-parse HEAD)"`.
+  WSL uses the Mac roadmap's tailnet URL in `ROADMAP_URL`. Report stale or unreachable data.
 - Report actual outcomes and unrun obligations. A worker's claim is not completion evidence.
 
 ## PR instructions

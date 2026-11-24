@@ -35,7 +35,7 @@ Claude Code analog of Cursor's built-in `/babysit`. The implementation is a loop
    - Review-bot comments (Bugbot and similar automation): classify fix/dismiss/ask before acting, per [`bugbot-triage.md`](references/bugbot-triage.md). Ask by default on security, data, and high-severity findings.
 
 3. **Loop.** Use the Claude Code `loop` skill to pace re-checks. Pick the interval from what you're watching:
-   - Active CI run: poll `gh pr checks --watch` (it blocks until checks finish, so no separate loop interval needed).
+   - Active dev-auto CI run: block with `~/.agents/skills/dev-auto/scripts/ci-wait <full-sha>`.
    - Awaiting reviewer: 20–30 min heartbeat.
    - Idle but want to catch new comments: hourly.
 

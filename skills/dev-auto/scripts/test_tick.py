@@ -1670,13 +1670,15 @@ with sqlite3.connect(":memory:") as db:
     ticket, state = review_fixture()
     ticket["stage"] = "Fixing"
     state.update(stage="Fixing", host="local", coder_terminal="coder-pane")
-    pending = dict(report("pending-coder", sha, msg_id="pending"), sequence=0, created_at="2026-11-22T22:35:40Z")
+    pending = dict(report("pending-coder", sha, msg_id="pending"), sequence=0, created_at="2026-11-22T22:35:40Z",
+                   payload={"dispatchId": "pending-coder", "taskId": "pending-task", "outcome": "succeeded"})
     other = dict(ticket, number=42)
     tick.review_state(db, "run", 41)
     tick.save_review(db, "run", 41, state)
     tick.save_review(db, "run", 42, dict(state, pending="pending", sha=sha, path="/other",
                                         coder="pending-coder", expected="pending-coder", coder_terminal="other-pane"))
-    chained = dict(report("retry", sha, msg_id="chained"), from_handle="fresh-pane", sequence=2)
+    chained = dict(report("retry", sha, msg_id="chained"), from_handle="fresh-pane", sequence=2,
+                   payload={"dispatchId": "retry", "taskId": "manual-task", "outcome": "succeeded"})
     messages = [pending, recorded, chained, *[
         dict(report(f"history-{i}", "unrelated", msg_id=f"old-{i}"), from_handle=f"pane-{i}", sequence=i + 3,
              payload={"dispatchId": f"history-{i}", "taskId": f"old-task-{i}", "outcome": "succeeded"})
@@ -1728,6 +1730,7 @@ with sqlite3.connect(":memory:") as db:
             shows = [args[3] for args in calls if args[1] == "worker-show"]
             assert len(shows) <= 30, f"700 unrelated successes produced {len(shows)} worker-show calls"
             assert set(shows) == expected_reads, shows
+            workers[3]["projection"] = {}  # The released retry's saved chain survives a missing worktree projection.
         assert any(args.args[1]["issue"] == 42 and "inspect uncertain Orca action" in args.args[1]["reason"]
                    for args in captured.call_args_list)
         assert tick.review_state(db, "run", 42)["pending"] == "pending"

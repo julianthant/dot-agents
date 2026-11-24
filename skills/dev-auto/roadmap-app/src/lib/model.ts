@@ -13,7 +13,7 @@ type NowState = {
   pr: (DevPr & { repo: 'hr-relay' | 'dot-agents' }) | null
 }
 export type Data = {
-  generated?: string; areas: string[]; milestones?: string[]; issues: Issue[]
+  generated?: string; githubFetchedAt?: string | null; areas: string[]; milestones?: string[]; issues: Issue[]
   pipeline: {
     devPrs?: DevPr[]; mergedSinceRelease?: number; devAheadOfStaging?: number | null; devAheadOfMain?: number | null
     stagingPr?: { n: number; head: string; checks: string }[]; release?: { tagName: string | null; publishedAt: string | null }

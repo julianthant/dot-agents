@@ -1,21 +1,17 @@
-"""Print hr-relay work as roadmap JSON for the roadmap app: Area and milestone order, every open issue
-and the newest closed ones, and the release pipeline.
-
-  roadmap.py > data.json   (launchd runs it every 15 seconds)
-
-Issues come from tick.py's shared snapshot. Each rebuild polls issues and Development runs conditionally,
-reads PR check rollups in one batch and joins current workers to the tick's local review records.
-"""
+"""Build roadmap JSON from saved data, or refresh GitHub on demand."""
+from argparse import ArgumentParser, Namespace
 import datetime
-from argparse import Namespace
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+import fcntl
 import json
 from pathlib import Path
 import re
 import sqlite3
 import subprocess
 import sys
+from threading import Lock
 import time
 
 import tick
@@ -43,14 +39,7 @@ query {
 
 
 def gh(*a):
-    return json.loads(subprocess.run(["gh", *a], check=True, capture_output=True, text=True).stdout)
-
-
-def ghq(*a):
-    try:
-        return gh(*a)
-    except Exception:
-        return None
+    return json.loads(subprocess.run(["gh", *a], check=True, capture_output=True, text=True, timeout=60).stdout)
 
 
 def row(n):
@@ -68,9 +57,9 @@ def row(n):
 
 
 def pull_requests():
-    result = ghq("api", "graphql", "-f", f"query={PR_QUERY}")
+    result = gh("api", "graphql", "-f", f"query={PR_QUERY}")
     if not result or result.get("errors"):
-        return None
+        raise ValueError("GitHub PR query failed")
 
     def pr(p):
         commit = p["commits"]["nodes"]
@@ -90,17 +79,9 @@ def pull_requests():
 REFUSED = (tick.OrcaError, OSError, ValueError, KeyError, subprocess.TimeoutExpired)
 
 
-def last_snapshot(fresh=False):
-    """The shared snapshot, or its last good copy when GitHub refuses the refetch."""
-    try:
-        return tick.snapshot(fresh)
-    except REFUSED:
-        return json.loads(tick.SNAPSHOT.read_text())
-
-
 STATE = tick.SNAPSHOT.with_name("roadmap.json")
-POLLS = {"issues": f"repos/{REPO}/issues?state=all&sort=updated&direction=desc&per_page=100&since={{since}}",
-         "runs": f"repos/{REPO}/actions/workflows/{tick.FULL_RUN_WORKFLOW}/runs?per_page=100"}
+RUNS = f"repos/{REPO}/actions/workflows/{tick.FULL_RUN_WORKFLOW}/runs?per_page=100"
+REFRESH_ERRORS = (*REFUSED, subprocess.CalledProcessError, TypeError)
 
 
 def poll(url, etag):
@@ -113,88 +94,65 @@ def poll(url, etag):
     return int(status[1]) if status else 0, tag[1].strip() if tag else etag, body
 
 
-ANCHOR_SECONDS = 600  # the issue poll's since= moves this rarely, so its ETag stays valid in between
-
-
-def changes(state):
-    """Changes to issues, and full and task runs from the same Actions response.
-
-    Issues compare (number, updated_at) after since=, so two updates in the same second still differ, and a
-    moved since= overlaps the old window by a minute, so its first unconditional reply compares cleanly too."""
-    tags = state.setdefault("etags", {})
-    if "since" not in state or not 0 <= time.time() - state.get("anchored", 0) < ANCHOR_SECONDS:
-        state["since"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 60))
-        state["anchored"], tags["issues"] = time.time(), None
-    since = state["since"]
-    changed, full_run = set(), None
-    for name, url in POLLS.items():
-        try:
-            status, tag, body = poll(url.format(since=since), tags.get(name))
-            if status != 200:
-                continue
-            if name == "issues":
-                seen = sorted([i["number"], i["updated_at"]] for i in json.loads(body) if i["updated_at"] > since)
-                before = [s for s in state["seen"] if s[1] > since] if "seen" in state else None
-                state["seen"] = seen
-                if seen != before:
-                    changed.add(name)
-            else:
-                runs = json.loads(body)["workflow_runs"]
-                latest = {}
-                for r in runs:
-                    if r["event"] == "push" and r["head_branch"].startswith("task/"):
-                        latest.setdefault(r["head_branch"], {k: r[k] for k in ("head_sha", "status", "conclusion")})
-                state["task_runs"] = {**state.get("task_runs", {}), **latest}
-                run = next((r for r in runs if r["head_branch"] == tick.FULL_RUN_BRANCH
-                            and r["event"] in ("schedule", "workflow_dispatch")), None)
-                if run:
-                    full_run = dict(status=run["status"], conclusion=run["conclusion"], createdAt=run["created_at"],
-                                    headSha=run["head_sha"], url=run["html_url"])
-            tags[name] = tag
-        except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
-            pass  # an unreadable poll counts as unchanged; the once-a-minute refresh still runs
-    return changed, full_run
-
-
-def render():
-    """This run's roadmap, reading GitHub beyond the polls only for what changed, or once a minute."""
+def read_json(path, default):
     try:
-        state = json.loads(STATE.read_text())
+        return json.loads(path.read_text())
     except (OSError, ValueError):
-        state = {}
-    changed, full_run = changes(state)
-    prs = pull_requests()
-    if prs is not None:
-        # Check-only changes update each row without rebuilding the release counters.
-        old = state.get("pipeline", {})
-        identity = lambda rows: [(p["n"], p.get("updated")) for p in rows]
-        if any(identity(prs.get(k, [])) != identity(old.get(k, [])) for k in ("devPrs", "stagingPr")):
-            changed.add("pulls")
-    now = time.time()
-    fresh = "issues" in changed or state.get("refresh_owed", False)  # a refused refresh is retried, alone
-    try:
-        snap, state["refresh_owed"] = tick.snapshot(fresh), False  # unchanged, it still refetches once a minute
-    except REFUSED:
-        snap, state["refresh_owed"] = json.loads(tick.SNAPSHOT.read_text()), fresh
-    if changed or "pipeline" not in state or not 0 <= now - state.get("built", 0) < tick.SNAPSHOT_SECONDS:
-        state.update(pipeline(state), built=now)
-    if prs is not None:
-        state["pipeline"].update(prs)
-    if full_run is not None:
-        state["pipeline"] = {**state["pipeline"], "fullRun": full_run}
+        return default
+
+
+def write_json(path, data):
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, separators=(",", ":")))
+    tmp.replace(path)
+
+
+def refresh(state):
+    rest = state.setdefault("rest", {})
+    runs = cached_rest(rest, RUNS, lambda data: data["workflow_runs"])
+    latest = {}
+    for run in runs:
+        if run["event"] == "push" and run["head_branch"].startswith("task/"):
+            latest.setdefault(run["head_branch"], {k: run[k] for k in ("head_sha", "status", "conclusion")})
+    state["task_runs"] = {**state.get("task_runs", {}), **latest}
+    full_run = next((r for r in runs if r["head_branch"] == tick.FULL_RUN_BRANCH
+                     and r["event"] in ("schedule", "workflow_dispatch")), None)
+    state.update(pipeline(rest, pull_requests(), full_run))
+
+    snap = tick.snapshot(fresh=True)
+    meta = tick.project_meta()
+    if {row(n)["area"] for n in snap["open"] + snap["closed"]} - {None, *area_names(meta)}:
+        meta = tick.project_meta(refresh=True)
+    state["areas"] = area_names(meta)
+    state["heads"] = branch_heads(tick.tickets(rows=snap["open"]))
+    state["readiness"] = {str(number): reason for number, reason in readiness(snap).items()}
+    state["githubFetchedAt"] = stamp()
+
+
+def render(full=False, directory=None):
     STATE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = STATE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state))
-    tmp.replace(STATE)
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        planned = executor.submit(readiness, snap)
-        live = now_rows(snap, state)
-        try:
-            decisions = planned.result()
-        except REFUSED as e:
-            print(f"roadmap readiness: {e}", file=sys.stderr)
-            decisions = {}
-    return build(snap, state, decisions, live)
+    if not full:
+        return render_local(directory)
+    # A slow GitHub request must not block periodic local updates.
+    with STATE.with_suffix(".refresh.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = read_json(STATE, {})
+        refresh(state)
+        return render_local(directory, refreshed=state)
+
+
+def render_local(directory, *, refreshed=None):
+    with STATE.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = read_json(STATE, {}) if refreshed is None else refreshed
+        state.setdefault("pipeline", {})
+        snap = read_json(tick.SNAPSHOT, {"open": [], "closed": []})
+        data = build(snap, state, now_rows(snap, state))
+        if refreshed is not None:
+            write_json(STATE, state)
+        if directory is not None:
+            write_json(directory / "data.json", data)
+        return data
 
 
 def readiness(snap):
@@ -315,18 +273,17 @@ def branch_heads(tickets):
         try:
             refs = subprocess.run(["git", "ls-remote", "--heads", f"https://github.com/julianthant/{name}.git", "refs/heads/task/*"],
                                   check=True, capture_output=True, text=True, timeout=4).stdout
-            for line in refs.splitlines():
-                sha, ref = line.split()
-                heads[name, ref.removeprefix("refs/heads/")] = sha
+            heads[name] = {ref.removeprefix("refs/heads/"): sha
+                           for sha, ref in (line.split() for line in refs.splitlines())}
         except (OSError, ValueError, subprocess.SubprocessError) as e:
-            print(f"roadmap {name} task heads: {e}", file=sys.stderr)
+            raise tick.OrcaError(f"roadmap {name} task heads: {e}") from e
     return heads
 
 
 def now_rows(snap, state):
     tickets = [t for t in tick.tickets(rows=snap["open"]) if t["kind"] in ("Task", "Bug")]
     reviews, workers = live_workers({t["number"] for t in tickets})
-    heads = branch_heads(tickets)
+    heads = state.get("heads", {})
     pipeline = state["pipeline"]
     pr_groups = {"hr-relay": pipeline.get("devPrs", []), "dot-agents": pipeline.get("agentPrs", [])}
     rows = {}
@@ -336,7 +293,7 @@ def now_rows(snap, state):
         reviewed, phase = review.get("sha"), review.get("stage")
         pr = next((p for p in pr_groups[repo] if n in p["issues"] or p["head"] == branch), None)
         coder, reviewer = workers.get((n, "coder")), workers.get((n, "reviewer"))
-        head = heads.get((repo, branch))
+        head = heads.get(repo, {}).get(branch)
         if not (pr or review or coder or reviewer or head):
             continue
 
@@ -394,87 +351,125 @@ def now_rows(snap, state):
     return rows
 
 
-def build(snap, github=None, decisions=None, live=None):
+def area_names(meta):
+    return [o["name"] for o in meta.get("fields", {}).get("Area", {}).get("options", [])]
+
+
+def stamp():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def build(snap, state, live):
     issues = sorted(snap["open"], key=lambda n: n["updatedAt"], reverse=True) + snap["closed"]
     rows = [row(n) for n in issues]
+    decisions = state.get("readiness", {})
     for r in rows:
-        if live is not None:
-            r["now"] = live.get(r["n"])
-        if decisions is not None and r["open"] and r["type"] in ("Task", "Bug"):
-            reason = decisions.get(r["n"], "readiness unavailable")
+        r["now"] = live.get(r["n"])
+        if r["open"] and r["type"] in ("Task", "Bug"):
+            reason = decisions.get(str(r["n"]), "readiness unavailable")
             r.update(ready=reason is None, holdReason=reason)
-    areas = lambda meta: [o["name"] for o in meta["fields"]["Area"]["options"]]
-    area_order = []
-    try:
-        area_order = tick.with_project(areas)
-        if {r["area"] for r in rows} - {None, *area_order}:
-            area_order = areas(tick.project_meta(refresh=True))  # an Area option added since the ids were cached
-    except REFUSED:
-        pass  # GitHub refused the lookup (quota 0): the cache stays, and this render keeps what it read
-    try:
-        last_tick = json.loads(tick.SNAPSHOT.with_name("tick.json").read_text())
-    except (OSError, ValueError):
-        last_tick = None
-    github = github or pipeline()
-    return {"generated": datetime.datetime.now(datetime.timezone.utc).isoformat(), "areas": area_order,
-            "milestones": github["milestones"], "issues": rows, "pipeline": github["pipeline"], "tick": last_tick}
+    areas = state.get("areas")
+    if areas is None:
+        areas = area_names(read_json(tick.PROJECT_CACHE, {}))
+    last_tick = read_json(tick.SNAPSHOT.with_name("tick.json"), None)
+    return {"generated": stamp(), "githubFetchedAt": state.get("githubFetchedAt"), "areas": areas,
+            "milestones": state.get("milestones", []), "issues": rows, "pipeline": state["pipeline"], "tick": last_tick}
 
 
-def cached_rest(cache, endpoint, select, default=None):
-    """Keep the ETag and the fields the roadmap needs from the last successful response."""
-    etag, value = cache.get(endpoint, (None, default))
-    try:
-        status, tag, body = poll(endpoint, etag)
-        if status == 200:
-            value = select(json.loads(body))
-            cache[endpoint] = tag, value
-    except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
-        pass
+def cached_rest(cache, endpoint, select):
+    """Use the saved value when GitHub confirms its ETag is current."""
+    etag, value = cache.get(endpoint, (None, None))
+    status, tag, body = poll(endpoint, etag)
+    if status == 200:
+        value = select(json.loads(body))
+        cache[endpoint] = tag, value
+    elif status != 304 or not etag:
+        raise ValueError(f"GitHub REST request returned {status}: {endpoint}")
     return value
 
 
-def pipeline(state=None):
-    """The release pipeline and the open milestones, read from GitHub."""
-    previous = state.get("pipeline", {}) if state is not None else pull_requests() or {}
-    def api(path, select, default=None):
-        endpoint = f"repos/{REPO}/{path}"
-        if state is not None:
-            return cached_rest(state.setdefault("rest", {}), endpoint, select, default)
-        result = ghq("api", endpoint)
-        return select(result) if result is not None else default
+def pipeline(rest, prs, full_run):
+    """The release pipeline and open milestones from a manual refresh."""
+    def api(path, select):
+        return cached_rest(rest, f"repos/{REPO}/{path}", select)
 
-    def compare(base):
-        return api(f"compare/{base}...development" + ("?per_page=1" if state is not None else ""),
-                   lambda result: result.get("ahead_by"))
-
-    if state is None:
-        releases = ghq("release", "list", "--repo", REPO, "--limit", "1", "--json", "tagName,publishedAt") or []
-        full = ghq("run", "list", "--repo", REPO, "--branch", "development", "--event", "schedule", "--limit", "5",
-                   "--json", "conclusion,status,createdAt,headSha,url") or []
-        release, full_run = next(iter(releases), None), next(iter(full), None)
-    else:
-        release = api("releases?per_page=1", lambda rows: {"tagName": rows[0]["tag_name"],
-                                                         "publishedAt": rows[0]["published_at"]} if rows else None)
-        full_run = state.get("pipeline", {}).get("fullRun")
+    release = api("releases?per_page=1", lambda rows: {"tagName": rows[0]["tag_name"],
+                                                     "publishedAt": rows[0]["published_at"]} if rows else None)
     if release is None:
         main_date = api("commits/main", lambda result: result.get("commit", {}).get("committer", {}).get("date"))
         release = {"tagName": None, "publishedAt": main_date}
-    since = release["publishedAt"]
-    # One REST search count instead of listing every merged PR over GraphQL.
-    merged = ghq("api", "-X", "GET", "search/issues", "-f", "per_page=1", "-f",
-                 f"q=repo:{REPO} is:pr is:merged base:development merged:>{(since or '2026-01-01')[:10]}")
-    cuts = api("git/matching-refs/heads/cut/", lambda rows: [r["ref"].removeprefix("refs/heads/") for r in rows], [])
-    stages = dict(devPrs=previous.get("devPrs", []), stagingPr=previous.get("stagingPr", []),
-                    mergedSinceRelease=(merged or {}).get("total_count", 0),
-                    devAheadOfStaging=compare("staging"), devAheadOfMain=compare("main"),
-                    release=release, cuts=cuts, fullRun=full_run)
-    if state is not None:
-        stages["agentPrs"] = previous.get("agentPrs", [])
+    since = (release["publishedAt"] or "2026-01-01")[:10]
+    merged = gh("api", "-X", "GET", "search/issues", "-f", "per_page=1", "-f",
+                f"q=repo:{REPO} is:pr is:merged base:development merged:>{since}")
+    cuts = api("git/matching-refs/heads/cut/", lambda rows: [r["ref"].removeprefix("refs/heads/") for r in rows])
+    stages = dict(**prs, mergedSinceRelease=merged["total_count"],
+                  devAheadOfStaging=api("compare/staging...development?per_page=1", lambda result: result["ahead_by"]),
+                  devAheadOfMain=api("compare/main...development?per_page=1", lambda result: result["ahead_by"]),
+                  release=release, cuts=cuts,
+                  fullRun=dict(status=full_run["status"], conclusion=full_run["conclusion"],
+                               createdAt=full_run["created_at"], headSha=full_run["head_sha"],
+                               url=full_run["html_url"]) if full_run else None)
+    return {"pipeline": stages, "milestones": api("milestones?state=open&per_page=50", lambda rows: [m["title"] for m in rows])}
+
+
+def publish(full, directory=None):
+    data = render(full, directory)
+    if directory is None:
+        json.dump(data, sys.stdout, separators=(",", ":"))
+
+
+def make_server(directory, bind, port):
+    refresh_lock = Lock()
+    completed = float("-inf")
+    status = 204
+
+    class Handler(SimpleHTTPRequestHandler):
+        def do_POST(self):
+            nonlocal completed, status
+            if self.path != "/refresh":
+                self.send_error(404)
+                return
+            # Cross-origin browser requests cannot send this header without a CORS preflight.
+            if self.headers.get("X-Roadmap-Refresh") != "1":
+                self.send_error(403)
+                return
+            if not refresh_lock.acquire(blocking=False):
+                self.send_error(409)
+                return
+            try:
+                if time.monotonic() - completed >= 2:
+                    try:
+                        publish(True, directory)
+                    except REFRESH_ERRORS as e:
+                        self.log_error("roadmap refresh: %s", e)
+                        status = 503
+                    else:
+                        status = 204
+                    completed = time.monotonic()
+                self.send_response(status)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            finally:
+                refresh_lock.release()
+
+    return ThreadingHTTPServer((bind, port), partial(Handler, directory=directory))
+
+
+def main():
+    parser = ArgumentParser(description=__doc__)
+    parser.add_argument("mode", nargs="?", choices=("local", "full", "serve"), default="local")
+    parser.add_argument("--directory", type=Path, help="serve this directory or write data.json here")
+    parser.add_argument("--bind", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8790)
+    args = parser.parse_args()
+    if args.mode == "serve":
+        if args.directory is None:
+            parser.error("serve requires --directory")
+        with make_server(args.directory, args.bind, args.port) as server:
+            server.serve_forever()
     else:
-        stages["stagingPr"] = [{k: p[k] for k in ("n", "head", "checks")} for p in stages["stagingPr"]]
-    milestones = api("milestones?state=open&per_page=50", lambda rows: [m["title"] for m in rows], [])
-    return {"pipeline": stages, "milestones": milestones}
+        publish(args.mode == "full", args.directory)
 
 
 if __name__ == "__main__":
-    json.dump(render(), sys.stdout, separators=(",", ":"))
+    main()

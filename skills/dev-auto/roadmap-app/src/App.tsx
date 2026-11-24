@@ -1,5 +1,6 @@
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import { Counts, FeatureCounts, FeatureList, GridSide, Legend, MilestoneGates, NowTable, Panel, RoadmapGrid, Stamp, StatusBar } from '@/components/roadmap'
+import { Button } from '@/components/ui/button'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { build, type Model } from '@/lib/model'
@@ -50,16 +51,51 @@ function Cockpit({ m }: { m: Model }) {
 }
 
 export default function App() {
-  const feed = useRoadmapData()
+  const [revision, setRevision] = useState(0)
+  const [refreshing, setRefreshing] = useState(false)
+  const [refreshError, setRefreshError] = useState<string | null>(null)
+  const feed = useRoadmapData(revision)
   const m = useMemo(() => (feed.data ? build(feed.data) : null), [feed.data])
+  const githubTime = feed.data?.githubFetchedAt
+
+  async function refresh() {
+    setRefreshing(true)
+    setRefreshError(null)
+    try {
+      const response = await fetch('/refresh', { method: 'POST', headers: { 'X-Roadmap-Refresh': '1' } })
+      if (response.status === 409) {
+        setRefreshError('A GitHub refresh is already running.')
+      } else if (response.ok) {
+        setRevision((value) => value + 1)
+      } else {
+        setRefreshError('Could not refresh GitHub data. Try again.')
+      }
+    } catch {
+      setRefreshError('Could not reach the roadmap server. Try again.')
+    } finally {
+      setRefreshing(false)
+    }
+  }
+
   return (
     <TooltipProvider delayDuration={200}>
       <main className="mx-auto grid max-w-[1440px] grid-cols-[minmax(0,1fr)] gap-4 px-4 pt-6 pb-12 sm:px-6">
         <header className="grid gap-3.5">
-          <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-1">
+          <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-2">
             <h1 className="text-[22px] font-bold tracking-[-0.015em]">hr-relay roadmap</h1>
-            <Stamp feed={feed} />
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+              <div className="grid gap-0.5">
+                <span role="status" className="text-xs text-muted-foreground">
+                  {githubTime ? <>GitHub data from <time dateTime={githubTime}>{new Date(githubTime).toLocaleString()}</time></> : 'GitHub refresh time unavailable'}
+                </span>
+                <Stamp feed={feed} />
+              </div>
+              <Button type="button" variant="outline" disabled={refreshing} onClick={refresh} aria-label="Refresh GitHub data">
+                {refreshing ? 'Refreshing…' : 'Refresh'}
+              </Button>
+            </div>
           </div>
+          {refreshError && <p role="alert" className="text-xs text-you">{refreshError}</p>}
           {m && <Counts m={m} />}
         </header>
         {m ? <Cockpit m={m} /> : feed.error

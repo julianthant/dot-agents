@@ -53,6 +53,19 @@ REST = {
 
 
 class Roadmap(unittest.TestCase):
+    def test_status_is_available_without_requesting_a_refresh(self):
+        with roadmap.make_server(tick.SNAPSHOT.parent, "127.0.0.1", 0) as server:
+            serving = Thread(target=server.serve_forever, daemon=True)
+            serving.start()
+            try:
+                with urlopen(f"http://127.0.0.1:{server.server_port}/status", timeout=5) as response:
+                    status = json.load(response)
+                self.assertIn("sources", status)
+                self.assertIn("callsLastHour", status)
+            finally:
+                server.shutdown()
+                serving.join(5)
+
     def setUp(self):
         tmp = TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
